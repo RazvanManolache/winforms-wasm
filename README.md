@@ -24,6 +24,10 @@ This is an early experiment. Selected applications render and respond to input t
 
 These are fresh captures of the live browser canvas. The controls and images shown below are rendered by the running application code.
 
+![Paint.NET 5.1.12 running in the browser with its editor interface and a basic brush stroke visible; compatibility is incomplete.](docs/screenshots/paint-net.jpg)
+
+**Paint.NET 5.1.12 — the most ambitious demo so far.** Seeing an application of this scale reach its editor and render a basic brush stroke in WebAssembly is an encouraging result. It is still only partially working: rendering and editing functionality are incomplete, and many workflows need further compatibility work.
+
 ![Telerik Photo Album running in the browser after a photo was dragged, with loading and data measurements above the canvas.](docs/screenshots/photo-album.jpg)
 
 *Telerik Photo Album: the dog photo has been dragged into the upper part of the canvas. [Before and after captures](docs/screenshots/README.md) show the interaction.*

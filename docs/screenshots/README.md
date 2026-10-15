@@ -2,6 +2,14 @@
 
 Captured on 15 October 2026 from the running local browser host. Images are unaltered browser captures at its normal viewport; large application canvases extend beyond the visible area. These are browser observations, not native desktop reference images or pixel-parity claims.
 
+## Paint.NET — partial compatibility
+
+![Paint.NET 5.1.12 displaying its editor interface and a basic brush stroke in the browser.](paint-net.jpg)
+
+The browser runs a separately obtained local copy of Paint.NET 5.1.12 through the compatibility layer. The capture shows the editor interface and a visible stroke after a brush drag in the document area.
+
+This is the most ambitious demo shown here, and it is still only partially working. Rendering and editing functionality are incomplete; this capture does not establish that tools, effects, file operations, or complete editing workflows work correctly. Paint.NET files and converted assemblies are not included in the repository.
+
 ## Calculator input
 
 ![The calculator showing 15 after entering 7 plus 8 in the browser.](calculator.jpg)

@@ -19,6 +19,7 @@ The project files declare NuGet dependencies, including Mono.Cecil, .NET browser
 
 ## Applications in screenshots
 
+- Paint.NET: [Paint.NET](https://www.getpaint.net/), version 5.1.12 in the capture. Its name, interface, and artwork remain the property of their respective owners. The screenshot shows a separately obtained local copy with incomplete browser compatibility; no Paint.NET application files or converted assemblies are distributed here.
 - Calculator: [albisnesstz/csharp-win-calculator](https://github.com/albisnesstz/csharp-win-calculator). Its source repository carries an MIT license; the screenshot shows a separately built local copy.
 - Photo Album: Telerik UI for WinForms demo application. Telerik/Progress names, components, photographs, and other artwork remain the property of their respective owners and are not covered by this project's MIT license.
 
