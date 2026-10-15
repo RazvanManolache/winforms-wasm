@@ -1,0 +1,91 @@
+<Project Sdk="Microsoft.NET.Sdk.BlazorWebAssembly">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <EnableUnsafeBinaryFormatterSerialization>true</EnableUnsafeBinaryFormatterSerialization>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <NoWarn>$(NoWarn);0436</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly" Version="9.0.20" />
+    <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.DevServer" Version="9.0.20" PrivateAssets="all" />
+    <PackageReference Include="System.Resources.Extensions" Version="9.0.0" />
+    <!-- Full System.Configuration impl (app settings + AppSettings):
+         the fork's own package reference does not flow through the
+         plain rewritten-small <Reference/>, so without this only the
+         facade ships and every settings touch TypeLoads. The rewriter
+         retargets System.Configuration.* refs here (rev35). -->
+    <PackageReference Include="System.Configuration.ConfigurationManager" Version="9.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\WfWasm.Shim\WfWasm.Shim.csproj" />
+    <ProjectReference Include="..\WfWasm.Renderer\WfWasm.Renderer.csproj" />
+    <ProjectReference Include="..\WfWasm.Drawing\WfWasm.Drawing.csproj" />
+    <ProjectReference Include="..\WfWasm.PdnCpu\WfWasm.PdnCpu.csproj" />
+    <ProjectReference Include="..\Microsoft.Win32.SystemEvents\Microsoft.Win32.SystemEvents.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="$(WfWasmMigratedForms)" />
+    <!-- Paint.NET ships on demand via /api/appmanifest?app=paintnet
+         (see AppTransform): no bundled paint references remain. -->
+  </ItemGroup>
+
+  <Target Name="AliasPrimitives" AfterTargets="ResolveAssemblyReferences">
+    <ItemGroup>
+      <ReferencePath Condition="'%(FileName)' == 'System.Drawing.Primitives'">
+        <Aliases>SysDrawPrimitives</Aliases>
+      </ReferencePath>
+      <ReferencePath Condition="'%(FileName)' == 'System.Drawing.Common'">
+        <Aliases>SysDrawCommon</Aliases>
+      </ReferencePath>
+    </ItemGroup>
+  </Target>
+
+  <!-- A1 bundle fix: RAR resolves the WindowsBase reference to the
+       browser-wasm runtime-pack facade (~6KB WebCIL in _framework). Mono
+       loads it into the default ALC first, so the real copy fetched on
+       demand can never displace it and Paint.NET bootstrap dies with
+       TypeLoadException token 01000023 (no DependencyObject in the
+       facade). Stage the full stub-transformed copy before references
+       resolve, then swap it in so the pipeline's own WebCIL conversion,
+       fingerprinting and boot.json integrity cover the real bytes. -->
+  <Target Name="PrepareFullWindowsBase" BeforeTargets="ResolveAssemblyReferences" Condition="'$(WfWasmWindowsBaseSource)' != ''">
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/../../scripts/ensure-windowsbase-full.ps1&quot; -IntermediateDir &quot;$(IntermediateOutputPath)&quot; -SourceDll &quot;$(WfWasmWindowsBaseSource)&quot;" />
+  </Target>
+
+  <Target Name="UseFullWindowsBase" AfterTargets="ResolveAssemblyReferences" Condition="'$(WfWasmWindowsBaseSource)' != ''">
+    <ItemGroup>
+      <_WindowsBaseFacade Include="@(ReferenceCopyLocalPaths)" Condition="'%(FileName)' == 'WindowsBase'" />
+      <_WindowsBaseFacadeRef Include="@(ReferencePath)" Condition="'%(FileName)' == 'WindowsBase'" />
+    </ItemGroup>
+    <PropertyGroup>
+      <_WindowsBaseFullDll>$(IntermediateOutputPath)full-windowsbase\WindowsBase.dll</_WindowsBaseFullDll>
+    </PropertyGroup>
+    <Error Condition="'@(_WindowsBaseFacade->Count())' != '0' and !Exists('$(_WindowsBaseFullDll)')"
+      Text="WindowsBase facade would bundle: full copy missing at $(_WindowsBaseFullDll)" />
+    <ItemGroup Condition="'@(_WindowsBaseFacade->Count())' != '0' and Exists('$(_WindowsBaseFullDll)')">
+      <ReferenceCopyLocalPaths Remove="@(ReferenceCopyLocalPaths)" Condition="'%(FileName)' == 'WindowsBase'" />
+      <ReferencePath Remove="@(ReferencePath)" Condition="'%(FileName)' == 'WindowsBase'" />
+      <ReferenceCopyLocalPaths Include="$(_WindowsBaseFullDll)">
+        <CopyLocal>true</CopyLocal>
+        <DestinationSubPath>WindowsBase.dll</DestinationSubPath>
+      </ReferenceCopyLocalPaths>
+      <ReferencePath Include="$(_WindowsBaseFullDll)">
+        <CopyLocal>true</CopyLocal>
+        <FusionName>WindowsBase</FusionName>
+      </ReferencePath>
+    </ItemGroup>
+    <Message Condition="'@(_WindowsBaseFacade->Count())' != '0' and Exists('$(_WindowsBaseFullDll)')"
+      Text="WindowsBase facade replaced with full copy ($(_WindowsBaseFullDll))" Importance="High" />
+  </Target>
+
+  <!-- Fail the build if the bundle regresses (facade back in _framework,
+       or boot.json integrity desync). Parent deploys via sync-wwwroot. -->
+  <Target Name="GateBundleWindowsBase" AfterTargets="Build" Condition="'$(WfWasmWindowsBaseSource)' != ''">
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/../../scripts/check-bundle.ps1&quot; -Root &quot;$(TargetDir)wwwroot/_framework&quot;" />
+  </Target>
+</Project>

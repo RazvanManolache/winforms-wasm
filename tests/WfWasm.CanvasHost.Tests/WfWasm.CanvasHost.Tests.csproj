@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.2" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\WfWasm.CanvasHost\WfWasm.CanvasHost.csproj" />
+    <!-- Form/Control types: the host's file reference does not flow transitively. -->
+    <Reference Include="$(WfWasmMigratedForms)" />
+  </ItemGroup>
+
+  <!-- Mirror the host: keep inbox System.Drawing.* out of the global
+       alias so System.Drawing.Color/Bitmap resolve to WfWasm.Drawing. -->
+  <Target Name="AliasPrimitives" AfterTargets="ResolveAssemblyReferences">
+    <ItemGroup>
+      <ReferencePath Condition="'%(FileName)' == 'System.Drawing.Primitives'">
+        <Aliases>SysDrawPrimitives</Aliases>
+      </ReferencePath>
+      <ReferencePath Condition="'%(FileName)' == 'System.Drawing.Common'">
+        <Aliases>SysDrawCommon</Aliases>
+      </ReferencePath>
+    </ItemGroup>
+  </Target>
+
+</Project>

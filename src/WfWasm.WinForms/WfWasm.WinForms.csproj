@@ -1,0 +1,142 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Fork of the real WinForms sources (runtimes/winforms, read-only) with a
+         managed windowing backend. Assembly is distinct; types keep their real
+         System.Windows.Forms namespaces so the rewriter maps apps onto them. -->
+    <TargetFramework>net9.0</TargetFramework>
+    <AssemblyName>WfWasm.WinForms</AssemblyName>
+    <RootNamespace>System.Windows.Forms</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <LangVersion>preview</LangVersion>
+    <!-- 0436 by design: this assembly intentionally redefines framework
+         System.Windows.Forms types with canvas-backed implementations. -->
+    <NoWarn>$(NoWarn);0436;SYSLIB5005;CA2201;CA1416</NoWarn>
+    <RunAnalyzersDuringBuild>false</RunAnalyzersDuringBuild>
+    <DefineConstants>OLE_JSON;TRACE</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\runtimes\winforms\src\System.Windows.Forms\System\**\*.cs"
+             Exclude="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Internal\AssemblyAttributes.cs;..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\SystemVisualSettingsTracker.cs;..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\NativeWindow.WindowClass.cs;..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Control.FontHandleWrapper.cs" />
+    <!-- TypeForwards removed at the end (after all globs). -->
+    <Compile Include="..\..\runtimes\winforms\src\System.Windows.Forms\misc\**\*.cs" />
+    <Compile Include="..\..\runtimes\winforms\src\System.Windows.Forms\Properties\**\*.cs" />
+    <Compile Include="..\..\runtimes\winforms\src\System.Windows.Forms.Primitives\src\**\*.cs"
+             Exclude="..\..\runtimes\winforms\src\System.Windows.Forms.Primitives\src\System\Windows\Forms\DeviceContextExtensions.cs;..\..\runtimes\winforms\src\System.Windows.Forms.Primitives\src\System\Windows\Forms\Internals\ScaleHelper.DpiAwarenessScope.cs" />
+    <Compile Include="..\..\runtimes\winforms\src\System.Private.Windows.Core\src\**\*.cs"
+             Exclude="..\..\runtimes\winforms\src\System.Private.Windows.Core\src\System\Private\Windows\Ole\DataObjectExtensions.cs;..\..\runtimes\winforms\src\System.Private.Windows.Core\src\System\Private\Windows\Graphics\IBitmap.cs;..\..\runtimes\winforms\src\System.Private.Windows.Core\src\Windows\Win32\PInvokeCore.GetClassLong.cs;..\..\runtimes\winforms\src\System.Private.Windows.Core\src\Windows\Win32\PInvokeCore.GetWindowLong.cs;..\..\runtimes\winforms\src\System.Private.Windows.Core\src\Windows\Win32\PInvokeCore.PrintDlgEx.cs;..\..\runtimes\winforms\src\System.Private.Windows.Core\src\Windows\Win32\PInvokeCore.SetClassLong.cs;..\..\runtimes\winforms\src\System.Private.Windows.Core\src\Windows\Win32\PInvokeCore.SetWindowLong.cs;..\..\runtimes\winforms\src\System.Private.Windows.Core\src\System\Private\Windows\OsVersion.cs" />
+    <EmbeddedResource Include="..\..\runtimes\winforms\src\System.Windows.Forms\Resources\SR.resx">
+      <LogicalName>System.Windows.Forms.SR.resources</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\..\runtimes\winforms\src\System.Windows.Forms\Resources\System\Windows\Forms\*.ico">
+      <LogicalName>System.Windows.Forms.%(FileName)</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\..\runtimes\winforms\src\System.Windows.Forms\Resources\System\Windows\Forms\ComponentModel\*.ico">
+      <LogicalName>System.Windows.Forms.ComponentModel.%(FileName)</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\..\runtimes\winforms\src\System.Windows.Forms\Resources\System\Windows\Forms\Design\*.ico">
+      <LogicalName>System.Windows.Forms.Design.%(FileName)</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\..\runtimes\winforms\src\System.Windows.Forms\Resources\System\Windows\Forms\PictureBox\*.ico">
+      <LogicalName>System.Windows.Forms.PictureBox.%(FileName)</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\..\runtimes\winforms\src\System.Windows.Forms\Resources\System\Windows\Forms\PropertyGridInternal\*.ico">
+      <LogicalName>System.Windows.Forms.PropertyGridInternal.%(FileName)</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\..\runtimes\winforms\src\System.Windows.Forms\Resources\System\Windows\Forms\Server\*.ico">
+      <LogicalName>System.Windows.Forms.Server.%(FileName)</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\..\runtimes\winforms\src\System.Windows.Forms\Resources\System\Windows\Forms\*.cur">
+      <LogicalName>System.Windows.Forms.%(FileName).cur</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\..\runtimes\winforms\src\System.Windows.Forms\Resources\System\Windows\Forms\XPThemes.manifest">
+      <LogicalName>System.Windows.Forms.XPThemes.manifest</LogicalName>
+    </EmbeddedResource>
+    <Compile Include="..\..\runtimes\winforms\src\System.Windows.Forms\GlobalUsings.cs" />
+    <Compile Include="..\..\runtimes\winforms\src\System.Windows.Forms\GlobalSuppressions.cs" />
+    <Compile Include="..\..\runtimes\winforms\src\System.Windows.Forms\SRCategoryAttribute.cs" />
+    <Compile Include="..\..\runtimes\winforms\src\System.Windows.Forms\SRDescriptionAttribute.cs" />
+    <Compile Include="..\..\runtimes\winforms\src\Common\src\**\*.cs"
+             Exclude="..\..\runtimes\winforms\src\Common\src\PlatformAttributes.cs" />
+    <Compile Include="..\..\runtimes\winforms\src\System.Windows.Forms.Analyzers\src\System\Windows\Forms\Analyzers\Diagnostics\DiagnosticIDs.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Browser overlay ToolStripManager.ModalMenuFilter.HookWasm.cs replaces this file. -->
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Controls\ToolStrips\ToolStripManager.ModalMenuFilter.HostedWindowsFormsMessageHook.cs" />
+<Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Components\Timer.cs" />
+    <!-- Legacy menus: upstream stubs throw PNSE from every constructor;
+         the *.Wasm.cs overlays provide a working in-memory model. -->
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Controls\Unsupported\ContextMenu\Menu.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Controls\Unsupported\ContextMenu\Menu.MenuItemCollection.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Controls\Unsupported\ContextMenu\MenuItem.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Controls\Unsupported\ContextMenu\ContextMenu.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Controls\Unsupported\MainMenu\MainMenu.cs" />
+    <!-- Transparent paint: upstream DrawingEventArgs throws ANE on a
+         null HDC; the DrawingEventArgs.Wasm.cs overlay tolerates it. -->
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Rendering\DrawingEventArgs.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\Properties\TypeForwards.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms.Primitives\src\Properties\AssemblyInfo.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Private.Windows.Core\src\Properties\AssemblyInfo.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Private.Windows.Core\src\Windows\Win32\PInvokeCore.GetWindowText.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Formats.Nrbf" Version="9.0.0" />
+    <ProjectReference Include="..\WfWasm.Drawing\WfWasm.Drawing.csproj" />
+    <ProjectReference Include="..\Microsoft.Win32.SystemEvents\Microsoft.Win32.SystemEvents.csproj" />
+    <PackageReference Include="System.Configuration.ConfigurationManager" Version="9.0.0" />
+    <PackageReference Include="System.Resources.Extensions" Version="9.0.0" />
+    <PackageReference Include="System.Windows.Extensions" Version="9.0.0" />
+  </ItemGroup>
+
+  <!-- Strip System.Private.Windows.Core.dll pulled transitively by System.Drawing.Common;
+       this assembly builds System.Private.Windows.Core directly from source. -->
+  <!--
+  <Target Name="RemoveCoreFromPackageReferences" AfterTargets="ResolvePackageAssets">
+    <ItemGroup>
+      <ResolvedCompileFileDefinitions Remove="@(ResolvedCompileFileDefinitions)" Condition="'%(FileName)' == 'System.Private.Windows.Core'" />
+    </ItemGroup>
+  </Target>
+  <Target Name="RemoveCoreFromAssemblyReferences" AfterTargets="ResolveAssemblyReferences">
+    <ItemGroup>
+      <ReferencePath Remove="@(ReferencePath)" Condition="'%(FileName)' == 'System.Private.Windows.Core'" />
+    </ItemGroup>
+  </Target>
+  -->
+  <!-- The fork binds System.Drawing.* to the canvas-backed WfWasm.Drawing
+       (rewritten apps resolve the same assembly, so fork/app signatures
+       agree). Framework Drawing assemblies stay aliased out of name
+       resolution, including transitive ones (System.Windows.Extensions). -->
+  <!-- Browser parity: Mono WASM turns a failed Debug.Assert into
+       FailFast (process terminated, uncatchable), while desktop Release
+       drops asserts entirely. Upstream WinForms asserts assume desktop
+       invariants that framework-era overrides legitimately break (e.g.
+       Control.MinimumSize's round-trip assert trips on Telerik
+       RadControl's element-backed getter before it syncs). Strip DEBUG
+       so the browser-served fork matches desktop Release semantics.
+       Diagnostics live in xUnit + the browser error inventory. -->
+  <Target Name="StripDebugForBrowserParity" BeforeTargets="CoreCompile">
+    <ItemGroup>
+      <_DefineTokens Include="$(DefineConstants.Split(';'))" />
+      <_DefineTokens Remove="DEBUG" />
+    </ItemGroup>
+    <PropertyGroup>
+      <DefineConstants>@(_DefineTokens, ';')</DefineConstants>
+    </PropertyGroup>
+  </Target>
+  <Target Name="AliasPrimitives" AfterTargets="ResolveAssemblyReferences">
+    <ItemGroup>
+      <ReferencePath Condition="'%(FileName)' == 'System.Drawing.Primitives'">
+        <Aliases>SysDrawPrimitives</Aliases>
+      </ReferencePath>
+      <ReferencePath Condition="'%(FileName)' == 'System.Drawing.Common'">
+        <Aliases>SysDrawCommon</Aliases>
+      </ReferencePath>
+    </ItemGroup>
+  </Target>
+</Project>

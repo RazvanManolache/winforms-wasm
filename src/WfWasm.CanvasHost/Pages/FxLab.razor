@@ -1,0 +1,166 @@
+@page "/fxlab"
+@inject IJSRuntime JS
+@using Microsoft.JSInterop
+@using WfWasm.PdnCpu
+@using WfWasm.Renderer
+
+<PageTitle>FX Lab</PageTitle>
+
+<h1>FX Lab</h1>
+<p>WebGL effect emulation battery (PixiJS filters over an offscreen renderer). Each row states its verdict; tiles below show input and outputs.</p>
+
+<ul style="font-family: monospace; font-size: 13px; line-height: 1.5;">
+    @foreach (string line in _lines)
+    {
+        <li>@line</li>
+    }
+</ul>
+
+<canvas id="fxcanvas" width="470" height="320" style="border: 1px solid #999;"></canvas>
+
+@code {
+    private readonly List<string> _lines = ["booting…"];
+    private bool _ran;
+
+    private const int S = 128;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender || _ran) return;
+        _ran = true;
+        _lines.Clear();
+        try
+        {
+            RunBattery();
+        }
+        catch (Exception ex)
+        {
+            Say("FATAL " + ex.GetType().Name + ": " + ex.Message.Split('\n')[0]);
+        }
+
+        StateHasChanged();
+        await Task.CompletedTask;
+    }
+
+    private void Say(string line)
+    {
+        _lines.Add(line);
+        try { Console.WriteLine("[FXLAB] " + line); } catch { }
+    }
+
+    private static uint[] Pattern()
+    {
+        uint[] px = new uint[S * S];
+        for (int y = 0; y < S; y++)
+            for (int x = 0; x < S; x++)
+            {
+                uint c = (x < S / 2)
+                    ? (y < S / 2 ? 0xFFFF0000u : 0xFF0000FFu)
+                    : (y < S / 2 ? 0xFF00FF00u : 0xFFFFFFFFu);
+                if (y >= 56 && y < 72) c = 0x80800000u; // 50% red band (premultiplied)
+                px[y * S + x] = c;
+            }
+
+        return px;
+    }
+
+    private static int MaxDiff(uint[] a, uint[] b)
+    {
+        int worst = 0;
+        for (int i = 0; i < a.Length; i++)
+        {
+            uint d = (uint)Math.Abs((int)(a[i] & 0xFF) - (int)(b[i] & 0xFF));
+            d = Math.Max(d, (uint)Math.Abs((int)((a[i] >> 8) & 0xFF) - (int)((b[i] >> 8) & 0xFF)));
+            d = Math.Max(d, (uint)Math.Abs((int)((a[i] >> 16) & 0xFF) - (int)((b[i] >> 16) & 0xFF)));
+            d = Math.Max(d, (uint)Math.Abs((int)((a[i] >> 24) & 0xFF) - (int)((b[i] >> 24) & 0xFF)));
+            if ((int)d > worst) worst = (int)d;
+        }
+
+        return worst;
+    }
+
+    private void RunBattery()
+    {
+        Say("caps=" + WebGlFx.CapsText);
+        if (!WebGlFx.IsAvailable)
+        {
+            Say("SKIP polarity=no-webgl (bridge unavailable in this browser)");
+            return;
+        }
+
+        uint[] input = Pattern();
+        var empty = new Dictionary<string, object?>();
+        var rec = new RecordingRenderer();
+        int tile = 0;
+
+        void Show(string label, uint[]? bgra)
+        {
+            int col = tile % 3, row = tile / 3;
+            float x = 10 + col * 155, y = 10 + row * 155;
+            rec.DrawText(label, x, y + 12, "12px sans-serif", 0x000000FFu);
+            if (bgra is not null)
+            {
+                byte[] rgba = new byte[bgra.Length * 4];
+                WebGlFx.BgraToRgba(bgra, rgba);
+                rec.DrawImage(rgba, S, S, x, y + 18, S, S);
+            }
+
+            tile++;
+        }
+
+        Show("input", input);
+
+        // 1. Identity colormatrix must be bit-exact.
+        float[] ident = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        uint[]? id = WebGlFx.TryRender("ColorMatrixEffect",
+            new Dictionary<string, object?> { ["Matrix"] = ident }, input, S, S);
+        Say(id is null ? "FAIL identity=null" : "identity maxdiff=" + MaxDiff(input, id) + (MaxDiff(input, id) == 0 ? " PASS" : ""));
+        Show("identity", id);
+
+        // 2. Invert twice must round-trip.
+        uint[]? inv = WebGlFx.TryRender("InvertEffect", empty, input, S, S);
+        uint[]? inv2 = inv is null ? null : WebGlFx.TryRender("InvertEffect", empty, inv, S, S);
+        Say(inv is null || inv2 is null ? "FAIL invert=null" : "invert2 maxdiff=" + MaxDiff(input, inv2) + (MaxDiff(input, inv2) <= 1 ? " PASS" : ""));
+        Show("invert", inv);
+
+        // 3. Grayscale: R==G==B and alpha preserved (weight-agnostic).
+        uint[]? gs = WebGlFx.TryRender("GrayscaleEffect", empty, input, S, S);
+        if (gs is null) Say("FAIL grayscale=null");
+        else
+        {
+            int spread = 0, alphaDrift = 0;
+            for (int i = 0; i < gs.Length; i++)
+            {
+                int r = (int)((gs[i] >> 16) & 0xFF), g = (int)((gs[i] >> 8) & 0xFF), b = (int)(gs[i] & 0xFF);
+                spread = Math.Max(spread, Math.Max(Math.Abs(r - g), Math.Abs(g - b)));
+                alphaDrift = Math.Max(alphaDrift, Math.Abs((int)((gs[i] >> 24) & 0xFF) - (int)((input[i] >> 24) & 0xFF)));
+            }
+
+            Say($"grayscale spread={spread} alphadrift={alphaDrift}" + (spread <= 1 && alphaDrift <= 1 ? " PASS" : ""));
+        }
+
+        Show("grayscale", gs);
+
+        // 4. Blur keeps quadrant centers (edges may bleed, centers must not).
+        uint[]? bl = WebGlFx.TryRender("GaussianBlurEffect",
+            new Dictionary<string, object?> { ["Radius"] = 4f }, input, S, S);
+        if (bl is null) Say("FAIL blur=null");
+        else
+        {
+            int worst = 0;
+            foreach ((int x, int y) in new[] { (32, 32), (96, 32), (32, 96), (96, 96) })
+                worst = Math.Max(worst, MaxDiff([input[y * S + x]], [bl[y * S + x]]));
+            Say("blur centers worst=" + worst + (worst <= 8 ? " PASS" : ""));
+        }
+
+        Show("blur r4", bl);
+
+        // 5. Unmapped effects answer null (CPU fallback keeps them).
+        uint[]? un = WebGlFx.TryRender("MorphologyErodeEffect", empty, input, S, S);
+        Say(un is null ? "unmapped=null PASS" : "FAIL unmapped!=null");
+
+        rec.EndFrame();
+        _ = CanvasBridge.PaintAsync(JS, "fxcanvas", rec.Commands);
+        Say("tiles=" + tile);
+    }
+}

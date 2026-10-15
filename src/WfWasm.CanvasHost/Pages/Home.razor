@@ -1,0 +1,385 @@
+@page "/"
+@page "/app/{SceneSlug}"
+@using Microsoft.AspNetCore.Components.Web
+@using Microsoft.AspNetCore.Components.Routing
+@using Microsoft.JSInterop
+@using WfWasm.Renderer
+@using WfWasm.Shim
+@inject IJSRuntime JS
+@inject SceneState State
+@inject HttpClient Http
+@inject NavigationManager Nav
+@implements IDisposable
+
+<PageTitle>@State.CurrentEntry.Label · App Studio</PageTitle>
+
+<div class="stage-layout @(State.ShowDesktopReference ? "comparing" : "")">
+<div class="live-stage">
+<canvas id="wfcanvas"
+        width="1200" height="950"
+        aria-label="Live interactive @State.CurrentEntry.Label"
+        tabindex="0"
+        @onmousedown="OnMouseDown"
+        @onmouseup="OnMouseUp"
+        @onmousemove="OnMouseMove"
+        @onkeydown="OnKeyDown"
+        @oncontextmenu="OnContextMenu"
+        @oncontextmenu:preventDefault></canvas>
+@if (_loading || _loadError is not null)
+{
+    <div class="stage-overlay @(_loadError is null ? "" : "error")" role="status">
+        @if (_loadError is null) { <div class="spinner"></div><h2>Opening @State.CurrentEntry.Label.Replace("Telerik: ", "")</h2><p id="load-stage-message">Preparing app resources…</p> }
+        else { <h2>The app could not load</h2><p>@_loadError</p><button class="subtle-button" @onclick="LoadSelectionAsync">Try again</button> }
+    </div>
+}
+</div>
+@if (State.ShowDesktopReference) { <DesktopComparison @key="State.Current" /> }
+</div>
+
+@code {
+    private readonly CanvasApp _app = new();
+    private readonly WinFormsAppHost _winFormsHost = new();
+    private DotNetObjectReference<Home>? _self;
+    private bool _loading = true;
+    private bool _disposed;
+    private string? _loadError;
+    private readonly SemaphoreSlim _selectionGate = new(1, 1);
+    private bool _canvasReady;
+
+    [Parameter]
+    public string? SceneSlug { get; set; }
+
+    // Last scene pushed to the host. Blazor can reach the same selection
+    // through two paths at once (Changed event + explicit refresh);
+    // the guard keeps host selection (and its dispose/recreate work)
+    // exactly-once per scene.
+    private AppScene? _hostScene;
+
+    // Canvas paints go through JS interop, not component rendering: skip the
+    // automatic re-render after every mouse/key event and only render when
+    // scene, reference toggle, or canvas attributes actually change.
+    private bool _needsRender = true;
+
+    protected override bool ShouldRender()
+    {
+        bool render = _needsRender;
+        _needsRender = false;
+        return render;
+    }
+
+    protected override void OnInitialized()
+    {
+        State.Changed += OnSceneChanged;
+        EnsureRepaintSubscription();
+        SelectFromSlug();
+    }
+
+    protected override void OnParametersSet()
+    {
+        // Deep link or back/forward navigation: the URL wins.
+        SelectFromSlug();
+    }
+
+    private void SelectFromSlug()
+    {
+        if (SceneState.TryParseSlug(SceneSlug, out var scene) && scene != State.Current)
+            State.Select(scene);
+    }
+
+    private void RefreshHost()
+    {
+        if (_hostScene == State.Current)
+            return;
+        _hostScene = State.Current;
+        WinFormsExecution.Run(() => _winFormsHost.SelectScene(State.Current));
+    }
+
+    private void OnSceneChanged()
+    {
+        SyncUrlWithScene();
+
+        _ = InvokeAsync(async () =>
+        {
+            _needsRender = true;
+            StateHasChanged();
+            if (_canvasReady && _hostScene != State.Current)
+                await LoadSelectionAsync();
+        });
+    }
+
+    // On-demand apps (SceneEntry.AppFolder set) fetch their assemblies
+    // from the server transform cache before the host creates the form.
+    // Bundled scenes skip fetching. Failures leave a visible retry action.
+    private async Task LoadSelectionAsync()
+    {
+        var scene = State.Current;
+        await _selectionGate.WaitAsync();
+        try
+        {
+            if (_disposed || scene != State.Current) return;
+            if (_hostScene == scene && _loadError is null) return;
+            _loading = true;
+            _loadError = null;
+            _needsRender = true;
+            StateHasChanged();
+            await JS.InvokeVoidAsync("preview.begin", SceneState.ToSlug(scene), State.CurrentEntry.Label);
+            string? folder = State.CurrentEntry.AppFolder;
+            if (folder is not null)
+                await AppAssemblyLoader.EnsureAppAsync(folder, Http, JS);
+            if (_disposed || scene != State.Current) return;
+            await JS.InvokeVoidAsync("preview.phase", "Creating app window");
+            RefreshHost();
+            await RepaintAsync();
+            await JS.InvokeVoidAsync("preview.ready");
+        }
+        catch (Exception ex)
+        {
+            _hostScene = null;
+            _loadError = ex.GetBaseException().Message.Split('\n')[0];
+            await JS.InvokeVoidAsync("preview.failed");
+            Console.WriteLine($"[Home.razor] On-demand load failed: {ex.GetType().Name}: {ex.Message.Split('\n')[0]}");
+        }
+        finally
+        {
+            if (scene == State.Current) _loading = false;
+            _needsRender = true;
+            if (!_disposed) StateHasChanged();
+            _selectionGate.Release();
+        }
+    }
+
+    private void SyncUrlWithScene()
+    {
+        string expected = "/app/" + SceneState.ToSlug(State.Current);
+        string actual;
+        try
+        {
+            actual = new Uri(Nav.Uri).AbsolutePath;
+        }
+        catch
+        {
+            return;
+        }
+
+        if (!string.Equals(actual.TrimEnd('/'), expected, StringComparison.OrdinalIgnoreCase))
+            Nav.NavigateTo(expected);
+    }
+
+    public void Dispose()
+    {
+        _disposed = true;
+        State.Changed -= OnSceneChanged;
+        System.Windows.Forms.WasmRepaintGate.RepaintRequested -= RequestPaint;
+        _self?.Dispose();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            _self = DotNetObjectReference.Create(this);
+            BrowserErrorReporter.Initialize(Http);
+            BrowserErrorReporter.InputContextProvider = () => _winFormsHost.RecentInputContext();
+            await JS.InvokeVoidAsync("wfwasm.fitCanvas", "wfcanvas", _self);
+            await JS.InvokeVoidAsync("wfwasm.installErrorReporting");
+            _canvasReady = true;
+            await LoadSelectionAsync();
+        }
+        await JS.InvokeVoidAsync("preview.refresh");
+    }
+
+    [JSInvokable]
+    public Task OnCanvasResized(int width, int height)
+    {
+        _winFormsHost.ViewWidth = Math.Max(1, width);
+        _winFormsHost.ViewHeight = Math.Max(1, height);
+        if (_hostScene is not null) WinFormsExecution.Run(_winFormsHost.OnViewportChanged);
+        RequestPaint();
+        return Task.CompletedTask;
+    }
+
+    private async Task RepaintAsync()
+    {
+        if (_disposed || _hostScene != State.Current) return;
+        var recorder = new RecordingRenderer();
+        WinFormsExecution.Run(() => _winFormsHost.Paint(recorder));
+        // Idle frames emit nothing (dirty gate): skip the interop round trip.
+        if (recorder.Commands.Count == 0)
+            return;
+        await CanvasBridge.PaintAsync(JS, "wfcanvas", recorder.Commands);
+    }
+
+    // Invalidation-driven repaint: headless Control.Invalidate is routed by
+    // the rewriter to WasmRepaintGate, which raises here (often from timer
+    // pool threads). The pump coalesces bursts into at most one repaint per
+    // frame (~60fps cap) and marshals onto the renderer context; static
+    // scenes request nothing and keep their single paint.
+    private readonly object _repaintGate = new();
+    private bool _repaintDirty;
+    private bool _repaintRunning;
+
+    // Input coalescing: mousemove storms (drag ticks vs slow frames)
+    // collapse to latest-wins -- intermediate positions are unobservable
+    // (no paint runs between them). Down/Up flush first so hit testing
+    // always sees the current position; the pump flushes before each
+    // Paint. Ordering preserved, backlogs bounded.
+    private readonly object _moveGate = new();
+    private int _pendingMoveX;
+    private int _pendingMoveY;
+    private bool _movePending;
+
+    private void EnsureRepaintSubscription()
+    {
+        System.Windows.Forms.WasmRepaintGate.RepaintRequested -= RequestPaint;
+        System.Windows.Forms.WasmRepaintGate.RepaintRequested += RequestPaint;
+    }
+
+
+    private void RequestPaint()
+    {
+        lock (_repaintGate)
+        {
+            _repaintDirty = true;
+            if (_repaintRunning)
+                return;
+            _repaintRunning = true;
+        }
+
+        _ = PumpRepaintsAsync();
+    }
+
+    private async Task PumpRepaintsAsync()
+    {
+        // Repaint requests arrive on headless timer callbacks whose
+        // ExecutionContext carries the WinForms SynchronizationContext.
+        // Its Post() targets a message loop that never pumps in the
+        // browser, so any await capturing it pends forever (silent stall,
+        // no exception). Run the pump with a cleared context; the change
+        // is AsyncLocal to this fire-and-forget flow and dies with it.
+        if (System.Threading.SynchronizationContext.Current is not null)
+            System.Threading.SynchronizationContext.SetSynchronizationContext(null);
+        for (; ; )
+        {
+            lock (_repaintGate)
+            {
+                if (!_repaintDirty)
+                {
+                    _repaintRunning = false;
+                    return;
+                }
+
+                _repaintDirty = false;
+            }
+
+            FlushPendingMove();
+            try
+            {
+                await RepaintAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+            }
+
+            // Work-conserving pace: an input already waiting (or a repaint
+            // request that arrived mid-paint) runs immediately; the 16ms cap
+            // only paces input-idle iterations (timer animation stays ~60fps
+            // while drags follow the input, not the timer).
+            bool moreWork;
+            lock (_moveGate)
+                moreWork = _movePending;
+            if (!moreWork)
+                lock (_repaintGate)
+                    moreWork = _repaintDirty;
+            if (!moreWork)
+                await Task.Delay(16);
+        }
+    }
+
+    private static System.Windows.Forms.MouseButtons ToButtons(long button) => button switch
+    {
+        1 => System.Windows.Forms.MouseButtons.Middle,
+        2 => System.Windows.Forms.MouseButtons.Right,
+        _ => System.Windows.Forms.MouseButtons.Left,
+    };
+
+    private Task OnMouseDown(Microsoft.AspNetCore.Components.Web.MouseEventArgs e)
+    {
+        try
+        {
+            int x = (int)e.OffsetX;
+            int y = (int)e.OffsetY;
+            var buttons = ToButtons(e.Button);
+            FlushPendingMove();
+            WinFormsExecution.Run(() =>
+            {
+                _winFormsHost.OnMouseDown(x, y, buttons);
+                // Click activation is left-button only, matching WinForms.
+                if (buttons == System.Windows.Forms.MouseButtons.Left)
+                    _winFormsHost.OnClick(x, y);
+            });
+            RequestPaint();
+            return Task.CompletedTask;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Home.razor] OnMouseDown error: {ex}");
+            return Task.CompletedTask;
+        }
+    }
+
+    private Task OnMouseUp(Microsoft.AspNetCore.Components.Web.MouseEventArgs e)
+    {
+        int x = (int)e.OffsetX;
+        int y = (int)e.OffsetY;
+        FlushPendingMove();
+        WinFormsExecution.Run(() => _winFormsHost.OnMouseUp(x, y, ToButtons(e.Button)));
+        RequestPaint();
+        return Task.CompletedTask;
+    }
+
+    private Task OnMouseMove(Microsoft.AspNetCore.Components.Web.MouseEventArgs e)
+    {
+        int x = (int)e.OffsetX;
+        int y = (int)e.OffsetY;
+        lock (_moveGate)
+        {
+            _pendingMoveX = x;
+            _pendingMoveY = y;
+            _movePending = true;
+        }
+
+        RequestPaint();
+        return Task.CompletedTask;
+    }
+
+    // Dispatches the latest pending move (all backlog collapses to one
+    // host call). False when nothing was pending.
+    private bool FlushPendingMove()
+    {
+        int x, y;
+        lock (_moveGate)
+        {
+            if (!_movePending)
+                return false;
+            x = _pendingMoveX;
+            y = _pendingMoveY;
+            _movePending = false;
+        }
+
+        WinFormsExecution.Run(() => _winFormsHost.OnMouseMove(x, y));
+        return true;
+    }
+
+    private Task OnKeyDown(KeyboardEventArgs e)
+    {
+        WinFormsExecution.Run(() => _winFormsHost.OnKeyDown(e.Key));
+        RequestPaint();
+        return Task.CompletedTask;
+    }
+
+    private void OnContextMenu()
+    {
+        // Absorbed (with preventDefault above): the app gets button events
+        // via OnMouseDown/Up; no menu, no repaint needed.
+    }
+}

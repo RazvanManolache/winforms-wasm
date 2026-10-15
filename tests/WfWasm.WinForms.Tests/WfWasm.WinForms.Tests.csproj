@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <EnableUnsafeBinaryFormatterSerialization>true</EnableUnsafeBinaryFormatterSerialization>
+    <NoWarn>$(NoWarn);0436</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.2" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <!-- Rewritten apps embed SDK-generated .resources blobs whose reader
+         lives in System.Resources.Extensions (same as CanvasHost/fork). -->
+    <PackageReference Include="System.Resources.Extensions" Version="9.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Compile against the MIGRATED fork (rewritten-small), not the src
+         build: the rewritten test apps bind WfWasm.Drawing-scoped signatures
+         that only the migrated copy has. Regenerate it any time with
+         E:\tmp\rewrite-small.ps1 (same coupling as WfWasm.CanvasHost). -->
+    <Reference Include="$(WfWasmMigratedForms)">
+      <!-- global keeps the existing unqualified fork refs; Fork reaches the
+           CAS stubs, which the framework ref packs forward to the
+           (runtime-absent) System.Security.Permissions assembly. -->
+      <Aliases>global,Fork</Aliases>
+    </Reference>
+    <ProjectReference Include="..\..\src\WfWasm.Drawing\WfWasm.Drawing.csproj">
+      <Aliases>global,WasmDraw</Aliases>
+    </ProjectReference>
+    <ProjectReference Include="..\..\src\Microsoft.Win32.SystemEvents\Microsoft.Win32.SystemEvents.csproj" />
+  </ItemGroup>
+
+</Project>

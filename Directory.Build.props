@@ -1,0 +1,7 @@
+<Project>
+  <PropertyGroup>
+    <WfWasmRoot>$(MSBuildThisFileDirectory)</WfWasmRoot>
+    <WfWasmArtifacts>$(WfWasmRoot).artifacts/</WfWasmArtifacts>
+    <WfWasmMigratedForms>$(WfWasmArtifacts)runtime/WfWasm.WinForms.dll</WfWasmMigratedForms>
+  </PropertyGroup>
+</Project>

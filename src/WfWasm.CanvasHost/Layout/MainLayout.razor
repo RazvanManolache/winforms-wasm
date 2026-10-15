@@ -1,0 +1,41 @@
+@inherits LayoutComponentBase
+@inject SceneState State
+@inject IJSRuntime JS
+@implements IDisposable
+
+<div class="preview-shell @(_menuOpen ? "menu-open" : "")">
+    <aside class="app-sidebar"><NavMenu /></aside>
+    <main class="preview-main">
+        <header class="preview-header">
+            <div class="app-heading">
+                <button class="icon-button menu-toggle" aria-label="Toggle app menu" aria-expanded="@_menuOpen" @onclick="() => _menuOpen = !_menuOpen">☰</button>
+                <div><span class="eyebrow">APP WORKSPACE</span><h1>@State.CurrentEntry.Label.Replace("Telerik: ", "")</h1></div>
+                <span class="live-badge"><i></i> Live app</span>
+                <div class="header-actions">
+                    <button class="subtle-button @(State.ShowDesktopReference ? "selected" : "")" aria-pressed="@State.ShowDesktopReference" @onclick="State.ToggleDesktopReference">◫ Compare desktop</button>
+                    <button class="subtle-button" @onclick="Reload">↻ Reload</button>
+                </div>
+            </div>
+            <div class="metrics-bar" aria-label="Loading measurements">
+                <div class="metric"><span>APP LOAD</span><strong id="metric-load">—</strong><small id="metric-phase">Starting</small></div>
+                <div class="metric"><span>APP DATA</span><strong id="metric-data">0.00 MB</strong><small id="metric-files">0 files</small></div>
+                <div class="metric" title="Measured HTTP transfer size for this selection, including response headers. Browser cache hits transfer no body."><span>NETWORK</span><strong id="metric-network">0.00 MB</strong><small id="metric-network-detail">Measured transfer</small></div>
+                <div class="metric" title="HTTP cache hits and in-session data reuse are counted separately."><span>CACHE REUSE</span><strong id="metric-cache">0 files</strong><small id="metric-cache-detail">Waiting for resources</small></div>
+                <div class="metric boot-metric" title="Navigation to workspace; uncompressed runtime and shell resources loaded before the app selection."><span>RUNTIME BOOT</span><strong id="metric-boot">—</strong><small id="metric-boot-detail">Navigation → workspace</small></div>
+            </div>
+        </header>
+        <div class="workspace-toolbar"><span class="workspace-label"><i></i> Interactive preview</span><span class="source-label">@State.CurrentEntry.SourceLabel</span>
+            @if (State.CurrentEntry.SourceUrl is string url) { <a href="@url" target="_blank" rel="noopener">View source ↗</a> }
+        </div>
+        <article class="preview-content">@Body</article>
+        <footer class="workspace-footer"><span>WinForms · WebAssembly</span><span>Load time ends at first canvas frame · MB = 1,000,000 bytes</span><a href="/errors" target="_blank" rel="noopener">Error inventory ↗</a></footer>
+    </main>
+</div>
+
+@code {
+    private bool _menuOpen;
+    protected override void OnInitialized() => State.Changed += OnStateChanged;
+    private void OnStateChanged() { _menuOpen = false; _ = InvokeAsync(StateHasChanged); }
+    private Task Reload() => JS.InvokeVoidAsync("preview.reload").AsTask();
+    public void Dispose() => State.Changed -= OnStateChanged;
+}

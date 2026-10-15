@@ -1,0 +1,76 @@
+@using System.Net.Http.Json
+@using System.Security.Cryptography
+@inject SceneState State
+@inject HttpClient Http
+@inject IJSRuntime JS
+
+<aside class="comparison-panel" aria-label="Desktop comparison">
+    <div class="panel-eyebrow">DESKTOP EVIDENCE</div>
+    <h2>Compare with Windows</h2>
+    <p>The live browser app stays interactive on the left. This panel shows a separate, static native capture; app state and window size can differ.</p>
+    @if (_pending) { <p>Reading capture record…</p> }
+    else if (_error is not null) { <div class="reference-notice">@_error</div> }
+    else if (_record?.file is null)
+    {
+        <div class="reference-empty"><strong>No desktop capture for this app</strong>A native screenshot with a capture record is needed before a visual comparison can be made.</div>
+    }
+    else
+    {
+        <div class="reference-notice @(_record.status == "captured" ? "fresh" : "")">
+            @(_record.status == "captured" ? "Native window capture · image hash checked" : "Unverified archive · capture provenance is unknown")
+            <div>@_record.note</div>
+        </div>
+        @if (_image is null)
+        {
+            <button class="subtle-button" @onclick="LoadImageAsync">Show unverified image</button>
+        }
+        else
+        {
+            <div class="reference-frame"><img src="@_image" alt="Static Windows capture of @State.CurrentEntry.Label" /></div>
+            <div class="reference-actions"><button class="subtle-button" @onclick="ToggleSize">Fit / actual pixels</button><a href="@_image" download="@_record.file">Download original PNG ↓</a></div>
+        }
+        <dl class="reference-details">
+            <dt>Capture time</dt><dd>@(_record.capturedAt ?? "Unknown — file modification time is not capture evidence")</dd>
+            <dt>Method</dt><dd>@(_record.method ?? "Unknown")</dd>
+            <dt>Window</dt><dd>@(_record.windowTitle ?? "Not recorded")</dd>
+            <dt>Image</dt><dd>@_record.file · @_record.width × @_record.height px</dd>
+            <dt>Image SHA-256</dt><dd>@_record.sha256</dd>
+            @if (_record.executable is not null) { <dt>Native executable</dt><dd>@_record.executable</dd><dt>Executable SHA-256</dt><dd>@_record.executableSha256</dd> }
+        </dl>
+    }
+    <div class="reference-actions"><button class="subtle-button" @onclick="Snapshot">Save browser frame ↓</button></div>
+    <p class="reference-hint">A screenshot records one moment. It does not verify functional compatibility or pixel parity. Use the same app state and dimensions when comparing.</p>
+</aside>
+
+@code {
+    private sealed record Capture(string slug, string? file, string? sha256, int width, int height, string? capturedAt, string? method, string? windowTitle, string? executable, string? executableSha256, string status, string? note);
+    private Capture? _record;
+    private string? _image, _error;
+    private bool _pending = true;
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            var records = await Http.GetFromJsonAsync<List<Capture>>("groundtruth/references.json");
+            _record = records?.FirstOrDefault(r => r.slug == SceneState.ToSlug(State.Current));
+            if (_record?.status == "captured") await LoadImageAsync();
+        }
+        catch (Exception) { _error = "The capture record could not be loaded. No reference has been verified."; }
+        finally { _pending = false; }
+    }
+    private async Task LoadImageAsync()
+    {
+        if (_record?.file is null) return;
+        try
+        {
+            if (Path.GetFileName(_record.file) != _record.file) throw new InvalidDataException();
+            var bytes = await Http.GetByteArrayAsync("groundtruth/" + Uri.EscapeDataString(_record.file));
+            if (!Convert.ToHexString(SHA256.HashData(bytes)).Equals(_record.sha256, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("Image hash differs from capture record.");
+            _image = "data:image/png;base64," + Convert.ToBase64String(bytes);
+        }
+        catch (Exception) { _error = "The reference image is missing or its hash differs from the capture record. It cannot be shown."; }
+    }
+    private Task ToggleSize() => JS.InvokeVoidAsync("preview.toggleReferenceSize").AsTask();
+    private Task Snapshot() => JS.InvokeVoidAsync("preview.snapshot").AsTask();
+}

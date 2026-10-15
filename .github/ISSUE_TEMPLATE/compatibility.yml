@@ -1,0 +1,21 @@
+name: Compatibility problem
+description: Report a reproducible rendering, input, or application behavior gap.
+body:
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps and minimal example
+      description: Share only source and data you can redistribute. Do not upload application binaries, commercial libraries, or private data.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and relevant errors
+      description: Include browser, OS, SDK, and the relevant error message. Remove private paths and data.

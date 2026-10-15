@@ -1,0 +1,6 @@
+# Hand type map for the rewrite queue: source full name = target assembly : target full name.
+# Same-name matches are drafted automatically; only cross-assembly and
+# renamed cases need entries here.
+# System.Drawing.SystemColors=WfWasm.Shim:WfWasm.Shim.SystemColors
+# System.Threading.ThreadExceptionEventHandler=WfWasm.Shim:System.Threading.ThreadExceptionEventHandler
+# System.Threading.ThreadExceptionEventArgs=WfWasm.Shim:System.Threading.ThreadExceptionEventArgs

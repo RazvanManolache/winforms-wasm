@@ -1,0 +1,216 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <!-- 
+    Microsoft ResX Schema 
+    
+    Version 2.0
+    
+    The primary goals of this format is to allow a simple XML format 
+    that is mostly human readable. The generation and parsing of the 
+    various data types are done through the TypeConverter classes 
+    associated with the data types.
+    
+    Example:
+    
+    ... ado.net/XML headers & schema ...
+    <resheader name="resmimetype">text/microsoft-resx</resheader>
+    <resheader name="version">2.0</resheader>
+    <resheader name="reader">System.Resources.ResXResourceReader, System.Windows.Forms, ...</resheader>
+    <resheader name="writer">System.Resources.ResXResourceWriter, System.Windows.Forms, ...</resheader>
+    <data name="Name1"><value>this is my long string</value><comment>this is a comment</comment></data>
+    <data name="Color1" type="System.Drawing.Color, System.Drawing">Blue</data>
+    <data name="Bitmap1" mimetype="application/x-microsoft.net.object.binary.base64">
+        <value>[base64 mime encoded serialized .NET Framework object]</value>
+    </data>
+    <data name="Icon1" type="System.Drawing.Icon, System.Drawing" mimetype="application/x-microsoft.net.object.bytearray.base64">
+        <value>[base64 mime encoded string representing a byte array form of the .NET Framework object]</value>
+        <comment>This is a comment</comment>
+    </data>
+                
+    There are any number of "resheader" rows that contain simple 
+    name/value pairs.
+    
+    Each data row contains a name, and value. The row also contains a 
+    type or mimetype. Type corresponds to a .NET class that support 
+    text/value conversion through the TypeConverter architecture. 
+    Classes that don't support this are serialized and stored with the 
+    mimetype set.
+    
+    The mimetype is used for serialized objects, and tells the 
+    ResXResourceReader how to depersist the object. This is currently not 
+    extensible. For a given mimetype the value must be set accordingly:
+    
+    Note - application/x-microsoft.net.object.binary.base64 is the format 
+    that the ResXResourceWriter will generate, however the reader can 
+    read any of the formats listed below.
+    
+    mimetype: application/x-microsoft.net.object.binary.base64
+    value   : The object must be serialized with 
+            : System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
+            : and then encoded with base64 encoding.
+    
+    mimetype: application/x-microsoft.net.object.soap.base64
+    value   : The object must be serialized with 
+            : System.Runtime.Serialization.Formatters.Soap.SoapFormatter
+            : and then encoded with base64 encoding.
+
+    mimetype: application/x-microsoft.net.object.bytearray.base64
+    value   : The object must be serialized into a byte array 
+            : using a System.ComponentModel.TypeConverter
+            : and then encoded with base64 encoding.
+    -->
+  <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata">
+    <xsd:import namespace="http://www.w3.org/XML/1998/namespace" />
+    <xsd:element name="root" msdata:IsDataSet="true">
+      <xsd:complexType>
+        <xsd:choice maxOccurs="unbounded">
+          <xsd:element name="metadata">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" />
+              </xsd:sequence>
+              <xsd:attribute name="name" use="required" type="xsd:string" />
+              <xsd:attribute name="type" type="xsd:string" />
+              <xsd:attribute name="mimetype" type="xsd:string" />
+              <xsd:attribute ref="xml:space" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="assembly">
+            <xsd:complexType>
+              <xsd:attribute name="alias" type="xsd:string" />
+              <xsd:attribute name="name" type="xsd:string" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="data">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+                <xsd:element name="comment" type="xsd:string" minOccurs="0" msdata:Ordinal="2" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" msdata:Ordinal="1" />
+              <xsd:attribute name="type" type="xsd:string" msdata:Ordinal="3" />
+              <xsd:attribute name="mimetype" type="xsd:string" msdata:Ordinal="4" />
+              <xsd:attribute ref="xml:space" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="resheader">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" />
+            </xsd:complexType>
+          </xsd:element>
+        </xsd:choice>
+      </xsd:complexType>
+    </xsd:element>
+  </xsd:schema>
+  <resheader name="resmimetype">
+    <value>text/microsoft-resx</value>
+  </resheader>
+  <resheader name="version">
+    <value>2.0</value>
+  </resheader>
+  <resheader name="reader">
+    <value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <resheader name="writer">
+    <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <data name="WFO0003Title" xml:space="preserve">
+    <value>Unsupported high DPI configuration</value>
+  </data>
+  <data name="WFO0003Message_CS" xml:space="preserve">
+    <value>Remove high DPI settings from {0} and configure via Application.SetHighDpiMode API or '{1}' project property</value>
+  </data>
+  <data name="WFO0003Message_VB" xml:space="preserve">
+    <value>Remove high DPI settings from {0} and configure via '{1}' property in Application Framework</value>
+  </data>
+  <data name="WFO3000Title" xml:space="preserve">
+    <value>Avoid unsupported code in InitializeComponent</value>
+  </data>
+  <data name="WFO3000Message" xml:space="preserve">
+    <value>'{0}' cannot round-trip through the WinForms Designer; keep InitializeComponent unrolled and move runtime-only logic to the user partial after InitializeComponent</value>
+  </data>
+  <data name="WFO3001Title" xml:space="preserve">
+    <value>Keep custom members out of Designer files</value>
+  </data>
+  <data name="WFO3001Message" xml:space="preserve">
+    <value>Move custom member '{0}' to the user partial; the Designer partial is reserved for generated initialization and infrastructure</value>
+  </data>
+  <data name="WFO3002Title" xml:space="preserve">
+    <value>Keep generated fields at the end of the Designer file</value>
+  </data>
+  <data name="WFO3002Message" xml:space="preserve">
+    <value>Declare designer member '{0}' at the end of the Designer partial, after its methods, to preserve the generated layout</value>
+  </data>
+  <data name="WFO3003Title" xml:space="preserve">
+    <value>Keep event and delegate declarations out of Designer files</value>
+  </data>
+  <data name="WFO3003Message" xml:space="preserve">
+    <value>Move {0} '{1}' to the user partial; keep its declaration out of the Designer-generated partial</value>
+  </data>
+  <data name="WFO3004Title" xml:space="preserve">
+    <value>Avoid collection expressions in Designer files</value>
+  </data>
+  <data name="WFO3004Message" xml:space="preserve">
+    <value>Collection expressions cannot round-trip through the WinForms Designer; use an explicit typed array or unrolled collection Add calls</value>
+  </data>
+  <data name="WFO3005Title" xml:space="preserve">
+    <value>Avoid nameof expressions in InitializeComponent</value>
+  </data>
+  <data name="WFO3005Message" xml:space="preserve">
+    <value>CodeDOM cannot represent nameof in InitializeComponent; replace it with the serialized string literal</value>
+  </data>
+  <data name="WFO3006Title" xml:space="preserve">
+    <value>Avoid conditional expressions in InitializeComponent</value>
+  </data>
+  <data name="WFO3006Message" xml:space="preserve">
+    <value>CodeDOM cannot represent conditional expressions in InitializeComponent; serialize a fixed value and move runtime-only choices to the user partial</value>
+  </data>
+  <data name="WFO3007Title" xml:space="preserve">
+    <value>Avoid null-coalescing expressions in InitializeComponent</value>
+  </data>
+  <data name="WFO3007Message" xml:space="preserve">
+    <value>CodeDOM cannot represent null-coalescing in InitializeComponent; use an explicit designer assignment and move runtime-only fallback logic to the user partial</value>
+  </data>
+  <data name="WFO3008Title" xml:space="preserve">
+    <value>Avoid null-conditional expressions in InitializeComponent</value>
+  </data>
+  <data name="WFO3008Message" xml:space="preserve">
+    <value>CodeDOM cannot represent null-conditional access in InitializeComponent; keep designer assignments explicit and move null-dependent runtime logic to the user partial</value>
+  </data>
+  <data name="WFO3009Title" xml:space="preserve">
+    <value>Avoid interpolated strings in InitializeComponent</value>
+  </data>
+  <data name="WFO3009Message" xml:space="preserve">
+    <value>CodeDOM cannot represent interpolated strings in InitializeComponent; use the serialized string literal or a supported resource lookup</value>
+  </data>
+  <data name="WFO3010Title" xml:space="preserve">
+    <value>Avoid anonymous functions in InitializeComponent</value>
+  </data>
+  <data name="WFO3010Message" xml:space="preserve">
+    <value>CodeDOM cannot represent anonymous functions in InitializeComponent; use a named method in the user partial and a named-method event hookup</value>
+  </data>
+  <data name="WFO2000Title" xml:space="preserve">
+    <value>Avoid constructing fresh reference instances in property getters</value>
+  </data>
+  <data name="WFO2000Message" xml:space="preserve">
+    <value>Getter '{0}' directly returns a newly constructed reference instance on this path; cache it only if stable identity is intended, or use a factory method for intentional creation</value>
+  </data>
+  <data name="WFO3010Message_VB" xml:space="preserve">
+    <value>CodeDOM cannot represent lambdas in InitializeComponent; use a named method in the user partial, with Handles for designer member events or AddressOf for local component events</value>
+  </data>
+  <data name="WFO3011Title" xml:space="preserve">
+    <value>Declare Designer component members WithEvents</value>
+  </data>
+  <data name="WFO3011Message" xml:space="preserve">
+    <value>Designer component member '{0}' must support the VB event model; add WithEvents to its declaration and use Handles for its named event handlers in the user partial</value>
+  </data>
+  <data name="WFO3012Title" xml:space="preserve">
+    <value>Use Handles for Designer member events</value>
+  </data>
+  <data name="WFO3012Message" xml:space="preserve">
+    <value>Use Handles {0} on a named handler in the user partial instead of AddHandler in InitializeComponent; remove the redundant hookup and keep component members WithEvents</value>
+  </data>
+</root>

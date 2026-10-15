@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.2" />
+    <PackageReference Include="Mono.Cecil" Version="0.11.5" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\WfWasm.Rewrite\WfWasm.Rewrite.csproj" />
+    <ProjectReference Include="..\..\src\WfWasm.PdnCpu\WfWasm.PdnCpu.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\..\src\WfWasm.Shim\WfWasm.Shim.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\..\src\WfWasm.Drawing\WfWasm.Drawing.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\WfWasm.Rewrite.Fixture\WfWasm.Rewrite.Fixture.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+</Project>

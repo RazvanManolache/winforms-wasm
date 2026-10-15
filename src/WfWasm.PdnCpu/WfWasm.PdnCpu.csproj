@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <!-- Deliberately reference-free: every parameter is a primitive or a
+       handle (long). PDN-typed glue is synthesized into the target module
+       by the rewriter, so this assembly never binds the PDN universe. -->
+
+</Project>
