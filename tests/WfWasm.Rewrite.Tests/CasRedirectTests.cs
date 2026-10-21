@@ -4,7 +4,8 @@ using Xunit;
 
 public sealed class CasRedirectTests
 {
-    private static readonly string TelerikPool = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release");
+    private static readonly string TelerikPool =
+        TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release");
 
     private static string ShimDll(string project, string name)
     {

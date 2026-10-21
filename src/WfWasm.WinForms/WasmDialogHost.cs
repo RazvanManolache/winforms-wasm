@@ -176,8 +176,8 @@ public static class WasmDialogHost
             UntrackLocked(form);
             s_windows.Add(new WasmShownWindow(form, modal));
         }
-        // TEMP-DLG: trace dialog presentation (retire before final).
-        try { Console.WriteLine($"[TMPDLG] Track {form.GetType().FullName} '{form.Text}' vis={form.Visible} modal={modal}"); } catch { }
+        // Presentation intentionally emits no console trace.
+        // (TMPDLG trace retired 2026-10-21: sweep baselines must stay clean.)
     }
 
     public static void Untrack(Form form)
@@ -199,7 +199,7 @@ public static class WasmDialogHost
 
     // Live entries oldest-first; invisible, disposed or disposing forms
     // are dropped here so Close() needs no explicit pop.
-    // TEMP-DLG: first-prune notice per form type (retire before final).
+    // (Prune notices retired with the TMPDLG trace.)
     private static readonly HashSet<string> s_pruneNoticed = new();
     public static WasmShownWindow[] Snapshot()
     {
@@ -217,7 +217,7 @@ public static class WasmDialogHost
                     {
                         if (s_pruneNoticed.Add(tn + "|" + (!vis ? "inv" : "disp")))
                         {
-                            try { Console.WriteLine($"[TMPDLG] Prune {tn} vis={vis} disposed={disposed} disposing={disposing}"); } catch { }
+                            // (trace retired; prune retained)
                         }
                     }
                     s_windows.RemoveAt(i);
@@ -251,5 +251,24 @@ public static class WasmDialogHost
             form = null;
             return false;
         }
+    }
+
+    // Fresh-host isolation (called only from the canvas host
+    // constructor): drop every tracked window. The browser constructs
+    // one host per session (empty registry: no-op); tests construct one
+    // per test, and a previous test's abandoned windows would otherwise
+    // steal routing. Presented marks need no clearing (weak-keyed by
+    // form instance: dead forms collect, live ones never collide);
+    // turn and prune-notice state stay monotonic across the process.
+    public static void ResetForNewHost()
+    {
+        try
+        {
+            lock (s_lock)
+            {
+                s_windows.Clear();
+            }
+        }
+        catch { }
     }
 }

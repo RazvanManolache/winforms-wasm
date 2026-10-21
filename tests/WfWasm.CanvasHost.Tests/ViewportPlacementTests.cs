@@ -6,7 +6,7 @@ public sealed class ViewportPlacementTests
     [Fact]
     public void Resize_ReCenters_AutoPlaced_Form()
     {
-        var host = new WinFormsAppHost(); // defaults 1200x950
+        using var host = new WinFormsAppHost(); // defaults 1200x950
         host.SelectScene(AppScene.Smoke); // 500x350 -> (350, 300)
         var form = host.GetOrCreateForm(AppScene.Smoke)!;
         Assert.Equal(350, form.Location.X);
@@ -23,7 +23,7 @@ public sealed class ViewportPlacementTests
     [Fact]
     public void Resize_Leaves_Dragged_Form_Alone()
     {
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         host.SelectScene(AppScene.Smoke);
         var form = host.GetOrCreateForm(AppScene.Smoke)!;
 

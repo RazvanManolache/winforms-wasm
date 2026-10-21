@@ -444,4 +444,204 @@ public static class NrbfImage
             return v;
         }
     }
+
+    // ImageListStreamer blobs (designer ".ImageStream" entries): the NRBF
+    // payload wraps a "MSFt"-magic body = RunLengthEncoder-compressed
+    // (count,value) pairs (upstream ImageListStreamer) over a comctl32
+    // legacy ImageList_Write stream: 28-byte IL head ("IL", image count,
+    // slot System.Drawing.Size) + color BMP + optional 1bpp mask BMP. These carry no
+    // image magic, so TryExtractImageBytes never matches them.
+    public static bool TryExtractImageListBytes(byte[]? nrbf, out byte[] msft)
+    {
+        msft = [];
+        if (nrbf is null || nrbf.Length < 20 || nrbf.Length > 100_000_000)
+            return false;
+        try
+        {
+            var walker = new Walker(nrbf);
+            if (!walker.Run())
+                return false;
+            byte[]? best = null;
+            foreach (byte[] candidate in walker.ByteArrays)
+            {
+                if (candidate.Length < 8 || !HasImageListMagic(candidate))
+                    continue;
+                if (best is null || candidate.Length > best.Length)
+                    best = candidate;
+            }
+            if (best is null)
+                return false;
+            msft = best;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    internal static bool HasImageListMagic(byte[] bytes) =>
+        bytes.Length >= 4 && bytes[0] == (byte)'M' && bytes[1] == (byte)'S' && bytes[2] == (byte)'F' && bytes[3] == (byte)'t';
+
+    // Decodes an "MSFt" imagelist stream into per-slot bitmaps (mask
+    // folded into alpha). Never throws: every anomaly answers false and
+    // the caller degrades to an empty list.
+    public static bool TryDecodeImageListStream(byte[]? msft, out System.Drawing.Bitmap[]? images, out System.Drawing.Size slot, out int bitDepth)
+    {
+        images = null;
+        slot = System.Drawing.Size.Empty;
+        bitDepth = 0;
+        if (msft is null || !HasImageListMagic(msft))
+            return false;
+        try
+        {
+            return DecodeImageListStreamCore(msft, out images, out slot, out bitDepth);
+        }
+        catch
+        {
+            images = null;
+            return false;
+        }
+    }
+
+    private static bool DecodeImageListStreamCore(byte[] msft, out System.Drawing.Bitmap[]? images, out System.Drawing.Size slot, out int bitDepth)
+    {
+        images = null;
+        slot = System.Drawing.Size.Empty;
+        bitDepth = 0;
+        if ((msft.Length - 4) % 2 != 0)
+            return false;
+        long total = 0;
+        for (int i = 4; i < msft.Length; i += 2)
+            total += msft[i];
+        if (total <= 0 || total > 100_000_000)
+            return false;
+        byte[] il = new byte[total];
+        int w = 0;
+        for (int i = 4; i < msft.Length; i += 2)
+        {
+            int count = msft[i];
+            if (count <= 0)
+                return false;
+            byte value = msft[i + 1];
+            for (int j = 0; j < count; j++)
+                il[w++] = value;
+        }
+        if (il.Length < 28 + 26 || il[0] != (byte)'I' || il[1] != (byte)'L')
+            return false;
+        int imageCount = il[4] | (il[5] << 8);
+        int cx = il[10] | (il[11] << 8);
+        int cy = il[12] | (il[13] << 8);
+        if (imageCount <= 0 || imageCount > 4096 || cx <= 0 || cy <= 0 || cx > 1024 || cy > 1024)
+            return false;
+        if (il[28] != (byte)'B' || il[29] != (byte)'M')
+            return false;
+        byte[] colorSlice = new byte[il.Length - 28];
+        Buffer.BlockCopy(il, 28, colorSlice, 0, colorSlice.Length);
+        System.Drawing.Bitmap strip;
+        try { strip = System.Drawing.BmpCodec.Decode(colorSlice); }
+        catch { return false; }
+        if (strip.Width < imageCount * cx || strip.Height < cy)
+            return false;
+        if (ReadI32(il, 28 + 14) < 40)
+            return false;
+        bitDepth = il[28 + 14 + 14] | (il[28 + 14 + 15] << 8);
+        int colorDataOff = ReadI32(il, 28 + 10);
+        int colorW = ReadI32(il, 28 + 14 + 4);
+        int colorHSigned = ReadI32(il, 28 + 14 + 8);
+        int colorH = Math.Abs(colorHSigned);
+        bool colorTopDown = colorHSigned < 0;
+        long colorStride = ((long)colorW * bitDepth + 31) / 32 * 4;
+        long colorEnd = 28L + colorDataOff + colorStride * colorH;
+        bool hasMask = false;
+        byte[]? maskBits = null;
+        int maskW = 0;
+        if (colorEnd >= 0 && colorEnd + 26 <= il.Length && il[colorEnd] == (byte)'B' && il[colorEnd + 1] == (byte)'M')
+            hasMask = TryReadMaskBits(il, (int)colorEnd, strip.Width, strip.Height, out maskBits, out maskW);
+        images = new System.Drawing.Bitmap[imageCount];
+        int[] src = strip.Pixels;
+        for (int s = 0; s < imageCount; s++)
+        {
+            var slotBmp = new System.Drawing.Bitmap(cx, cy);
+            int[] dest = slotBmp.Pixels;
+            for (int y = 0; y < cy; y++)
+            {
+                for (int x = 0; x < cx; x++)
+                {
+                    int gx = s * cx + x;
+                    int argb = src[y * strip.Width + gx];
+                    bool transparent = hasMask && maskBits![y * maskW + gx] == 1;
+                    int alpha = transparent ? 0 : (bitDepth == 32 ? ColorAlphaAt(il, 28, colorDataOff, (int)colorStride, colorTopDown, colorH, gx, y) : 255);
+                    dest[y * cx + x] = (alpha << 24) | (argb & 0xFFFFFF);
+                }
+            }
+            images[s] = slotBmp;
+        }
+        slot = new System.Drawing.Size(cx, cy);
+        return true;
+    }
+
+    // Reads the 1bpp mask BMP into top-down 0/1 bytes. Anything
+    // unexpected (wrong depth, compression, geometry) answers false and
+    // the caller renders opaque.
+    private static bool TryReadMaskBits(byte[] il, int at, int stripW, int stripH, out byte[]? bits, out int maskW)
+    {
+        bits = null;
+        maskW = 0;
+        try
+        {
+            if (at < 0 || at + 26 > il.Length)
+                return false;
+            if (ReadI32(il, at + 14) != 40)
+                return false;
+            int mw = ReadI32(il, at + 14 + 4);
+            int mhSigned = ReadI32(il, at + 14 + 8);
+            int mh = Math.Abs(mhSigned);
+            bool topDown = mhSigned < 0;
+            int bpp = il[at + 14 + 14] | (il[at + 14 + 15] << 8);
+            if (bpp != 1 || ReadI32(il, at + 14 + 16) != 0 || mw != stripW || mh != stripH)
+                return false;
+            int dataOff = ReadI32(il, at + 10);
+            long stride = ((long)mw + 31) / 32 * 4;
+            if (dataOff < 0 || (long)dataOff + stride * mh > il.Length - at)
+                return false;
+            var bytes = new byte[mw * mh];
+            for (int y = 0; y < mh; y++)
+            {
+                int srcRow = topDown ? y : mh - 1 - y;
+                for (int x = 0; x < mw; x++)
+                    bytes[y * mw + x] = (byte)((il[at + dataOff + srcRow * stride + (x >> 3)] >> (7 - (x & 7))) & 1);
+            }
+            bits = bytes;
+            maskW = mw;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // System.Drawing.BmpCodec drops the alpha channel of BI_RGB 32bpp data; recover it
+    // from the XOR bytes for imagelist slot compositing.
+    private static int ColorAlphaAt(byte[] il, int colorAt, int dataOff, int stride, bool topDown, int height, int gx, int y)
+    {
+        try
+        {
+            if (dataOff < 0 || stride <= 0 || height <= 0)
+                return 255;
+            int srcRow = topDown ? y : height - 1 - y;
+            long o = (long)colorAt + dataOff + (long)srcRow * stride + (long)gx * 4 + 3;
+            if (o < 0 || o >= il.Length)
+                return 255;
+            return il[o];
+        }
+        catch
+        {
+            return 255;
+        }
+    }
+
+    private static int ReadI32(byte[] bytes, int at) =>
+        bytes[at] | (bytes[at + 1] << 8) | (bytes[at + 2] << 16) | (bytes[at + 3] << 24);
 }

@@ -7,13 +7,15 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.Server" Version="9.0.20" />
+    <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.Server" Version="9.0.21" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\WfWasm.ErrorLog\WfWasm.ErrorLog.csproj" />
     <ProjectReference Include="..\WfWasm.CanvasHost\WfWasm.CanvasHost.csproj" />
     <ProjectReference Include="..\WfWasm.Rewrite\WfWasm.Rewrite.csproj" />
+    <ProjectReference Include="..\WfWasm.WinRtStubs.Foundation\WfWasm.WinRtStubs.Foundation.csproj" />
+    <ProjectReference Include="..\WfWasm.WinRtStubs.Universal\WfWasm.WinRtStubs.Universal.csproj" />
   </ItemGroup>
 
 </Project>

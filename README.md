@@ -20,23 +20,40 @@ The idea is to **use AI to convert the “SAFE” part**: the runtime, drawing l
 
 This is an early experiment. Selected applications render and respond to input today. Compatibility is incomplete, and preserving behavior still requires testing each application's real workflows.
 
+## Recent progress — October 2026
+
+The experiment now covers more of the platform around a real desktop application:
+
+- **An independent app library and runtime sessions.** Search/filter the library, switch apps during startup, stop/restart a session, and inspect errors attributed to the app and session that produced them. Load time, app payload, network transfer and cache reuse are reported separately.
+- **A wider compatibility corpus.** The local catalog has 62 entries, including 42 selected Syncfusion samples spanning editors, grids, diagrams, maps, charts, navigation and documents. The catalog is a way to expose missing behavior; it is not a claim that all these applications work. A source-only checkout shows only apps whose inputs are actually present.
+- **More runtime and drawing compatibility.** New work covers image lists/resources, rich-text streaming and drawing, cursors/dialog hooks, layout/input plumbing, and additional Windows API boundaries. The Syncfusion diagram node gallery now reaches its real form and rich-text nodes in the captured development build.
+- **A retained-rendering foundation and WebGL2 experiments.** Rendering commands, surface/resource lifetimes, composition and a GLES/WebGL binding now have dedicated tests and a browser probe. Normal application painting still uses the CPU path; broad GPU acceleration and its performance acceptance remain work in progress.
+- **Platform-service foundations.** A separate demo and server/browser modules explore declared file mounts, browser file selection, scoped virtual registry storage and browser printing. Wiring these services consistently into existing applications is still incomplete; the presence of the demo is not full WinForms API parity.
+- **Tests that distinguish launch from behavior.** New shell-isolation, pixel, platform, rewrite and browser-gallery checks exercise real failure paths and selected workflows. The gallery runner is an early implementation with explicitly blocked/untested dimensions, not a certification engine. Missing hardware evidence cannot pass the GPU acceptance gate.
+
+See the [progress and validation notes](docs/progress-2026-10.md) for what was checked in this source update and what remains open.
+
 ## See it running
 
-These are fresh captures of the live browser canvas. The controls and images shown below are rendered by the running application code.
+The following are **unaltered captures from the live local browser on 21 October 2026**, at its normal viewport. They show existing application code and its supported behavior, including visible limitations. They are not desktop reference images or full compatibility claims.
 
-![Paint.NET 5.1.12 running in the browser with its editor interface and a basic brush stroke visible; compatibility is incomplete.](docs/screenshots/paint-net.jpg)
+![Paint.NET 5.1.12 in WebAssembly after four brush drags draw a W-shaped stroke; editor panels remain incomplete.](docs/screenshots/paint-net-2026-10.jpg)
 
-**Paint.NET 5.1.12 — the most ambitious demo so far.** Seeing an application of this scale reach its editor and render a basic brush stroke in WebAssembly is an encouraging result. It is still only partially working: rendering and editing functionality are incomplete, and many workflows need further compatibility work.
+**Paint.NET 5.1.12 remains the most ambitious showcase.** The editor loads and real brush input changes the document and its modified state. It is still partially working: panels, rendering, editing commands, effects and file workflows need further compatibility work. This capture establishes basic drawing, not a complete image editor.
 
-![Telerik Photo Album running in the browser after a photo was dragged, with loading and data measurements above the canvas.](docs/screenshots/photo-album.jpg)
+![Syncfusion Map Selection with Brazil highlighted after clicking its actual country polygon in the browser.](docs/screenshots/map-selection-2026-10.jpg)
 
-*Telerik Photo Album: the dog photo has been dragged into the upper part of the canvas. [Before and after captures](docs/screenshots/README.md) show the interaction.*
+*Map Selection: clicking Brazil highlights its actual polygon. This exercises shape rendering and hit testing; map zoom/pan and full data workflows were not certified.*
 
-![An existing WinForms calculator running in the browser and displaying 15 after entering 7 plus 8.](docs/screenshots/calculator.jpg)
+![Syncfusion Barcode after editing the input to /wasm and pressing UPDATE; the generated QR code independently decodes to /wasm.](docs/screenshots/barcode-update-2026-10.jpg)
 
-*The [csharp-win-calculator](https://github.com/albisnesstz/csharp-win-calculator) application, displaying the result of `7 + 8`.*
+*Barcode: real keyboard input and UPDATE regenerate the QR code. An independent image decoder reads the exact value `/wasm` from this capture.*
 
-The screenshots show separately obtained applications used for local compatibility testing. Their application files, commercial libraries, loose assets, and converted binaries are **not included** in this repository. Application names and artwork belong to their respective owners. The larger local app library visible in these captures is not the contents of a fresh checkout.
+![Syncfusion Diagram Nodes showing the real node toolbar, geometric shapes, rich-text node and property grid in the browser.](docs/screenshots/diagram-nodes-2026-10.jpg)
+
+*Diagram Nodes: the sample reaches its actual gallery, including geometric and rich-text nodes and a property grid. This image documents startup/rendering progress; drag/edit/serialization parity is not established by this capture.*
+
+[Capture details and earlier Calculator/Photo Album interactions](docs/screenshots/README.md) describe the exact actions and limits. The separately obtained application binaries, commercial libraries, loose assets and converted assemblies are **not included**. Names and artwork belong to their respective owners. The larger local library shown in these captures is not the content of a fresh checkout.
 
 ## How it works
 
@@ -45,9 +62,9 @@ The screenshots show separately obtained applications used for local compatibili
 3. **Run in WebAssembly.** The .NET browser runtime executes the managed code. A canvas bridge presents the rendered output and routes mouse and keyboard input back to the application.
 4. **Request dependencies as they are needed.** App startup requests its entry assembly. When the runtime asks for another assembly, the server looks it up by name in configured folders, transforms it, and returns it. It does not send every DLL in the folder or require rebuilding the browser host for each app.
 
-The local server serves the browser host and prepares assemblies. The application executes in the browser. The host reports time to the first canvas frame, application payload size, measured network transfer, and cache reuse separately.
+The library shell hosts each app in a separate runtime frame with its own session identity. The local server serves the browser host and prepares assemblies. The application executes in the browser. The host reports time to the first canvas frame, application payload size, measured network transfer, and cache reuse separately.
 
-The shared compatibility runtime is built with the host. Application DLLs remain separate and are requested dynamically. Loose content such as images and XML currently loads during app startup. The assembly resolution bridge currently uses synchronous requests, which can pause the UI while a new dependency arrives.
+The shared compatibility runtime is built with the host. Application DLLs remain separate and are requested dynamically. Loose content such as images and XML currently loads during app startup. Limited manifest-declared dependency warm-up is separate from the fallback resolver; it does not turn every lookup folder into a download bundle. The assembly resolution bridge currently uses synchronous requests, which can pause the UI while a new dependency arrives.
 
 ## Build and run the base project
 
@@ -60,9 +77,9 @@ dotnet workload restore src/WfWasm.CanvasHost/WfWasm.CanvasHost.csproj
 
 Open [http://127.0.0.1:5210](http://127.0.0.1:5210). The checkout starts with the built-in smoke form; external applications appear only when their files are available locally. No third-party application is required to build or open the base project.
 
-![The source-only base project running its built-in WinForms form; clicking the button increments the success counter.](docs/screenshots/base-project.jpg)
+![The updated source-only base project running its built-in WinForms form without any external applications installed.](docs/screenshots/base-project-2026-10.jpg)
 
-*What a fresh checkout includes: the base runtime and its built-in interactive form.*
+*What a source-only build includes: the base runtime and its built-in form. External app inputs are optional and remain local.*
 
 The script builds the fork and rewriter, generates the browser-compatible runtime under the ignored `.artifacts/` directory, and builds the host. See [build instructions](docs/building.md) for individual steps, tests, and locally supplied applications.
 
@@ -78,7 +95,7 @@ This is a local development host. Use trusted application binaries and keep the 
 
 Good contributions start with a small, reproducible behavior: a control that paints incorrectly, a workflow that stops, an assembly that resolves differently, or a slow interaction. A generic compatibility fix with a focused regression test helps many applications at once.
 
-See [architecture](docs/architecture.md), [contributing](CONTRIBUTING.md), and the [roadmap](docs/roadmap.md).
+See [architecture](docs/architecture.md), [testing](docs/testing.md), [contributing](CONTRIBUTING.md), and the [roadmap](docs/roadmap.md).
 
 ## Licenses and acknowledgments
 

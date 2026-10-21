@@ -11,7 +11,7 @@ public sealed class DropdownClickTests
         // even when the point also lies inside the document page bounds
         // (Adjustments/Levels over the canvas was swallowed as a brush
         // press). Leaf clicks also dismiss the menu, desktop parity.
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         host.SelectScene(AppScene.Smoke);
         using var dlg = new FormsForm { Text = "Dock", Width = 500, Height = 400 };
         var strip = new System.Windows.Forms.MenuStrip();

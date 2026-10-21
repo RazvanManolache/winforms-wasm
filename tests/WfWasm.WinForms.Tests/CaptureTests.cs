@@ -20,6 +20,67 @@ public sealed class CaptureTests
     }
 
     [Fact]
+    public void Capture_Loss_Notifies_On_Release()
+    {
+        using var control = new System.Windows.Forms.Control();
+        _ = control.Handle; // force headless handle creation
+        int fired = 0;
+        control.MouseCaptureChanged += (_, _) => fired++;
+        try
+        {
+            control.Capture = true;
+            Assert.Equal(0, fired); // acquiring never notifies
+            control.Capture = false;
+            Assert.Equal(1, fired);
+        }
+        finally
+        {
+            Windows.Win32.PInvoke.ReleaseCapture();
+        }
+    }
+
+    [Fact]
+    public void Capture_Loss_Notifies_On_Steal()
+    {
+        using var first = new System.Windows.Forms.Control();
+        using var second = new System.Windows.Forms.Control();
+        _ = first.Handle;
+        _ = second.Handle;
+        int firstFired = 0, secondFired = 0;
+        first.MouseCaptureChanged += (_, _) => firstFired++;
+        second.MouseCaptureChanged += (_, _) => secondFired++;
+        try
+        {
+            first.Capture = true;
+            second.Capture = true; // steals: first loses
+            Assert.Equal(1, firstFired);
+            Assert.Equal(0, secondFired);
+            second.Capture = false;
+            Assert.Equal(1, secondFired);
+        }
+        finally
+        {
+            Windows.Win32.PInvoke.ReleaseCapture();
+        }
+    }
+
+    [Fact]
+    public void SetCapture_Returns_Previous_Hwnd()
+    {
+        var first = new Windows.Win32.Foundation.HWND(4321);
+        var second = new Windows.Win32.Foundation.HWND(8765);
+        try
+        {
+            Assert.Equal(0, (nint)Windows.Win32.PInvoke.SetCapture(first));
+            Assert.Equal(first.Value, (nint)Windows.Win32.PInvoke.SetCapture(second));
+        }
+        finally
+        {
+            Windows.Win32.PInvoke.ReleaseCapture();
+        }
+    }
+
+    [Fact]
     public void Capture_Stubs_Track_Hwnd()
     {
         var hwnd = new Windows.Win32.Foundation.HWND(1234);

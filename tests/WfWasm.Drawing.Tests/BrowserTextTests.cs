@@ -7,6 +7,7 @@ using WfBrushes = WfDraw::System.Drawing.Brushes;
 using WfFont = WfDraw::System.Drawing.Font;
 using WfFontFamily = WfDraw::System.Drawing.FontFamily;
 using WfFontStyle = WfDraw::System.Drawing.FontStyle;
+using WfCounters = WfDraw::System.Drawing.TextRasterCounters;
 using WfGraphics = WfDraw::System.Drawing.Graphics;
 using WfRectangleF = WfDraw::System.Drawing.RectangleF;
 using WfSizeF = WfDraw::System.Drawing.SizeF;
@@ -16,6 +17,19 @@ using Xunit;
 
 public sealed class BrowserTextTests
 {
+    [Fact]
+    public void ToCss_Caches_By_Value()
+    {
+        using var a = new WfFont("Segoe UI", 9f);
+        using var b = new WfFont("Segoe UI", 9f);
+        // Equal-valued distinct instances share the cached string.
+        Assert.Same(WfBrowserText.ToCss(a, 96f), WfBrowserText.ToCss(b, 96f));
+        using var c = new WfFont("Segoe UI", 10f);
+        Assert.NotEqual(WfBrowserText.ToCss(a, 96f), WfBrowserText.ToCss(c, 96f));
+        using var d = new WfFont("Segoe UI", 9f);
+        Assert.NotEqual(WfBrowserText.ToCss(a, 96f), WfBrowserText.ToCss(d, 120f));
+    }
+
     [Fact]
     public void ToCss_Maps_Family_Size_And_Style()
     {
@@ -63,8 +77,11 @@ public sealed class BrowserTextTests
             using var font = new WfFont(WfFontFamily.GenericSansSerif, 9f);
             var size = g.MeasureString("SELECT CATEGORY:", font, int.MaxValue);
             Assert.Equal(2048, seenMaxW);
-            Assert.Equal(100f, size.Width);
-            Assert.Equal(20f, size.Height);
+            // GDI+ layout pad (see MeasureString_GdiPlus_Pad_Matches_Desktop):
+            // 100 + 12/3 + 0.03*100 - 0.5 = 106.5.
+            Assert.Equal(106.5f, size.Width);
+            // GDI+ line-box height: 12 x 1.1318 + 12/8 = 15.08.
+            Assert.InRange(size.Height, 15.0, 15.2);
         }
         finally
         {
@@ -92,8 +109,10 @@ public sealed class BrowserTextTests
             using var format = new WfStringFormat(WfStringFormatFlags.NoWrap);
             var size = g.MeasureString("a long title that would wrap at 100px", font, 100, format);
             Assert.Equal(2048, seenMaxW);
-            Assert.Equal(300f, size.Width);
-            Assert.Equal(20f, size.Height);
+            // GDI+ layout pad: 300 + 12/3 + 0.03*300 - 0.5 = 312.5.
+            Assert.Equal(312.5f, size.Width);
+            // GDI+ line-box height: 12 x 1.1318 + 12/8 = 15.08.
+            Assert.InRange(size.Height, 15.0, 15.2);
         }
         finally
         {
@@ -120,8 +139,10 @@ public sealed class BrowserTextTests
             using var font = new WfFont(WfFontFamily.GenericSansSerif, 9f);
             var size = g.MeasureString("a long title that wraps at 100px", font, 100, null);
             Assert.Equal(100, seenMaxW);
-            Assert.Equal(90f, size.Width);
-            Assert.Equal(80f, size.Height);
+            // GDI+ layout pad: 90 + 12/3 + 0.03*90 - 0.5 = 96.2.
+            Assert.InRange(size.Width, 96.1, 96.3);
+            // GDI+ line-box height (string-independent): 15.08.
+            Assert.InRange(size.Height, 15.0, 15.2);
         }
         finally
         {
@@ -132,24 +153,24 @@ public sealed class BrowserTextTests
     [Fact]
     public void MeasureString_LinesFilled_Counts_Wrapped_Raster_Lines()
     {
-        // linesFilled derives from the wrapped raster height, not from
-        // explicit newlines: counting only \n starved Telerik text
+        // linesFilled counts visual rows off the line-box grid: a
+        // 100px raster in a 30px layout wraps to 4 rows, and the
+        // height is rows x line box + em/8 (GDI+ rule, oracle
+        // text-multi.fsx). Counting only \n starved Telerik text
         // layout of height (BookShelf titles: 1 line over a void).
-        using var bmp = new WfBitmap(64, 32);
-        using var g = WfGraphics.FromImage(bmp);
-        using var font = new WfFont(WfFontFamily.GenericSansSerif, 9f);
-        float linePx = font.GetHeight(g.DpiY);
-        Assert.True(linePx > 1f);
-        int rasterH = (int)MathF.Round(4f * linePx);
         WfBrowserText.MeasureOverride = (text, f, dpi, maxW) =>
-            new WfBrowserText.Raster(100, rasterH, new byte[100 * rasterH * 4]);
+            new WfBrowserText.Raster(100, 48, new byte[100 * 48 * 4]);
         try
         {
+            using var bmp = new WfBitmap(64, 32);
+            using var g = WfGraphics.FromImage(bmp);
+            using var font = new WfFont(WfFontFamily.GenericSansSerif, 9f);
             var size = g.MeasureString("four wrapped lines here", font,
-                new WfSizeF(100, 1000), null, out int chars, out int lines);
+                new WfSizeF(30, 1000), null, out int chars, out int lines);
             Assert.Equal("four wrapped lines here".Length, chars);
             Assert.Equal(4, lines);
-            Assert.Equal(rasterH, (int)size.Height);
+            // 4 x 12 x 1.1318 + 12/8 = 55.83.
+            Assert.InRange(size.Height, 55.5, 56.1);
         }
         finally
         {
@@ -167,5 +188,119 @@ public sealed class BrowserTextTests
         using var font = new WfFont(WfFontFamily.GenericSansSerif, 9f);
         g.DrawString(string.Empty, font, WfBrushes.Black, new WfRectangleF(0, 0, 16, 16), null);
         g.DrawString(null, font, WfBrushes.Black, 0f, 0f);
+    }
+
+    [Fact]
+    public void MeasureString_GdiPlus_Pad_Matches_Desktop()
+    {
+        // GDI+ MeasureString(GenericDefault) pads the tight advances:
+        // desktop oracle (text-padfit.fsx, Segoe UI 9): typographic
+        // 25.83 -> GenericDefault 30.60, i.e. pad = em/3 + 0.03*width.
+        // The production raster (26x15) is the ceiled typographic
+        // width, so the pad carries a -0.5 raster-ceil correction:
+        // 26 + 4 + 0.78 - 0.5 = 30.28 (desktop 30.60). Telerik tab
+        // items size from this (BugTracker Bugs tab: 34px without
+        // the pad, 39px native). GenericTypographic stays tight.
+        WfBrowserText.MeasureOverride = (text, font, dpi, maxW) =>
+            new WfBrowserText.Raster(26, 15, new byte[26 * 15 * 4]);
+        try
+        {
+            using var bmp = new WfBitmap(64, 32);
+            using var g = WfGraphics.FromImage(bmp);
+            using var font = new WfFont(new WfFontFamily("Segoe UI"), 9f);
+            var twoArg = g.MeasureString("Bugs", font);
+            Assert.InRange(twoArg.Width, 30.0, 31.0);
+            Assert.InRange(twoArg.Height, 17.3, 17.6);
+            var fourArg = g.MeasureString("Bugs", font, 9999, WfStringFormat.GenericDefault);
+            Assert.InRange(fourArg.Width, 30.0, 31.0);
+            Assert.InRange(fourArg.Height, 17.3, 17.6);
+            var typo = g.MeasureString("Bugs", font, 9999, WfStringFormat.GenericTypographic);
+            Assert.Equal(26f, typo.Width);
+            Assert.Equal(15f, typo.Height);
+        }
+        finally
+        {
+            WfBrowserText.MeasureOverride = null;
+        }
+    }
+
+    [Fact]
+    public void RasterCounters_Take_Snapshots_And_Resets()
+    {
+        // Perf item 4 contract: off by default (one bool read), Take
+        // drains per frame. Headless TryRaster returns null past the
+        // availability check but still counts the call.
+        Assert.False(WfCounters.PerfEnabled);
+        WfCounters.PerfEnabled = true;
+        try
+        {
+            WfCounters.Take();
+            using var font = new WfFont(WfFontFamily.GenericSansSerif, 9f);
+            Assert.Null(WfBrowserText.TryRaster("hi", font, 96f, 200));
+            Assert.Null(WfBrowserText.TryMeasureWidth("hi", font, 96f, 200));
+            WfCounters.NoteDraw(2);
+            var snap = WfCounters.Take();
+            Assert.Equal(1, snap.DrawCalls);
+            Assert.Equal(2, snap.DrawChars);
+            Assert.Equal(1, snap.RasterCalls);
+            Assert.Equal(0, snap.RasterHits);
+            Assert.Equal(0, snap.RasterMisses);
+            Assert.Equal(1, snap.MeasureWidthCalls);
+            var empty = WfCounters.Take();
+            Assert.Equal(0, empty.RasterCalls);
+            WfCounters.NoteDrawPx(600);
+            Assert.Equal(600, WfCounters.Take().DrawPx);
+            WfCounters.NoteDrawTicks(44);
+            Assert.Equal(44, WfCounters.Take().DrawTicks);
+            WfCounters.NoteDrawPx(7);
+            Assert.Equal(7, WfCounters.Peek().DrawPx);
+            Assert.Equal(7, WfCounters.Take().DrawPx);
+            // Op census contract: take drains, peek does not.
+            WfCounters.NoteFill();
+            WfCounters.NoteFillPx(10);
+            WfCounters.NoteImage();
+            WfCounters.NoteImagePx(20);
+            WfCounters.NoteLine();
+            var ops = WfCounters.Peek();
+            Assert.Equal(1, ops.FillCalls);
+            Assert.Equal(10, ops.FillPx);
+            Assert.Equal(1, ops.ImageCalls);
+            Assert.Equal(20, ops.ImagePx);
+            Assert.Equal(1, ops.LineCalls);
+            var drained = WfCounters.Take();
+            Assert.Equal(1, drained.FillCalls);
+            Assert.Equal(0, WfCounters.Peek().FillCalls);
+            // Behavioral: a real fill and a real line trip the hooks.
+            WfCounters.Take();
+            using var bmp = new WfBitmap(16, 16);
+            using var g = WfGraphics.FromImage(bmp);
+            using var brush = new WfDraw::System.Drawing.SolidBrush(WfDraw::System.Drawing.Color.Red);
+            g.FillRectangle(brush, new WfDraw::System.Drawing.RectangleF(1, 1, 4, 4));
+            var seen = WfCounters.Take();
+            Assert.Equal(1, seen.FillCalls);
+            Assert.Equal(16, seen.FillPx);
+            // Big-fill attribution contract.
+            WfCounters.NoteBigFill(60000, "T.X.Y", -1);
+            WfCounters.TakeBigFills(out long bigN, out long bigPx, out string? bigCaller, out int bigArgb);
+            Assert.Equal(1, bigN);
+            Assert.Equal(60000, bigPx);
+            Assert.Equal("T.X.Y", bigCaller);
+            Assert.Equal(-1, bigArgb);
+            WfCounters.TakeBigFills(out long bigN2, out long _, out string? _, out int _);
+            Assert.Equal(0, bigN2);
+            // Caller capture never throws; outside Telerik/app frames
+            // it reports non-telerik.
+            Assert.Equal("non-telerik", WfCounters.CaptureTelerikCaller());
+            // Tier-2 line-height math matches the JS scratch canvas
+            // (ceil(px * 1.25)): 16px -> 20, 12px -> 15, 9px -> 12.
+            Assert.Equal(20, WfBrowserText.FullLineHeight(16));
+            Assert.Equal(15, WfBrowserText.FullLineHeight(12));
+            Assert.Equal(12, WfBrowserText.FullLineHeight(9));
+        }
+        finally
+        {
+            WfCounters.PerfEnabled = false;
+            WfCounters.Take();
+        }
     }
 }

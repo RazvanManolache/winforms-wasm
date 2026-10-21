@@ -68,6 +68,15 @@ public static unsafe class CpuPaint
 
     public static void FreeContext(long ctx) => FreeHandle(ctx);
 
+    // Target dimension probes for the synthesized CPU device context
+    // (get_PixelSize/get_Size/get_PixelFormat). Primitives only, like the
+    // rest of this surface. Unknown/zero handles answer 0 (callers treat an
+    // empty size as nothing-to-draw, matching the native default path).
+    public static int GetTargetWidth(long ctx) => ctx == 0 ? 0 : FromHandle<Target>(ctx).Width;
+    public static int GetTargetHeight(long ctx) => ctx == 0 ? 0 : FromHandle<Target>(ctx).Height;
+    public static int GetTargetStride(long ctx) => ctx == 0 ? 0 : FromHandle<Target>(ctx).Stride;
+    public static int GetTargetBpp(long ctx) => ctx == 0 ? 0 : FromHandle<Target>(ctx).Bpp;
+
     public static void SetTransform(long ctx, float m11, float m12, float m21, float m22, float m31, float m32)
     {
         if (ctx == 0)
@@ -147,6 +156,28 @@ public static unsafe class CpuPaint
         {
             b.Pin.Free();
             b.IsPinned = false;
+        }
+    }
+
+    // Row-copy download into a caller buffer (stride may differ from
+    // the packed width*4): EndDraw/Dispose write-back for FromBitmap
+    // contexts uses this so panel/preview pixels reach the source.
+    public static void DownloadBitmap(long bmp, IntPtr dst, int dstStride)
+    {
+        if (bmp == 0 || dst == IntPtr.Zero || dstStride <= 0)
+            return;
+        var b = FromHandle<Bitmap>(bmp);
+        int w = b.Width, h = b.Height;
+        if (w <= 0 || h <= 0 || b.Pixels.Length < w * h)
+            return;
+        int rowBytes = w * 4;
+        int copy = Math.Min(rowBytes, dstStride);
+        fixed (uint* src = b.Pixels)
+        {
+            byte* s = (byte*)src;
+            byte* d = (byte*)dst;
+            for (int y = 0; y < h; y++)
+                Buffer.MemoryCopy(s + (nint)y * rowBytes, d + (nint)y * dstStride, copy, copy);
         }
     }
 
@@ -1757,29 +1788,101 @@ public static unsafe class CpuPaint
                 }
                 catch { }
             }
-            int guard = 0;
-            while (input is not null && guard++ < 4)
+            // Unwrap shells, proxies, and BitmapImage wrappers to a raw
+            // device bitmap: DrawImage only blits those, so an
+            // effect-drawn upload (e.g. the color wheel) otherwise falls
+            // through to the loud unknown-image throw. Layers repeat
+            // until fixpoint (BitmapImage.image is itself a proxy that
+            // needs another shell/proxy round); every inner loop is
+            // guard-capped and the pass exits when nothing moves.
+            for (int pass = 0; pass < 3; pass++)
             {
-                Type it = input.GetType();
-                string? fn = it.FullName;
-                if (fn is null
-                    || (!fn.Contains("ComObjectRef") && !fn.Contains("ObjectRef")))
+                object? before = input;
+                int guard = 0;
+                while (input is not null && guard++ < 4)
+                {
+                    Type it = input.GetType();
+                    string? fn = it.FullName;
+                    if (fn is null
+                        || (!fn.Contains("ComObjectRef") && !fn.Contains("ObjectRef")
+                        && !fn.Contains("Proxy")))
+                        break;
+                    var inner = it.GetField("_inner",
+                        System.Reflection.BindingFlags.Instance
+                        | System.Reflection.BindingFlags.Public
+                        | System.Reflection.BindingFlags.NonPublic);
+                    object? innerVal = null;
+                    try { innerVal = inner?.GetValue(input); }
+                    catch { break; }
+                    if (innerVal is null)
+                    {
+                        // ObjectRefProxy<T> shells (e.g. IDeviceImageProxy)
+                        // expose InnerRef instead of an _inner field. Any
+                        // single lookup here can throw AmbiguousMatch
+                        // (explicit interface re-implementations), so
+                        // enumerate and take the first index-free hit.
+                        System.Reflection.PropertyInfo? innerProp = null;
+                        try
+                        {
+                            foreach (var cand in it.GetProperties(
+                                System.Reflection.BindingFlags.Instance
+                                | System.Reflection.BindingFlags.Public
+                                | System.Reflection.BindingFlags.NonPublic))
+                            {
+                                if (cand.Name == "InnerRef"
+                                    && cand.GetIndexParameters().Length == 0)
+                                { innerProp = cand; break; }
+                            }
+                        }
+                        catch { break; }
+                        if (innerProp is null)
+                            break;
+                        try { innerVal = innerProp.GetValue(input); }
+                        catch { break; }
+                    }
+                    if (innerVal is null || ReferenceEquals(innerVal, input))
+                        break;
+                    input = innerVal;
+                }
+                guard = 0;
+                while (input is not null && guard++ < 4 && IsEffectProxy(input))
+                {
+                    object? deeper = GetProxySourceImage(input);
+                    if (deeper is null || ReferenceEquals(deeper, input))
+                        break;
+                    input = deeper;
+                }
+                guard = 0;
+                while (input is not null && guard++ < 4
+                    && (input.GetType().FullName?.Contains("BitmapImage") ?? false))
+                {
+                    var imageField = input.GetType().GetField("image",
+                        System.Reflection.BindingFlags.Instance
+                        | System.Reflection.BindingFlags.Public
+                        | System.Reflection.BindingFlags.NonPublic);
+                    object? innerBmp = null;
+                    try { innerBmp = imageField?.GetValue(input); }
+                    catch { break; }
+                    if (innerBmp is null || ReferenceEquals(innerBmp, input))
+                        break;
+                    input = innerBmp;
+                }
+                // Mid-chain effects (e.g. PrecisionEffect behind a proxy)
+                // need a fresh props-chain round: recurse so the entry
+                // scan re-runs for the new object. Gated to non-entry
+                // objects so the original image never re-enters here.
+                guard = 0;
+                while (input is not null && guard++ < 2
+                    && !ReferenceEquals(input, image)
+                    && input.GetType().GetMethod("get_Properties", Type.EmptyTypes) is not null)
+                {
+                    object? deeper2 = GetProxySourceImage(input);
+                    if (deeper2 is null || ReferenceEquals(deeper2, input))
+                        break;
+                    input = deeper2;
+                }
+                if (ReferenceEquals(input, before))
                     break;
-                var inner = it.GetField("_inner",
-                    System.Reflection.BindingFlags.Instance
-                    | System.Reflection.BindingFlags.Public
-                    | System.Reflection.BindingFlags.NonPublic);
-                if (inner is null)
-                    break;
-                input = inner.GetValue(input);
-            }
-            guard = 0;
-            while (input is not null && guard++ < 4 && IsEffectProxy(input))
-            {
-                object? deeper = GetProxySourceImage(input);
-                if (deeper is null || ReferenceEquals(deeper, input))
-                    break;
-                input = deeper;
             }
             try { Console.WriteLine("[PROXYOUT] in=" + t.FullName + " out=" + (input is null ? "null" : input.GetType().FullName)); }
             catch { }

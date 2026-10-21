@@ -31,7 +31,7 @@ public sealed class DocumentPointerTests
         // Home.razor) and the host routes it into a document stroke with
         // the right button, which PDN renders in the secondary color.
         // Live proof: right-drag erases a black stroke (white secondary).
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         host.SelectScene(AppScene.Smoke);
         host.SetDocumentPageBounds(100, 100, 400, 400);
         host.OnMouseDown(200, 200, FormsMouseButtons.Right);

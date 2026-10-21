@@ -3,12 +3,24 @@ extern alias WfDraw;
 using System.IO;
 using System.Reflection;
 using System.Resources;
+using System.Runtime.ExceptionServices;
 using WfBitmap = WfDraw::System.Drawing.Bitmap;
 using WfResourceHelper = WfDraw::WfWasm.Drawing.ResourceHelper;
 using Xunit;
 
 public sealed class ResourceHelperTests
 {
+    [Fact]
+    public void AppBaseDirectory_Passes_Real_Value_Through()
+    {
+        // Root of the WasmAppIdentity.BaseDirectory shim pair: the real
+        // runtime answer passes through wherever it exists; only the
+        // browser's null/empty falls back to "/app" (untestable here).
+        string real = System.AppContext.BaseDirectory;
+        Assert.False(string.IsNullOrEmpty(real));
+        Assert.Equal(real, WfResourceHelper.AppBaseDirectory());
+    }
+
     // The rewriter swaps ComponentResourceManager.GetObject for
     // SafeGetObject: a BinaryFormatter ImageListStreamer blob (which
     // the browser BCL cannot deserialize) must answer null -- the
@@ -86,6 +98,24 @@ public sealed class ResourceHelperTests
         Assert.Equal(1, decoded.Height);
     }
 
+    // Two loaded assemblies share one base name; the entry lives only in
+    // the second. The old load-order first-stream-hit scan resolved the
+    // first assembly and missed every entry into the 32px placeholder.
+    // Regression: BugTracker preloader/validation_icon/FilteringIcon
+    // placeholders (telerik-bugtracker-compat F3).
+    [Fact]
+    public void SafeGetObject_Resolves_Entry_In_Owning_Assembly_On_BaseName_Collision()
+    {
+        _ = BuildNrbfAssembly("Fake.Shared",
+            ("other.Entry", BitmapType, NrbfFixtures.BitmapPayload(NrbfFixtures.Bmp1x1(9, 9, 9)), null));
+        Assembly owner = BuildNrbfAssembly("Fake.Shared",
+            ("pic.Logo", BitmapType, NrbfFixtures.BitmapPayload(NrbfFixtures.Bmp1x1(0x11, 0x22, 0x33)), null));
+        var rm = new ResourceManager("Fake.Shared", owner);
+        var decoded = Assert.IsType<WfBitmap>(WfResourceHelper.SafeGetObject(rm, "pic.Logo"));
+        Assert.Equal(1, decoded.Width);
+        Assert.Equal(0x11, decoded.GetPixel(0, 0).R);
+    }
+
     [Fact]
     public void SafeGetObject_Caches_Decoded_Image_By_Manager_And_Name()
     {
@@ -125,10 +155,105 @@ public sealed class ResourceHelperTests
         Assert.Equal("hi", widget.Text);
     }
 
+    // Throw-free decode (regression for the per-boot PNSE first-chance
+    // noise across all Telerik demos, e.g. CreateUntypedDelegate 41x):
+    // SafeGetObject must resolve the BinaryFormatter bitmap entry
+    // through the NRBF path without a single first-chance
+    // PlatformNotSupportedException, with identical pixels.
+    [Fact]
+    public void SafeGetObject_Decodes_Bitmap_Without_FirstChance_Throw()
+    {
+        byte[] bmp = NrbfFixtures.Bmp1x1(0x33, 0x22, 0x11);
+        var rm = new ResourceManager("Fake.NrbfQuiet", BuildNrbfAssembly("Fake.NrbfQuiet",
+            ("pic.Logo", BitmapType, NrbfFixtures.BitmapPayload(bmp), null)));
+        int pnse = CountFirstChance<PlatformNotSupportedException>(() =>
+        {
+            var decoded = Assert.IsType<WfBitmap>(WfResourceHelper.SafeGetObject(rm, "pic.Logo"));
+            Assert.Equal(1, decoded.Width);
+            Assert.Equal(0x33, decoded.GetPixel(0, 0).R);
+        });
+        Assert.Equal(0, pnse);
+    }
+
+    [Fact]
+    public void SafeGetObject_Passes_String_Without_FirstChance_Throw()
+    {
+        var rm = new ResourceManager("Fake.QuietStr", BuildNrbfAssembly("Fake.QuietStr",
+            ("plain.String", null, null, "hello")));
+        int pnse = CountFirstChance<PlatformNotSupportedException>(() =>
+        {
+            Assert.Equal("hello", WfResourceHelper.SafeGetObject(rm, "plain.String"));
+        });
+        Assert.Equal(0, pnse);
+    }
+
+    [Fact]
+    public void SafeApplyResources_Sets_Image_Without_FirstChance_Throw()
+    {
+        byte[] bmp = NrbfFixtures.Bmp1x1(0xAA, 0xBB, 0xCC);
+        var rm = new TestComponentResourceManager("Fake.NrbfQuietApply", BuildNrbfAssembly("Fake.NrbfQuietApply",
+            ("comp.Image", BitmapType, NrbfFixtures.BitmapPayload(bmp), null),
+            ("comp.Text", null, null, "hi")));
+        var widget = new FakeWidget();
+        int pnse = CountFirstChance<PlatformNotSupportedException>(() =>
+        {
+            WfResourceHelper.SafeApplyResources(rm, widget, "comp");
+        });
+        Assert.Equal(0, pnse);
+        Assert.NotNull(widget.Image);
+        Assert.Equal(1, widget.Image.Width);
+        Assert.Equal(0xAA, widget.Image.GetPixel(0, 0).R);
+        Assert.Equal("hi", widget.Text);
+    }
+
+    private static int CountFirstChance<T>(Action action) where T : Exception
+    {
+        int hits = 0;
+        void Handler(object? _, FirstChanceExceptionEventArgs e)
+        {
+            if (e.Exception is T)
+                System.Threading.Interlocked.Increment(ref hits);
+        }
+        System.AppDomain.CurrentDomain.FirstChanceException += Handler;
+        try
+        {
+            action();
+        }
+        finally
+        {
+            System.AppDomain.CurrentDomain.FirstChanceException -= Handler;
+        }
+        return hits;
+    }
+
+    private enum FakeDock
+    {
+        None,
+        Fill
+    }
+
+    // Generic TypeConverter coverage (replaces the removed BCL
+    // ApplyResources conversions): a string entry must convert to an
+    // enum property with no first-chance PNSE.
+    [Fact]
+    public void SafeApplyResources_Converts_String_To_Enum_Without_FirstChance_Throw()
+    {
+        var rm = new TestComponentResourceManager("Fake.NrbfEnum", BuildNrbfAssembly("Fake.NrbfEnum",
+            ("comp.Dock", null, null, "Fill")));
+        var widget = new FakeWidget();
+        int pnse = CountFirstChance<PlatformNotSupportedException>(() =>
+        {
+            WfResourceHelper.SafeApplyResources(rm, widget, "comp");
+        });
+        Assert.Equal(0, pnse);
+        Assert.Equal(FakeDock.Fill, widget.Dock);
+    }
+
     private sealed class FakeWidget
     {
         public WfBitmap? Image { get; set; }
         public string? Text { get; set; }
+        public FakeDock Dock { get; set; }
     }
 
     // ComponentResourceManager only binds (Type); the fixture stream

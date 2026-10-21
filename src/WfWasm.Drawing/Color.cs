@@ -196,7 +196,31 @@ public sealed class ColorTranslator
 
     public static Color FromHtml(string htmlColor)
     {
-        if (htmlColor.Length > 0 && htmlColor[0] == '#')
+        // Desktop parity (oracle-verified case by case, including the odd
+        // corners): null/empty read Empty; leading/trailing SPACES are
+        // ignored (Syncfusion themes ship " #444444"-style values; without
+        // this every themed paint threw ArgumentException); other
+        // whitespace is NOT skipped (a tab-padded "#fff" takes the plain
+        // integer path below, exactly like desktop).
+        if (string.IsNullOrEmpty(htmlColor))
+            return Color.Empty;
+        htmlColor = htmlColor.Trim(' ');
+        if (htmlColor.Length == 0)
+            return Color.Empty;
+        if (htmlColor[0] != '#')
+        {
+            if (htmlColor.Equals("LightGrey", StringComparison.OrdinalIgnoreCase))
+                return Color.FromKnownColor(KnownColor.LightGray);
+            if (Color.NameToKnown.TryGetValue(htmlColor, out KnownColor trimmedKnown))
+                return Color.FromKnownColor(trimmedKnown);
+            // Odd desktop corner: other whitespace is not skipped up front,
+            // but a fully-trimmed "#..." still parses as a plain integer
+            // ("\t #fff\t" reads 0x00000FFF, oracle-verified).
+            string fullTrim = htmlColor.Trim();
+            if (fullTrim.Length > 0 && fullTrim[0] == '#')
+                return Color.FromArgb(Convert.ToInt32(fullTrim.Substring(1), 16));
+            throw new ArgumentException($"'{htmlColor}' is not a valid color.");
+        }
         {
             string hex = htmlColor.Substring(1);
             if (hex.Length == 3)

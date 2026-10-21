@@ -1,5 +1,23 @@
 # Live browser captures
 
+## 21 October 2026
+
+These JPEGs are unaltered browser screenshots at the normal 1280×720 viewport. No desktop screenshots, generated mockups or image edits were used. Fixed-size desktop windows still exceed or crowd the available area in some cases; those limitations remain visible. The local development app corpus is separately supplied and excluded from this repository.
+
+| Capture | Action and independently observed result | Limit |
+| --- | --- | --- |
+| [Paint.NET](paint-net-2026-10.jpg) | Four brush drags draw a W-shaped stroke; the document title becomes modified. | Basic painting only; panels and editing/file/effect workflows incomplete. |
+| [Map Selection](map-selection-2026-10.jpg) | Click Brazil; its real country polygon changes to cyan. | No pan/zoom/data parity claim. |
+| [Barcode](barcode-update-2026-10.jpg) | Enter `/wasm`, click UPDATE; OpenCV QRCodeDetector independently decodes the image to `/wasm`. | Other symbologies/validation untested in this capture. |
+| [Diagram Nodes](diagram-nodes-2026-10.jpg) | Open the actual sample; node shapes, rich-text node, toolbar and property grid render. | Startup/rendering evidence; drag/edit/save not verified. |
+| [Source-only base](base-project-2026-10.jpg) | Build the public source checkout and open its built-in form with no external apps installed. | A base-build check, not the external demo corpus. |
+
+The development captures used the local preview on port 5210. The base capture used a separate source-checkout host on port 5390. Counters show the particular sessions, including warm caches; they are not calibrated load/performance comparisons. See [progress and validation](../progress-2026-10.md).
+
+Application names, UI and artwork retain their owners' rights. [Third-party notices](../../THIRD-PARTY-NOTICES.md) explain the source-only and attribution boundaries. No app library, executable, converted assembly or loose app asset accompanies these captures.
+
+# Earlier captures — 15 October 2026
+
 Captured on 15 October 2026 from the running local browser host. Images are unaltered browser captures at its normal viewport; large application canvases extend beyond the visible area. These are browser observations, not native desktop reference images or pixel-parity claims.
 
 ## Paint.NET — partial compatibility

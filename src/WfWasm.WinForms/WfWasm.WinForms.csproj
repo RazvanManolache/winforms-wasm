@@ -79,10 +79,43 @@
     <!-- Transparent paint: upstream DrawingEventArgs throws ANE on a
          null HDC; the DrawingEventArgs.Wasm.cs overlay tolerates it. -->
     <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Rendering\DrawingEventArgs.cs" />
+    <!-- Headless cursor: upstream Cursor(Stream) loads through COM/OLE
+         (E_NOTIMPL in the browser) and the escaping NIE traps the
+         runtime; the Cursor.Wasm.cs overlay emulates it. -->
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Input\Cursor.cs" />
+    <!-- Headless dialogs: upstream CommonDialog..ctor marshals the hook
+         delegate (GetFunctionPointerForDelegate aborts the browser
+         runtime); the CommonDialog.Wasm.cs overlay skips the thunk. -->
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Dialogs\CommonDialogs\CommonDialog.cs" />
+    <!-- Headless trap-class sweep: these upstream files marshal hook
+         delegates (GetFunctionPointerForDelegate aborts the browser
+         runtime); the *.Wasm.cs overlays skip the thunk. -->
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\WindowSubclassHandler.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Accessibility\LabelEditNativeWindow.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Controls\PropertyGrid\PropertyGridInternal\PropertyGridView.MouseHook.cs" />
     <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\Properties\TypeForwards.cs" />
     <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms.Primitives\src\Properties\AssemblyInfo.cs" />
     <Compile Remove="..\..\runtimes\winforms\src\System.Private.Windows.Core\src\Properties\AssemblyInfo.cs" />
     <Compile Remove="..\..\runtimes\winforms\src\System.Private.Windows.Core\src\Windows\Win32\PInvokeCore.GetWindowText.cs" />
+    <!-- DragDrop: upstream generic wrapper COM-marshals the drop target
+         (PNSE on WASM); fork no-op success lives in Interop/PInvokeCore.RegisterDragDrop.Wasm.cs. -->
+    <Compile Remove="..\..\runtimes\winforms\src\System.Private.Windows.Core\src\Windows\Win32\PInvokeCore.RegisterDragDrop.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Components\ImageList\ImageListStreamer.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Components\ImageList\ImageList.NativeImageList.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms.Primitives\src\System\Windows\Forms\DeviceContextExtensions.IDeviceContextAdapter.cs" />
+    <!-- Headless a11y: oleacc's typelib can't load in the browser (no
+         registry/COM), which poisoned AccessibleDispatch's static TypeInfo
+         and made every AccessibleObject ctor throw. Fork inert dispatch
+         lives in AccessibleDispatch.Wasm.cs. -->
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms.Primitives\src\Windows\Win32\UI\Accessibility\AccessibleDispatch.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Controls\WebBrowser\WebBrowser.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Controls\WebBrowser\WebBrowser.WebBrowserAccessibleObject.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Controls\WebBrowser\WebBrowser.WebBrowserEvent.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Controls\WebBrowser\WebBrowser.WebBrowserSite.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Controls\WebBrowser\WebBrowserBase.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Controls\WebBrowser\WebBrowserBase.WebBrowserBaseNativeWindow.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Controls\WebBrowser\WebBrowserContainer.cs" />
+    <Compile Remove="..\..\runtimes\winforms\src\System.Windows.Forms\System\Windows\Forms\Controls\WebBrowser\WebBrowserSiteBase.cs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -92,6 +125,9 @@
     <PackageReference Include="System.Configuration.ConfigurationManager" Version="9.0.0" />
     <PackageReference Include="System.Resources.Extensions" Version="9.0.0" />
     <PackageReference Include="System.Windows.Extensions" Version="9.0.0" />
+    <!-- Registry ACL enums (RegistryRights/RegistrySecurity) for the
+         WasmRegistry missing-key hooks; headless answers are null. -->
+    <PackageReference Include="System.Security.AccessControl" Version="6.0.0" />
   </ItemGroup>
 
   <!-- Strip System.Private.Windows.Core.dll pulled transitively by System.Drawing.Common;

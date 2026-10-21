@@ -27,6 +27,7 @@
     <!-- Aliased: WfWasm.Drawing redefines framework type names on purpose.
          Tests reach ours via WfDraw:: (see WfDrawAliases.cs). -->
     <ProjectReference Include="..\..\src\WfWasm.Drawing\WfWasm.Drawing.csproj" Aliases="WfDraw" />
+    <ProjectReference Include="..\..\src\WfWasm.Rendering\WfWasm.Rendering.csproj" />
     <ProjectReference Include="..\..\src\WfWasm.ApiScan\WfWasm.ApiScan.csproj" />
   </ItemGroup>
 

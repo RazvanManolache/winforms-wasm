@@ -83,3 +83,19 @@ Specialized compatibility experiments may require a full locally supplied `Windo
 `bin/`, `obj/`, and `.artifacts/` are ignored. The default transformation cache is `.artifacts/transform-cache`; set `WFWASM_CACHE` to put it elsewhere. `WFWASM_ROOT` can point the server at the repository when running from an unusual deployment directory.
 
 Re-run the build script after changing the fork, drawing layer, or rewriter. Those inputs participate in cache invalidation. Browser HTTP caching and in-session reuse are separate; a warm return is not a cold-start measurement.
+
+## New test and platform sources
+
+See [testing](testing.md) for the rendering, shell, platform and gallery suites and their required inputs. The separate platform demo can be started with a private writable data directory outside any web root:
+
+```powershell
+dotnet run --project src/WfWasm.Platform.Demo -- --Platform:DataDirectory C:/LocalData/wfwasm-platform --urls http://127.0.0.1:5384
+```
+
+That demo is scaffolding for file/registry/print integration; it does not mean existing apps already use every service. Keep it local. Node is needed for module checks, and the optional browser-gallery runner needs separately installed Python browser/image dependencies.
+
+## Optional Syncfusion corpus
+
+`scripts/prepare-syncfusion.ps1` reads the declared catalog, obtains the upstream sample repository and builds selected samples into ignored `external-apps/syncfusion`. Its default source checkout is `external-apps/syncfusion-sources`; evidence goes to `.artifacts/syncfusion-evidence`. Supply the vendor prerequisites and any valid licensing yourself; preparation neither bypasses licensing nor establishes browser compatibility.
+
+Set `WF_SYNCFUSION_APPS_ROOT` if the built samples live elsewhere. Loose Diagram sample content also uses its declared source mapping; keep the source checkout if exercising that case. These inputs are never checked in. Only available entry assemblies appear in the outer library of a source-only build.

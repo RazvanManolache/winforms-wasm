@@ -12,7 +12,9 @@ public static partial class AppAssemblyLoader
 {
     private sealed record ManifestFile(string name, string sha256, string url);
     private sealed record ManifestContent(string name, string url, string? sha256 = null);
-    private sealed record AppManifest(string entry, List<ManifestFile> files, List<ManifestContent>? content);
+    private sealed record ManifestDefaultFont(string name, float size);
+    private sealed record AppManifest(string entry, List<ManifestFile> files, List<ManifestContent>? content, ManifestDefaultFont? defaultFont = null, List<ManifestPrefetch>? prefetch = null);
+    private sealed record ManifestPrefetch(string name, string url, long size, string sha256);
     private sealed record ContentItem(string Name, byte[]? Bytes, AppFileSystem.DecodedImage? Image, long SourceSize)
     {
         public long Size => Bytes?.LongLength ?? Image?.Rgba.LongLength ?? 0;
@@ -51,9 +53,27 @@ public static partial class AppAssemblyLoader
         }
     }
 
+    // Rewrite-target scopes unify with the bundled fork: rewritten
+    // assemblies reference the fork by name, but Verbatim assemblies
+    // (System.Windows.Forms.Legacy, WPF) keep framework scopes. Binding
+    // those to the already-loaded fork/drawing avoids a duplicate load
+    // of the same types (split-brain) and a pointless multi-MB fetch
+    // (a rewritten System.Windows.Forms is 7MB of desktop surface the
+    // browser must never bind).
+    private static string? WellKnownForkAssembly(string name) => name.ToLowerInvariant() switch
+    {
+        "system.windows.forms" => "WfWasm.WinForms",
+        "system.windows.forms.primitives" => "WfWasm.WinForms",
+        "system.drawing" => "WfWasm.Drawing",
+        "system.drawing.common" => "WfWasm.Drawing",
+        "system.drawing.primitives" => "WfWasm.Drawing",
+        _ => null,
+    };
+
     private static Assembly? ResolveRequestedAssembly(object? sender, ResolveEventArgs args)
     {
         string? name = new AssemblyName(args.Name).Name;
+        /* resolve probe removed (misses still log "treating as missing") */
         if (name is null) return null;
         string? app;
         byte[]? bytes;
@@ -67,6 +87,23 @@ public static partial class AppAssemblyLoader
         {
             if (bytes is null)
             {
+                // One copy per name, version-agnostic: netfx v4 refs
+                // (Telerik UIA -> WindowsBase v4) must bind the bundled
+                // v9, never a second fetch. Without this, twin loads of
+                // one framework assembly split type identity (Rect !=
+                // Rect) and interface maps fail ("get_BoundingRectangle
+                // ... does not have an implementation"). The hook only
+                // fires when default binding failed, so returning a
+                // loaded same-name assembly can only unify, and the
+                // on-demand model is name-keyed anyway (no side-by-side).
+                string localName = WellKnownForkAssembly(name) ?? name;
+                var loaded = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(a =>
+                    string.Equals(a.GetName().Name, localName, StringComparison.OrdinalIgnoreCase));
+                if (loaded is not null)
+                {
+                    if (app is not null) NoteUsed(app, name);
+                    return loaded;
+                }
                 if (app is null || !OperatingSystem.IsBrowser() || Missing.Contains(app + "/" + name)) return null;
                 // AssemblyResolve is synchronous. Fetch only the name the CLR
                 // requested, then supply its verified bytes before returning.
@@ -76,9 +113,45 @@ public static partial class AppAssemblyLoader
                 Console.WriteLine($"[AppAssemblyLoader] Requested {app}/{name} ({bytes.Length} bytes) at runtime.");
             }
             if (app is not null) NoteUsed(app, name);
-            return Assembly.Load(bytes);
+            try
+            {
+                var loadedAsm = Assembly.Load(bytes);
+                try { Console.WriteLine($"[AppAssemblyLoader] Loaded {app}/{name}."); } catch { }
+                /* load beacon removed (endpoint ignored the flag; saved a manifest regen per assembly) */
+                return loadedAsm;
+            }
+            catch (Exception ex)
+            {
+                // An exception out of an AssemblyResolve handler kills the
+                // Mono runtime (exit 1): PDN's WPF AssemblyHelper.OnLoaded
+                // throws NIE on ReflectionOnly during Load. Convert the
+                // throwing load into a catchable miss (null) instead of
+                // propagating; the request site sees FileNotFound.
+                Console.WriteLine($"[AppAssemblyLoader] Load of {app}/{name} threw {ex.GetType().Name}, treating as missing.");
+                return null;
+            }
         }
         finally { lock (Gate) Resolving.Remove(name); }
+    }
+
+    private static readonly HashSet<string> FontApplied = new(StringComparer.OrdinalIgnoreCase);
+
+    private static void ApplyDefaultFont(string app, ManifestDefaultFont? font)
+    {
+        if (font is null) return;
+        lock (Gate)
+        {
+            if (!FontApplied.Add(app)) return;
+        }
+        try
+        {
+            global::System.Windows.Forms.Application.SetDefaultFont(new global::System.Drawing.Font(font.name, font.size));
+        }
+        catch (InvalidOperationException)
+        {
+            // A window already exists (app switch): the first app's font sticks.
+            Console.WriteLine($"[AppAssemblyLoader] Default font for {app} skipped (windows exist).");
+        }
     }
 
     private static void NoteUsed(string app, string name)
@@ -122,6 +195,7 @@ public static partial class AppAssemblyLoader
             }
         }
         await RestoreContentAsync(app, http, js, loaded.Manifest.content);
+        ApplyDefaultFont(app, loaded.Manifest.defaultFont);
         System.Windows.Forms.WasmAppIdentity.EntryFileName = loaded.Manifest.entry + ".exe";
         return loaded.Assembly;
     }
@@ -130,6 +204,16 @@ public static partial class AppAssemblyLoader
     {
         var manifest = await http.GetFromJsonAsync<AppManifest>("/api/appmanifest?app=" + Uri.EscapeDataString(app))
             ?? throw new InvalidOperationException("No manifest for app '" + app + "'.");
+        // Kick the browser-cache warm first (zero WASM-thread cost): the
+        // sync demand hook hits the same appresolve URLs, so each fault
+        // becomes a cache hit instead of a transform + download stall.
+        try
+        {
+            if (js is not null && manifest.prefetch is { Count: > 0 })
+                await js.InvokeVoidAsync("wfwasmPrefetch", app,
+                    manifest.prefetch.Select(f => Key(f.name)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray());
+        }
+        catch { }
         await PhaseAsync(js, "Downloading app entry assembly");
         // Even a legacy manifest containing a folder/catalog cannot cause a
         // preload: only the entry is fetched here. Everything else is requested
@@ -144,6 +228,30 @@ public static partial class AppAssemblyLoader
         lock (Gate) Bytes[Key(file.name)] = entryBytes;
         NoteUsed(app, Key(file.name));
         await ReportAsync(js, entryBytes.Length, !ReferenceEquals(fetch, lazy));
+        // Warm the manifest closure in parallel without delaying first
+        // paint: demand faults that arrive before warmup completes use the
+        // sync hook as before. Fire-and-forget (all failures swallowed —
+        // the hook stays the fallback); integrity comes from the response
+        // header, never from a blind store.
+        if (manifest.prefetch is { Count: > 0 })
+        {
+            var warm = manifest.prefetch
+                .Where(f => !Key(f.name).Equals(manifest.entry, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            _ = Task.Run(async () =>
+            {
+                using var gate = new SemaphoreSlim(6);
+                long warmed = 0;
+                await Task.WhenAll(warm.Select(async f =>
+                {
+                    await gate.WaitAsync();
+                    try { warmed += await PrefetchOneAsync(http, f); }
+                    catch { }
+                    finally { gate.Release(); }
+                }));
+                try { Console.WriteLine($"[AppAssemblyLoader] Prefetch warmed {warmed} bytes for '{app}'."); } catch { }
+            });
+        }
         var entry = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(a =>
             string.Equals(a.GetName().Name, manifest.entry, StringComparison.OrdinalIgnoreCase));
         if (entry is null)
@@ -151,6 +259,27 @@ public static partial class AppAssemblyLoader
             entry = Assembly.Load(entryBytes);
         }
         return (entry, manifest);
+
+        // One prefetch lane: raw transformed bytes, stored only when the
+        // server's content hash header matches. Anything else (miss,
+        // optional assembly, drift) is left for the demand hook.
+        async Task<long> PrefetchOneAsync(HttpClient client, ManifestPrefetch f)
+        {
+            string key = Key(f.name);
+            lock (Gate) { if (Bytes.ContainsKey(key)) return 0; }
+            using var resp = await client.GetAsync(f.url);
+            if (!resp.IsSuccessStatusCode) return 0;
+            byte[] body = await resp.Content.ReadAsByteArrayAsync();
+            if (resp.Headers.TryGetValues("X-WfWasm-Sha256", out var values)
+                && values.FirstOrDefault() is string sha
+                && sha.Equals(Convert.ToHexString(SHA256.HashData(body)), StringComparison.OrdinalIgnoreCase))
+            {
+                lock (Gate) Bytes[key] = body;
+                await ReportAsync(js, body.Length, false);
+                return body.Length;
+            }
+            return 0;
+        }
     }
 
     private static async Task<byte[]> FetchVerifiedAsync(HttpClient http, ManifestFile file)

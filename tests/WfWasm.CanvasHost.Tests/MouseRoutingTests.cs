@@ -26,7 +26,7 @@ public sealed class MouseRoutingTests
     [Fact]
     public void Mousedown_Reaches_Control_Handler_With_Local_Coords()
     {
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         host.SelectScene(AppScene.Smoke);
         var form = host.GetOrCreateForm(AppScene.Smoke);
         Assert.NotNull(form);
@@ -55,7 +55,7 @@ public sealed class MouseRoutingTests
     {
         // OnMouseUp logs unconditionally (tracing doc-stroke completion);
         // it must stay safe with no active form, target, or drawing flag.
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         var ex = Record.Exception(() => host.OnMouseUp(10, 10));
         Assert.Null(ex);
     }
@@ -63,7 +63,7 @@ public sealed class MouseRoutingTests
     [Fact]
     public void Right_Mousedown_Reaches_Handler_As_Right()
     {
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         host.SelectScene(AppScene.Smoke);
         var form = host.GetOrCreateForm(AppScene.Smoke);
         Assert.NotNull(form);

@@ -17,9 +17,9 @@ internal static partial class PInvoke
     public static HWND ChildWindowFromPointEx(HWND hwndParent, Point pt, CWP_FLAGS uFlags) => default;
     public static BOOL ClientToScreen(HWND hWnd, ref Point lpPoint)
     {
-        var r = WindowBoundsStorage.Get(hWnd);
-        lpPoint.X += r.X;
-        lpPoint.Y += r.Y;
+        var origin = WasmScreenMapping.ClientOrigin(hWnd);
+        lpPoint.X += origin.X;
+        lpPoint.Y += origin.Y;
         return (BOOL)true;
     }
     public static BOOL CloseHandle(HANDLE hObject) => (BOOL)true;
@@ -47,13 +47,13 @@ internal static partial class PInvoke
     public static void NotifyWinEvent(uint @event, HWND hwnd, int idObject, int idChild) { }
     public static BOOL ScreenToClient(HWND hWnd, ref Point lpPoint)
     {
-        var r = WindowBoundsStorage.Get(hWnd);
-        lpPoint.X -= r.X;
-        lpPoint.Y -= r.Y;
+        var origin = WasmScreenMapping.ClientOrigin(hWnd);
+        lpPoint.X -= origin.X;
+        lpPoint.Y -= origin.Y;
         return (BOOL)true;
     }
     public static HWND SetActiveWindow(HWND hWnd) => hWnd;
-    public static IntPtr SetCapture(HWND hWnd) { global::System.Windows.Forms.WasmCaptureState.Set(hWnd.Value); return (IntPtr)hWnd.Value; }
+    public static IntPtr SetCapture(HWND hWnd) { return (IntPtr)global::System.Windows.Forms.WasmCaptureState.Set(hWnd.Value); }
     public static BOOL SetForegroundWindow(HWND hWnd) => (BOOL)true;
     public static BOOL SetLayeredWindowAttributes(HWND hwnd, COLORREF crKey, byte bAlpha, LAYERED_WINDOW_ATTRIBUTES_FLAGS dwFlags) => (BOOL)true;
     public static BOOL SetMenu(HWND hWnd, HMENU hMenu) => (BOOL)true;
@@ -96,7 +96,15 @@ internal static partial class PInvoke
         return (BOOL)true;
     }
     public static HRESULT SHAutoComplete(HWND hwndEdit, SHELL_AUTOCOMPLETE_FLAGS flags) => HRESULT.S_OK;
-    public static BOOL ShowWindow(HWND hWnd, SHOW_WINDOW_CMD nCmdShow) => (BOOL)true;
+    public static BOOL ShowWindow(HWND hWnd, SHOW_WINDOW_CMD nCmdShow)
+    {
+        // Native ShowWindow synchronously sends WM_SHOWWINDOW; that message
+        // is what runs Control.CreateControl and Form.Load on show. Deliver
+        // it so the show lifecycle happens (see NativeWindow.Wasm.cs).
+        bool shown = nCmdShow != SHOW_WINDOW_CMD.SW_HIDE;
+        global::System.Windows.Forms.NativeWindow.WasmNotifyShowWindow(hWnd, shown);
+        return (BOOL)true;
+    }
     public static unsafe BOOL InvalidateRect(HWND hWnd, RECT* lpRect, BOOL bErase) => (BOOL)true;
     public static unsafe bool IsAccelerator(HACCEL hAccel, int cAccelEntries, MSG* lpMsg, ushort* lpwCmd) => false;
     public static unsafe BOOL RedrawWindow(HWND hWnd, RECT* lprcUpdate, HRGN hrgnUpdate, REDRAW_WINDOW_FLAGS flags) => (BOOL)true;

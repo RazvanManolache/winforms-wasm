@@ -148,6 +148,7 @@ namespace System.Drawing.Text
         {
             ArgumentException.ThrowIfNullOrEmpty(filename);
             _files.Add(filename);
+            _families.Add(new FontFamily(System.IO.Path.GetFileNameWithoutExtension(filename)));
         }
 
         protected override void Dispose(bool disposing)
@@ -156,6 +157,7 @@ namespace System.Drawing.Text
             {
                 _files.Clear();
                 _blobs.Clear();
+                _families.Clear();
             }
             base.Dispose(disposing);
         }
@@ -168,11 +170,96 @@ namespace System.Drawing.Text
             var copy = new byte[length];
             System.Runtime.InteropServices.Marshal.Copy(memory, copy, 0, length);
             _blobs.Add(copy);
+            // Record only successfully named fonts: consumers (Syncfusion
+            // IconFontHelper.RegisterIcons) loop while Families is empty
+            // and recurse while the single name mismatches, so an unnamed
+            // entry degrades to an empty set (bounded, terminating) rather
+            // than a hang, while a parsed entry terminates the loop.
+            string? name = TryReadFamilyName(copy);
+            if (name is not null)
+                _families.Add(new FontFamily(name));
         }
 
-        internal override FontFamily[] GetFamilies() => FontFamily.Families;
+        // Only fonts added to THIS collection (cf. desktop, where installed
+        // families never leak into a private collection). Returning the
+        // installed generics here made vendor load-once checks misfire:
+        // they saw a non-empty set before loading, skipped the load, and
+        // then indexed the still-null shared slot.
+        internal override FontFamily[] GetFamilies() => _families.ToArray();
+
+        // Best-effort TrueType 'name' table family (nameID 1) read. Never
+        // throws: any malformed input yields null. Prefers the Windows
+        // Unicode entry, then Mac Roman, then the first family record.
+        internal static string? TryReadFamilyName(byte[] bytes)
+        {
+            try
+            {
+                if (bytes.Length < 12)
+                    return null;
+                int tableCount = ReadU16(bytes, 4);
+                int nameOffset = -1;
+                for (int i = 0; i < tableCount; i++)
+                {
+                    int record = 12 + i * 16;
+                    if (record + 16 > bytes.Length)
+                        return null;
+                    if (bytes[record] == (byte)'n' && bytes[record + 1] == (byte)'a'
+                        && bytes[record + 2] == (byte)'m' && bytes[record + 3] == (byte)'e')
+                    {
+                        nameOffset = ReadU32(bytes, record + 8);
+                        break;
+                    }
+                }
+                if (nameOffset < 0 || nameOffset + 6 > bytes.Length)
+                    return null;
+                int recordCount = ReadU16(bytes, nameOffset + 2);
+                int storageOffset = nameOffset + ReadU16(bytes, nameOffset + 4);
+                string? macRoman = null;
+                string? first = null;
+                for (int i = 0; i < recordCount; i++)
+                {
+                    int record = nameOffset + 6 + i * 12;
+                    if (record + 12 > bytes.Length)
+                        break;
+                    int platform = ReadU16(bytes, record);
+                    int encoding = ReadU16(bytes, record + 2);
+                    int language = ReadU16(bytes, record + 4);
+                    int nameId = ReadU16(bytes, record + 6);
+                    int byteLength = ReadU16(bytes, record + 8);
+                    int stringOffset = ReadU16(bytes, record + 10);
+                    if (nameId != 1)
+                        continue;
+                    int start = storageOffset + stringOffset;
+                    if (start < 0 || byteLength < 0 || start + byteLength > bytes.Length)
+                        continue;
+                    if (platform == 3)
+                    {
+                        string candidate = System.Text.Encoding.BigEndianUnicode.GetString(bytes, start, byteLength);
+                        if (encoding == 1 && language == 0x0409)
+                            return candidate;
+                        first ??= candidate;
+                    }
+                    else if (platform == 1 && encoding == 0 && language == 0)
+                    {
+                        macRoman ??= System.Text.Encoding.Latin1.GetString(bytes, start, byteLength);
+                    }
+                }
+                return macRoman ?? first;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static int ReadU16(byte[] bytes, int offset) =>
+            (bytes[offset] << 8) | bytes[offset + 1];
+
+        private static int ReadU32(byte[] bytes, int offset) =>
+            (bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
 
         private readonly List<string> _files = new();
         private readonly List<byte[]> _blobs = new();
+        private readonly List<FontFamily> _families = new();
     }
 }

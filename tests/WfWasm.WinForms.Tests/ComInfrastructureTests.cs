@@ -1,4 +1,4 @@
-﻿using Windows.Win32;
+using Windows.Win32;
 using Windows.Win32.Foundation;
 using Windows.Win32.System.Com;
 
@@ -39,5 +39,24 @@ public sealed unsafe class ComInfrastructureTests
         Assert.Throws<InvalidCastException>(() => ComHelpers.GetComScope<FakeObject>(new object()));
         using ComScope<FakeObject> scope = ComHelpers.TryGetComScope<FakeObject>(new object());
         Assert.True(scope.IsNull);
+    }
+
+    // No shell drag-drop exists headless: DragAcceptFiles is a no-op leaf.
+    // The upstream generic wrapper forwards to the PInvokeCore leaf; the
+    // RegisterDragDrop source is not compiled into the fork, so without the
+    // leaf the wrapper resolves back to itself and recurses to stack
+    // overflow on every RichTextBox handle creation (UpdateOleCallback tail).
+    [Fact]
+    public void DragAcceptFiles_Generic_Wrapper_Does_Not_Recurse()
+    {
+        var window = new FakeWindow(default(HWND));
+        Exception? fault = Record.Exception(() =>
+            PInvokeCore.DragAcceptFiles(window, (BOOL)false));
+        Assert.Null(fault);
+    }
+
+    private readonly struct FakeWindow(HWND handle) : IHandle<HWND>
+    {
+        public HWND Handle => handle;
     }
 }

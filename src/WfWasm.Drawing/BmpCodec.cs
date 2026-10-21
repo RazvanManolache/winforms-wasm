@@ -138,6 +138,8 @@ internal static class BmpCodec
         }
 
         var bitmap = new Bitmap(width, height);
+        if (bpp == 32 && !hasAlpha)
+            bitmap.PixelFormatStorage = Imaging.PixelFormat.Format32bppRgb;
         int[] dest = bitmap.Pixels;
         for (int y = 0; y < height; y++)
         {
@@ -182,8 +184,14 @@ internal static class BmpCodec
             }
             default:
             {
+                // 32bpp only (1/4/8/16/24 handled above). GDI+ keeps the
+                // BI_RGB X byte in memory: GetPixel reports opaque but
+                // LockBits exposes the raw byte, and theme art (Telerik
+                // caption glyphs) carries real alpha there. Forcing 255
+                // destroyed it (black titlebar strip); preserve it and
+                // let GetPixel mask on read for the Rgb storage tag.
                 uint pixel = ReadUInt32(bytes, rowAt + x * 4);
-                int alpha = hasAlpha ? a.Scale(pixel) : 255;
+                int alpha = hasAlpha ? a.Scale(pixel) : (int)(pixel >> 24);
                 return Color.FromArgb(alpha, r.Scale(pixel), g.Scale(pixel), b.Scale(pixel)).ToArgb();
             }
         }

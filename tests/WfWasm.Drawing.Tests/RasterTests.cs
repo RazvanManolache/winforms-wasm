@@ -61,6 +61,83 @@ public sealed class RasterTests
     }
 
     [Fact]
+    public void FillRectangle_Opaque_FastPath_VersionParity()
+    {
+        // The Array.Fill fast path must bump the version once per
+        // pixel, exactly like the per-pixel loop it replaces.
+        using var bitmap = new WfBitmap(8, 8);
+        using var graphics = WfGraphics.FromImage(bitmap);
+        graphics.Clear(WfColor.White);
+        int v0 = bitmap.PaintVersion;
+        graphics.FillRectangle(new WfSolidBrush(WfColor.Blue), new WfRectangle(2, 2, 3, 3));
+        Assert.Equal(WfColor.Blue.ToArgb(), bitmap.GetPixel(3, 3).ToArgb());
+        Assert.Equal(v0 + 9, bitmap.PaintVersion);
+    }
+
+    [Fact]
+    public void FillRectangle_Skips_Redundant_Layer_Background()
+    {
+        // White-on-white over a freshly cleared layer writes identical
+        // pixels: the skip keeps them (and the version) exact, and any
+        // later write re-arms painting (stale layer repaints).
+        using var bitmap = new WfBitmap(8, 8);
+        using var graphics = WfGraphics.FromImage(bitmap);
+        graphics.Clear(WfColor.White);
+        int v0 = bitmap.PaintVersion;
+        graphics.FillRectangle(new WfSolidBrush(WfColor.White), new WfRectangle(0, 0, 8, 8));
+        Assert.Equal(WfColor.White.ToArgb(), bitmap.GetPixel(4, 4).ToArgb());
+        Assert.Equal(v0, bitmap.PaintVersion);
+        graphics.FillRectangle(new WfSolidBrush(WfColor.Blue), new WfRectangle(0, 0, 8, 8));
+        Assert.Equal(WfColor.Blue.ToArgb(), bitmap.GetPixel(0, 0).ToArgb());
+        int v1 = bitmap.PaintVersion;
+        graphics.FillRectangle(new WfSolidBrush(WfColor.White), new WfRectangle(0, 0, 8, 8));
+        Assert.Equal(WfColor.White.ToArgb(), bitmap.GetPixel(0, 0).ToArgb());
+        Assert.True(bitmap.PaintVersion > v1);
+    }
+
+    [Fact]
+    public void FillRectangle_Transparent_SourceOver_IsNoOp()
+    {
+        using var bitmap = new WfBitmap(8, 8);
+        using var graphics = WfGraphics.FromImage(bitmap);
+        graphics.Clear(WfColor.White);
+        int v0 = bitmap.PaintVersion;
+        graphics.FillRectangle(
+            new WfSolidBrush(WfColor.FromArgb(0, 255, 0, 0)), new WfRectangle(0, 0, 8, 8));
+        Assert.Equal(WfColor.White.ToArgb(), bitmap.GetPixel(4, 4).ToArgb());
+        Assert.Equal(v0, bitmap.PaintVersion);
+    }
+
+    [Fact]
+    public void Graphics_Clear_Memsets_With_Single_Version_Bump()
+    {
+        using var bitmap = new WfBitmap(8, 8);
+        using var graphics = WfGraphics.FromImage(bitmap);
+        graphics.Clear(WfColor.Blue);
+        Assert.Equal(WfColor.Blue.ToArgb(), bitmap.GetPixel(7, 7).ToArgb());
+        int v0 = bitmap.PaintVersion;
+        graphics.Clear(WfColor.White);
+        Assert.Equal(WfColor.White.ToArgb(), bitmap.GetPixel(0, 0).ToArgb());
+        // One bump per Clear (not per pixel), like the old loop.
+        Assert.Equal(v0 + 1, bitmap.PaintVersion);
+    }
+
+    [Fact]
+    public void FillRectangle_Transparent_SourceCopy_Clears()
+    {
+        using var bitmap = new WfBitmap(8, 8);
+        using var graphics = WfGraphics.FromImage(bitmap);
+        graphics.Clear(WfColor.White);
+        graphics.CompositingMode = WfDraw::System.Drawing.Drawing2D.CompositingMode.SourceCopy;
+        graphics.FillRectangle(
+            new WfSolidBrush(WfColor.FromArgb(0, 255, 0, 0)), new WfRectangle(2, 2, 3, 3));
+        // SourceCopy writes the raw color (PutPixel passthrough parity:
+        // Color.ToArgb() is 0x00FF0000, alpha included).
+        Assert.Equal(16711680, bitmap.GetPixel(3, 3).ToArgb());
+        Assert.Equal(WfColor.White.ToArgb(), bitmap.GetPixel(0, 0).ToArgb());
+    }
+
+    [Fact]
     public void Graphics_DrawLine_Hits_Diagonal()
     {
         using var bitmap = new WfBitmap(8, 8);
@@ -224,8 +301,10 @@ public sealed class RasterTests
     [Fact]
     public void SystemFonts_Resolve()
     {
-        Assert.Equal("Tahoma", WfSystemFonts.MenuFont.Name);
-        Assert.Equal("Tahoma", WfSystemFonts.DefaultFont.Name);
+        Assert.Equal("Segoe UI", WfSystemFonts.MenuFont.Name);
+        Assert.Equal("Segoe UI", WfSystemFonts.DefaultFont.Name);
+        Assert.Equal(9f, WfSystemFonts.DefaultFont.Size);
+        Assert.Equal("Microsoft Sans Serif", WfSystemFonts.DialogFont.Name);
         Assert.Equal("Consolas", WfSystemFonts.GetFontByName("Consolas").Name);
     }
 

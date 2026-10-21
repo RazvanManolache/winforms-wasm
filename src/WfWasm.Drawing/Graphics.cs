@@ -9,10 +9,16 @@ using System.Drawing.Text;
 namespace System.Drawing
 {
     /// <summary>2D rasterizer (cf. System.Drawing.Graphics).</summary>
-    public sealed class Graphics : IDeviceContext, IDisposable
+    public sealed partial class Graphics : IDeviceContext, IDisposable
     {
         private Bitmap? _target;
         private Matrix _transform = new();
+        private IntPtr _overlayHwnd;
+        private bool _overlayCommitted;
+
+
+
+
         private Region? _clip;
         private readonly Stack<StateFrame> _stack = new();
 
@@ -37,18 +43,54 @@ namespace System.Drawing
 
         public static Graphics FromHdc(IntPtr hdc, IntPtr hdevice) => new();
 
+        // Fork hook: FromHwnd paints onto a per-window overlay bitmap
+        // the host composites after the control (spell squiggles,
+        // adorner layers). Wired once by the fork module initializer;
+        // without the fork, or for unknown windows, the Graphics stays
+        // detached as before.
+        internal static Func<IntPtr, Size>? HwndOverlaySizeHook { get; set; }
+        internal static Action<IntPtr, Bitmap>? HwndOverlayCommitHook { get; set; }
+
         [Obsolete("Use FromHwnd with HandleRef in new code.")]
-        public static Graphics FromHwnd(IntPtr hwnd) => new();
+        public static Graphics FromHwnd(IntPtr hwnd) => FromHwndCore(hwnd);
 
-        public static Graphics FromHwndInternal(IntPtr hwnd) => new();
+        public static Graphics FromHwndInternal(IntPtr hwnd) => FromHwndCore(hwnd);
 
-        public IntPtr GetHdc() => IntPtr.Zero;
+        private static Graphics FromHwndCore(IntPtr hwnd)
+        {
+            try
+            {
+                Size size = HwndOverlaySizeHook?.Invoke(hwnd) ?? Size.Empty;
+                if (size.Width > 0 && size.Height > 0)
+                {
+                    var overlay = new Graphics(new Bitmap(size.Width, size.Height));
+                    overlay._overlayHwnd = hwnd;
+                    return overlay;
+                }
+            }
+            catch
+            {
+            }
+
+            return new Graphics();
+        }
+
+        // Fork hook: headless HDCs are tokens into the fork's Graphics
+        // registry (WasmFillBridge), minted on GetHdc so GDI paint calls
+        // (DrawText, ImageList_Draw) resolve the target. Wired once by the
+        // fork module initializer; without the fork, GetHdc answers Zero
+        // as before.
+        internal static Func<Graphics, IntPtr>? HdcHook { get; set; }
+        internal static Action<IntPtr>? HdcReleaseHook { get; set; }
+
+        public IntPtr GetHdc() => HdcHook?.Invoke(this) ?? IntPtr.Zero;
         public void ReleaseHdc()
         {
         }
 
         public void ReleaseHdc(IntPtr hdc)
         {
+            try { HdcReleaseHook?.Invoke(hdc); } catch { }
         }
 
         public void Flush()
@@ -66,6 +108,11 @@ namespace System.Drawing
 
         private void Dispose(bool disposing)
         {
+            if (disposing && _overlayHwnd != IntPtr.Zero && !_overlayCommitted && _target is Bitmap bmp)
+            {
+                _overlayCommitted = true;
+                try { HwndOverlayCommitHook?.Invoke(_overlayHwnd, bmp); } catch { }
+            }
         }
 
         public void Dispose()
@@ -93,15 +140,42 @@ namespace System.Drawing
         public Matrix Transform
         {
             get => _transform.Clone();
-            set => _transform = value?.Clone() ?? new Matrix();
-        }
-
-        public Region Clip
-        {
-            get => _clip is null ? new Region(Bounds()) : (Region)_clip.Clone();
             set
             {
-                _clip = value is null ? null : (Region)value.Clone();
+            if (IsDisplay) throw new NotSupportedException("Display path does not implement this operation.");
+
+                _transform = value?.Clone() ?? new Matrix();
+            }
+        }
+
+        // Clip space contract (GDI+): _clip is stored in DEVICE space
+        // (drawing tests device pixels against it in PutPixel/HitTest),
+        // while the public surface speaks WORLD space: setters transform
+        // world->device, getters transform device->world. Storing the
+        // world rect raw collapsed every translated SetClip (Telerik
+        // SetClipping passes local Bounds under an absolute paint
+        // transform), which emptied nested clips and hid grid cells.
+        public Region Clip
+        {
+            get
+            {
+                Region raw = _clip is null ? new Region(Bounds()) : (Region)_clip.Clone();
+                raw.Transform(WorldMatrix());
+                return raw;
+            }
+            set
+            {
+                if (value is null)
+                {
+                    _clip = null;
+                    if (IsDisplay) _displayRecorder!.Record(new WfWasm.Rendering.ResetClip());
+                    return;
+                }
+
+                Region device = (Region)value.Clone();
+                device.Transform(DeviceMatrix());
+                if (IsDisplay) RecordDisplayClip(device, CombineMode.Replace);
+                _clip = device;
             }
         }
 
@@ -111,9 +185,9 @@ namespace System.Drawing
             {
                 RectangleF bounds = Bounds();
                 if (_clip is null)
-                    return bounds;
+                    return ToWorldRect(bounds);
                 RectangleF hit = RectangleF.Intersect(bounds, _clip.GetBounds(null));
-                return hit;
+                return ToWorldRect(hit);
             }
         }
 
@@ -122,6 +196,7 @@ namespace System.Drawing
         public GraphicsState Save()
         {
             _stack.Push(new StateFrame(_transform.Clone(), _clip is null ? null : (Region)_clip.Clone()));
+            if (IsDisplay) _displayRecorder!.Record(new WfWasm.Rendering.SaveState());
             return new GraphicsState();
         }
 
@@ -132,6 +207,7 @@ namespace System.Drawing
             StateFrame frame = _stack.Pop();
             _transform = frame.Transform;
             _clip = frame.Clip;
+            if (IsDisplay) _displayRecorder!.Record(new WfWasm.Rendering.RestoreState());
         }
 
         public GraphicsContainer BeginContainer() => BeginContainer(new Rectangle(), new Rectangle(), GraphicsUnit.Pixel);
@@ -139,12 +215,14 @@ namespace System.Drawing
         public GraphicsContainer BeginContainer(Rectangle dstrect, Rectangle srcrect, GraphicsUnit unit)
         {
             _stack.Push(new StateFrame(_transform.Clone(), _clip is null ? null : (Region)_clip.Clone()));
+            if (IsDisplay) _displayRecorder!.Record(new WfWasm.Rendering.SaveState());
             return new GraphicsContainer();
         }
 
         public GraphicsContainer BeginContainer(RectangleF dstrect, RectangleF srcrect, GraphicsUnit unit)
         {
             _stack.Push(new StateFrame(_transform.Clone(), _clip is null ? null : (Region)_clip.Clone()));
+            if (IsDisplay) _displayRecorder!.Record(new WfWasm.Rendering.SaveState());
             return new GraphicsContainer();
         }
 
@@ -155,9 +233,14 @@ namespace System.Drawing
             StateFrame frame = _stack.Pop();
             _transform = frame.Transform;
             _clip = frame.Clip;
+            if (IsDisplay) _displayRecorder!.Record(new WfWasm.Rendering.RestoreState());
         }
 
-        public void ResetTransform() => _transform.Reset();
+        public void ResetTransform()
+        {
+            if (IsDisplay) throw new NotSupportedException("Display path does not implement this operation.");
+            _transform.Reset();
+        }
 
         public void MultiplyTransform(Matrix matrix) =>
             MultiplyTransform(matrix, MatrixOrder.Prepend);
@@ -165,26 +248,42 @@ namespace System.Drawing
         public void MultiplyTransform(Matrix matrix, MatrixOrder order)
         {
             ArgumentNullException.ThrowIfNull(matrix);
+            if (IsDisplay) throw new NotSupportedException("Display path does not implement this operation.");
             _transform.Multiply(matrix, order);
         }
 
         public void TranslateTransform(float dx, float dy) =>
             TranslateTransform(dx, dy, MatrixOrder.Prepend);
 
-        public void TranslateTransform(float dx, float dy, MatrixOrder order) =>
+        public void TranslateTransform(float dx, float dy, MatrixOrder order)
+        {
+
+            TranslateTransformCore(dx, dy, order);
+        }
+
+        private void TranslateTransformCore(float dx, float dy, MatrixOrder order)
+        {
             _transform.Translate(dx, dy, order);
+            if (IsDisplay) RecordDisplayTransform();
+        }
 
         public void ScaleTransform(float sx, float sy) =>
             ScaleTransform(sx, sy, MatrixOrder.Prepend);
 
-        public void ScaleTransform(float sx, float sy, MatrixOrder order) =>
+        public void ScaleTransform(float sx, float sy, MatrixOrder order)
+        {
+            if (IsDisplay) throw new NotSupportedException("Display path does not implement this operation.");
             _transform.Scale(sx, sy, order);
+        }
 
         public void RotateTransform(float angle) =>
             RotateTransform(angle, MatrixOrder.Prepend);
 
-        public void RotateTransform(float angle, MatrixOrder order) =>
+        public void RotateTransform(float angle, MatrixOrder order)
+        {
+            if (IsDisplay) throw new NotSupportedException("Display path does not implement this operation.");
             _transform.Rotate(angle, order);
+        }
 
         public void TransformPoints(PointF[] pts)
         {
@@ -219,7 +318,7 @@ namespace System.Drawing
         public void SetClip(Graphics g, CombineMode combineMode)
         {
             ArgumentNullException.ThrowIfNull(g);
-            CombineClip(g._clip is null ? new Region(Bounds()) : (Region)g._clip.Clone(), combineMode);
+            CombineClipDevice(g._clip is null ? new Region(Bounds()) : (Region)g._clip.Clone(), combineMode);
         }
 
         public void SetClip(Rectangle rect) => SetClip(rect, CombineMode.Replace);
@@ -240,22 +339,23 @@ namespace System.Drawing
         public void IntersectClip(RectangleF rect) => SetClip(rect, CombineMode.Intersect);
         public void IntersectClip(Region region) => SetClip(region, CombineMode.Intersect);
 
-        public void ExcludeClip(Rectangle rect)
-        {
-            var universe = _clip is null ? new Region(Bounds()) : (_clip.Clone() as Region)!;
-            universe.Exclude(new RectangleF(rect.X, rect.Y, rect.Width, rect.Height));
-            _clip = universe;
-        }
+        public void ExcludeClip(Rectangle rect) => CombineClip(new Region(rect), CombineMode.Exclude);
+
+
+
+        public void ExcludeClip(RectangleF rect) => CombineClip(new Region(rect), CombineMode.Exclude);
 
         public void ExcludeClip(Region region)
         {
             ArgumentNullException.ThrowIfNull(region);
-            var universe = _clip is null ? new Region(Bounds()) : (_clip.Clone() as Region)!;
-            universe.Exclude(region);
-            _clip = universe;
+            CombineClip((Region)region.Clone(), CombineMode.Exclude);
         }
 
-        public void ResetClip() => _clip = null;
+        public void ResetClip()
+        {
+            _clip = null;
+            if (IsDisplay) _displayRecorder!.Record(new WfWasm.Rendering.ResetClip());
+        }
 
         public bool IsVisible(int x, int y) => IsVisible(new Point(x, y));
         public bool IsVisible(Point point) => IsVisible(point.X, point.Y, null);
@@ -291,6 +391,18 @@ namespace System.Drawing
 
         private void CombineClip(Region region, CombineMode mode)
         {
+            // GDI+: the incoming region is expressed in world units and
+            // mapped through the current transform; storage is device.
+            region.Transform(DeviceMatrix());
+            CombineClipDevice(region, mode);
+        }
+
+        private void CombineClipDevice(Region region, CombineMode mode)
+        {
+            // Display records first (it may honestly reject unrepresentable
+            // regions/modes with state untouched), then shares the stored
+            // device-space clip so getters and text islands observe it.
+            if (IsDisplay) RecordDisplayClip(region, mode);
             switch (mode)
             {
                 case CombineMode.Intersect:
@@ -340,7 +452,13 @@ namespace System.Drawing
         }
 
         private RectangleF Bounds() =>
-            _target is null ? new RectangleF(0, 0, 0, 0) : new RectangleF(0, 0, _target.Width, _target.Height);
+            _target is null
+                ? IsDisplay && _clip is not null
+                    // No CPU target by design; the stored clip is the only
+                    // known-visible display extent (never fabricate one).
+                    ? _clip.GetBounds(null)
+                    : new RectangleF(0, 0, 0, 0)
+                : new RectangleF(0, 0, _target.Width, _target.Height);
 
         private float UnitScale() => PageScale * PageUnit switch
         {
@@ -359,6 +477,42 @@ namespace System.Drawing
             return device;
         }
 
+        private Matrix WorldMatrix()
+        {
+            Matrix world = DeviceMatrix();
+            if (world.IsInvertible)
+                world.Invert();
+            else
+                world.Reset();
+            return world;
+        }
+
+        private RectangleF ToWorldRect(RectangleF device)
+        {
+            Matrix world = WorldMatrix();
+            var corners = new PointF[]
+            {
+                new(device.X, device.Y),
+                new(device.Right, device.Y),
+                new(device.Right, device.Bottom),
+                new(device.X, device.Bottom),
+            };
+            world.TransformPoints(corners);
+            float minX = corners[0].X;
+            float minY = corners[0].Y;
+            float maxX = corners[0].X;
+            float maxY = corners[0].Y;
+            for (int i = 1; i < corners.Length; i++)
+            {
+                if (corners[i].X < minX) minX = corners[i].X;
+                if (corners[i].Y < minY) minY = corners[i].Y;
+                if (corners[i].X > maxX) maxX = corners[i].X;
+                if (corners[i].Y > maxY) maxY = corners[i].Y;
+            }
+
+            return new RectangleF(minX, minY, maxX - minX, maxY - minY);
+        }
+
         private void DevicePoint(PointF point, out float dx, out float dy)
         {
             Matrix device = DeviceMatrix();
@@ -367,6 +521,28 @@ namespace System.Drawing
 
         private void ToDevice(RectangleF rect, out float x, out float y, out float w, out float h)
         {
+            // Fast path: pixel units at scale 1 with a pure-translation
+            // world transform (the TPF span pattern is translate-there/
+            // back around DrawString). Bit-identical: the general path
+            // computes ((p + t) * s + o) with s == 1, o == 0 and a
+            // translation-only matrix, which reduces exactly to p + t
+            // (same float ops; int casts absorb -0); anything else takes
+            // the slow path below.
+            if (RenderingOrigin.X == 0 && RenderingOrigin.Y == 0
+                && PageScale == 1f
+                && (PageUnit == GraphicsUnit.Pixel || PageUnit == GraphicsUnit.Display || PageUnit == GraphicsUnit.World)
+                && _transform.IsPureTranslation(out float ttx, out float tty))
+            {
+                x = rect.X + ttx;
+                y = rect.Y + tty;
+                w = Math.Abs(rect.Width);
+                h = Math.Abs(rect.Height);
+                if (rect.Width < 0)
+                    x += rect.Width;
+                if (rect.Height < 0)
+                    y += rect.Height;
+                return;
+            }
             DevicePoint(new PointF(rect.X, rect.Y), out x, out y);
             Matrix device = DeviceMatrix();
             device.TransformVector(rect.Width, rect.Height, out float vw, out float vh);
@@ -409,53 +585,224 @@ namespace System.Drawing
             return (a << 24) | (r << 16) | (g << 8) | b;
         }
 
-        private Color ResolveColor(Brush brush, float x, float y)
+        // Integer-component twin of BlendOver (the DrawString hoisted
+        // loop composes src ARGB directly instead of round-tripping a
+        // Color through FromArgb's CheckBytes; identical math).
+        private static int BlendOverInt(int dest, int sa, int sr, int sg, int sb)
+        {
+            int inv = 255 - sa;
+            int dr = (dest >> 16) & 0xFF;
+            int dg = (dest >> 8) & 0xFF;
+            int db = dest & 0xFF;
+            int da = (int)((uint)dest >> 24);
+            int r = ((sr * sa) + (dr * inv)) / 255;
+            int g = ((sg * sa) + (dg * inv)) / 255;
+            int b = ((sb * sa) + (db * inv)) / 255;
+            int a = sa + ((da * inv) / 255);
+            return (a << 24) | (r << 16) | (g << 8) | b;
+        }
+
+        // Drawing frame: the integer device-pixel rectangle in which a
+        // PutPixel can possibly land for the current target/clip. Finite
+        // clips contribute their bounds envelope (a superset: disjoint
+        // rects and holes still go through PutPixel's exact IsVisible);
+        // null/infinite clips map to the whole target; an empty clip (or
+        // an envelope disjoint from the target, or no target) yields no
+        // frame and callers skip all scan/color work. The bounds of an
+        // infinite/empty region are never read: IsInfinite/IsEmpty are
+        // the tokens, checked first, and no rect is handed to Region.
+        private bool TryGetDrawFrame(out int x0, out int y0, out int x1, out int y1)
+        {
+            x0 = 0;
+            y0 = 0;
+            x1 = 0;
+            y1 = 0;
+            if (_target is null)
+                return false;
+            x1 = _target.Width;
+            y1 = _target.Height;
+            if (x1 <= 0 || y1 <= 0)
+                return false;
+            Region? clip = _clip;
+            if (clip is null || clip.IsInfinite(null))
+                return true;
+            if (clip.IsEmpty(null))
+                return false;
+            RectangleF bounds = clip.GetBounds(null);
+            double left = bounds.X;
+            double top = bounds.Y;
+            double right = (double)bounds.X + bounds.Width;
+            double bottom = (double)bounds.Y + bounds.Height;
+            if (double.IsNaN(left) || double.IsNaN(top) || double.IsNaN(right) || double.IsNaN(bottom))
+                return true; // unusable envelope: keep the target frame; PutPixel stays exact
+
+            // Integer pixels visible through a rect satisfy X <= px < Right
+            // (RectangleF.Contains), so the candidate integer range is
+            // [ceil(left), ceil(right)) intersected with the target.
+            x0 = (int)Math.Clamp(Math.Ceiling(left), 0, x1);
+            y0 = (int)Math.Clamp(Math.Ceiling(top), 0, y1);
+            x1 = (int)Math.Clamp(Math.Ceiling(right), 0, x1);
+            y1 = (int)Math.Clamp(Math.Ceiling(bottom), 0, y1);
+            return x0 < x1 && y0 < y1;
+        }
+
+        // Integer candidate range [lo, hi) for the legacy loops'
+        // floor(loF) <= p < hiF span, intersected with the frame range
+        // [f0, f1). Double math keeps huge/infinite float spans from
+        // overflowing the int cast the old loops used; NaN spans (which
+        // the old float comparisons also rejected) yield no range.
+        private static bool TryBoundRange(float loF, float hiF, int f0, int f1, out int lo, out int hi)
+        {
+            lo = f0;
+            hi = f0;
+            if (float.IsNaN(loF) || float.IsNaN(hiF))
+                return false;
+            lo = (int)Math.Clamp(Math.Floor((double)loF), f0, f1);
+            hi = (int)Math.Clamp(Math.Ceiling((double)hiF), f0, f1);
+            return lo < hi;
+        }
+
+        // Per-draw brush state, resolved once at each fill's call
+        // boundary (gradient stops arrive here as a cloned snapshot via
+        // LerpColor/EffectiveStops, so mutating the brush between draws
+        // is honored and nothing is cached across calls by identity).
+        // Texture brushes stay spatial: the tile is sampled per pixel
+        // exactly like the old ResolveColor did.
+        private readonly struct PreparedBrush
+        {
+            private readonly Color _color;
+            private readonly Bitmap? _tile;
+
+            internal PreparedBrush(Color color, Bitmap? tile)
+            {
+                _color = color;
+                _tile = tile;
+            }
+
+            internal Bitmap? Tile => _tile;
+
+            internal bool TryGetFlatColor(out Color color)
+            {
+                color = _color;
+                return _tile is null;
+            }
+
+            internal Color Sample(float x, float y) =>
+                _tile is not null
+                    ? _tile.GetPixel(Mod((int)x, _tile.Width), Mod((int)y, _tile.Height))
+                    : _color;
+
+            private static int Mod(int value, int length) => ((value % length) + length) % length;
+        }
+
+        private static PreparedBrush PrepareBrush(Brush brush)
         {
             switch (brush)
             {
                 case SolidBrush solid:
-                    return solid.Color;
+                    return new PreparedBrush(solid.Color, null);
                 case HatchBrush hatch:
-                    return hatch.ForegroundColor;
+                    return new PreparedBrush(hatch.ForegroundColor, null);
                 case LinearGradientBrush linear:
-                    return LerpColor(linear);
+                    return new PreparedBrush(LerpColor(linear), null);
                 case TextureBrush texture when texture.Image is Bitmap tile && tile.Width > 0 && tile.Height > 0:
-                    return tile.GetPixel(Mod((int)x, tile.Width), Mod((int)y, tile.Height));
+                    return new PreparedBrush(Color.Empty, tile);
                 case Drawing2D.PathGradientBrush radial:
                     // Radial interpolation waits for the gradient milestone.
-                    return radial.CenterColor;
+                    return new PreparedBrush(radial.CenterColor, null);
                 default:
-                    return Color.Gray;
+                    return new PreparedBrush(Color.Gray, null);
             }
-
-            static int Mod(int value, int length) => ((value % length) + length) % length;
         }
+
+        private Color ResolveColor(Brush brush, float x, float y) =>
+            PrepareBrush(brush).Sample(x, y);
 
         private static Color LerpColor(LinearGradientBrush linear)
         {
-            Color[] colors = linear.LinearColors;
-            if (colors.Length == 0)
-                return Color.Empty;
-            if (colors.Length == 1)
-                return colors[0];
-            Color first = colors[0];
-            Color last = colors[^1];
-            return Color.FromArgb(255,
-                (byte)((first.R + last.R) / 2),
-                (byte)((first.G + last.G) / 2),
-                (byte)((first.B + last.B) / 2));
+        // Effective stops: InterpolationColors when set (GDI+
+        // semantics), else LinearColors. The flat resolve approximates
+        // the gradient integral (trapezoid over stop positions) in all
+        // 4 channels: zero-alpha stops stay transparent, never the
+        // opaque black that ARGB(0,0,0,0) theme sentinels produced.
+        Color[] colors = EffectiveStops(linear, out float[] positions);
+        if (colors.Length == 0)
+        return Color.Empty;
+        if (colors.Length == 1)
+        return colors[0];
+        double a = 0, r = 0, g = 0, b = 0, wsum = 0;
+        for (int i = 0; i + 1 < colors.Length; i++)
+        {
+        double w = Math.Max(0f, positions[i + 1] - positions[i]);
+        if (w <= 0)
+        continue;
+        a += w * (colors[i].A + colors[i + 1].A) * 0.5;
+        r += w * (colors[i].R + colors[i + 1].R) * 0.5;
+        g += w * (colors[i].G + colors[i + 1].G) * 0.5;
+        b += w * (colors[i].B + colors[i + 1].B) * 0.5;
+        wsum += w;
+        }
+        if (wsum <= 0)
+        {
+        foreach (Color c in colors)
+        {
+        a += c.A;
+        r += c.R;
+        g += c.G;
+        b += c.B;
+        }
+        return Color.FromArgb(ToByte(a / colors.Length), ToByte(r / colors.Length), ToByte(g / colors.Length), ToByte(b / colors.Length));
+        }
+        return Color.FromArgb(ToByte(a / wsum), ToByte(r / wsum), ToByte(g / wsum), ToByte(b / wsum));
+        }
+        private static byte ToByte(double value) => (byte)Math.Round(Math.Clamp(value, 0, 255));
+        // Snapshot rule: the returned arrays are private clones taken at
+        // the calling draw's boundary (UniformPositions already returns a
+        // fresh array), never the brush's live arrays, so a prepared
+        // gradient cannot observe a later mutation mid-draw and no
+        // cross-call cache is keyed by brush identity.
+        private static Color[] EffectiveStops(LinearGradientBrush linear, out float[] positions)
+        {
+            ColorBlend blend = linear.InterpolationColors;
+            if (blend?.Colors is { Length: > 0 } blendColors)
+            {
+                positions = blend.Positions is { Length: > 0 } p && p.Length == blendColors.Length
+                    ? (float[])p.Clone()
+                    : UniformPositions(blendColors.Length);
+                return (Color[])blendColors.Clone();
+            }
+
+            Color[] colors = linear.LinearColors ?? Array.Empty<Color>();
+            positions = UniformPositions(colors.Length);
+            return colors.Length == 0 ? colors : (Color[])colors.Clone();
+        }
+
+        private static float[] UniformPositions(int count)
+        {
+        if (count <= 1)
+        return [0f];
+        var positions = new float[count];
+        for (int i = 0; i < count; i++)
+        positions[i] = i / (float)(count - 1);
+        return positions;
         }
 
         public void Clear(Color color)
         {
+            if (IsDisplay) { RecordDisplayClear(color); return; }
             if (_target is null)
                 return;
             _target.PaintVersion++;
             _target.ClearVersion++;
             int[] pixels = _target.Pixels;
             int argb = color.ToArgb();
-            for (int i = 0; i < pixels.Length; i++)
-                pixels[i] = argb;
+            // Perf: whole-bitmap memset (same values, same single version
+            // bumps as the old loop) plus the clear color for redundancy
+            // analysis (layer bg vs per-block bg fills).
+            System.Array.Fill(pixels, argb);
+            TextRasterCounters.NoteClearSurface(_target, _target.PaintVersion, argb);
+            if (TextRasterCounters.PerfEnabled)
+                TextRasterCounters.NoteClear(argb);
         }
 
         public void FillRectangle(Brush brush, RectangleF rect) =>
@@ -486,22 +833,80 @@ namespace System.Drawing
 
         private void FillRectCore(Brush brush, RectangleF rect)
         {
-
-
             ArgumentNullException.ThrowIfNull(brush);
+            if (IsDisplay) { RecordDisplayFill(brush, rect); return; }
+            if (!TryGetDrawFrame(out int fx0, out int fy0, out int fx1, out int fy1))
+                return;
             ToDevice(rect, out float x, out float y, out float w, out float h);
-            int x0 = (int)MathF.Floor(x);
-            int y0 = (int)MathF.Floor(y);
-            int x1 = (int)MathF.Ceiling(x + w);
-            int y1 = (int)MathF.Ceiling(y + h);
-            if (brush is TextureBrush texture && texture.Image is Bitmap tile && tile.Width > 0 && tile.Height > 0)
+            if (!TryBoundRange(x, x + w, fx0, fx1, out int x0, out int x1) ||
+                !TryBoundRange(y, y + h, fy0, fy1, out int y0, out int y1))
+                return;
+            // Perf item 4 op census.
+            if (TextRasterCounters.PerfEnabled)
+            {
+                TextRasterCounters.NoteFill();
+                long censusPx = (long)(x1 - x0) * (y1 - y0);
+                TextRasterCounters.NoteFillPx(censusPx);
+            }
+            PreparedBrush prepared = PrepareBrush(brush);
+            if (prepared.Tile is Bitmap tile)
             {
                 FillTextureFast(tile, x0, y0, x1, y1);
                 return;
             }
+            // Big-fill attribution (size + color + caller) for flat fills.
+            if (TextRasterCounters.PerfEnabled && prepared.TryGetFlatColor(out Color bigFlat))
+            {
+                long bigPx = (long)(x1 - x0) * (y1 - y0);
+                if (bigPx > 50000)
+                    TextRasterCounters.NoteBigFill(bigPx, TextRasterCounters.CaptureTelerikCaller(), bigFlat.ToArgb());
+            }
+            // Redundant-fill skip (per-surface, version-guarded): a flat
+            // fill whose ARGB exactly matches the surface's own clear color,
+            // with no intervening write to THAT surface, rewrites identical
+            // pixels when opaque (any mode) or under SourceCopy (replace
+            // with self), so it returns with the version exact. Translucent
+            // SourceOver is NOT identity (128-over-128 blends to 191) and
+            // must paint. Fully transparent SourceOver (alpha 0) is identity
+            // on any surface. Every other path below writes, and its
+            // PaintVersion bump voids the record.
+            if (prepared.TryGetFlatColor(out Color skipFlat))
+            {
+                if (skipFlat.A == 0 && CompositingMode != CompositingMode.SourceCopy)
+                    return;
+                if ((skipFlat.A == 255 || CompositingMode == CompositingMode.SourceCopy)
+                    && _target is not null && TextRasterCounters.TrySkipClearFill(_target, skipFlat.ToArgb()))
+                    return;
+            }
+            // Perf: flat-color fills (RTE per-block backgrounds: 46M px/frame
+            // through per-pixel PutPixel) take a memset path. Transparent
+            // SourceOver is a no-op (the old loop rewrote identical pixels);
+            // opaque-or-SourceCopy with no clip is a per-row Array.Fill;
+            // anything else keeps the exact per-pixel loop.
+            if (prepared.TryGetFlatColor(out Color flat) && _target is not null)
+            {
+                bool fillCopy = CompositingMode == CompositingMode.SourceCopy;
+                if (flat.A == 0 && !fillCopy)
+                    return;
+                if ((flat.A == 255 || fillCopy) && _clip is null)
+                {
+                    int[] fillDst = _target.Pixels;
+                    int fillW = _target.Width;
+                    int argb = flat.ToArgb();
+                    int fw = x1 - x0;
+                    if (x0 == 0 && x1 == fillW)
+                        System.Array.Fill(fillDst, argb, y0 * fillW, (y1 - y0) * fillW);
+                    else
+                        for (int fy = y0; fy < y1; fy++)
+                        System.Array.Fill(fillDst, argb, fy * fillW + x0, fw);
+                    _target.PaintVersion += (y1 - y0) * fw;
+                    return;
+                }
+            }
+
             for (int py = y0; py < y1; py++)
                 for (int px = x0; px < x1; px++)
-                    PutPixel(px, py, ResolveColor(brush, px, py));
+                    PutPixel(px, py, prepared.Sample(px, py));
         }
 
         // Integer fast path for TextureBrush rect fills (the viewer-composite
@@ -611,9 +1016,15 @@ namespace System.Drawing
 
         private void StrokeLine(Pen pen, PointF a, PointF b)
         {
+            if (IsDisplay) throw new NotSupportedException("Display path does not implement this operation.");
+
+            // Perf item 4 op census.
+            if (TextRasterCounters.PerfEnabled)
+                TextRasterCounters.NoteLine();
             ArgumentNullException.ThrowIfNull(pen);
             DevicePoint(a, out float x0, out float y0);
             DevicePoint(b, out float x1, out float y1);
+
             float width = Math.Max(1f, pen.Width * UnitScale());
             Color color = ResolveColor(BrushFor(pen), x0, y0);
             int steps = (int)MathF.Ceiling(Math.Max(Math.Abs(x1 - x0), Math.Abs(y1 - y0)));
@@ -655,21 +1066,28 @@ namespace System.Drawing
         private void FillEllipseCore(Brush brush, RectangleF rect)
         {
             ArgumentNullException.ThrowIfNull(brush);
+            if (IsDisplay) throw new NotSupportedException("Display path does not implement this operation.");
+
             ToDevice(rect, out float x, out float y, out float w, out float h);
             if (w <= 0f || h <= 0f)
+                return;
+            if (!TryGetDrawFrame(out int fx0, out int fy0, out int fx1, out int fy1) ||
+                !TryBoundRange(x, x + w, fx0, fx1, out int x0, out int x1) ||
+                !TryBoundRange(y, y + h, fy0, fy1, out int y0, out int y1))
                 return;
             float rx = w / 2f;
             float ry = h / 2f;
             float cx = x + rx;
             float cy = y + ry;
-            for (int py = (int)MathF.Floor(y); py < y + h; py++)
+            PreparedBrush prepared = PrepareBrush(brush);
+            for (int py = y0; py < y1; py++)
             {
-                for (int px = (int)MathF.Floor(x); px < x + w; px++)
+                for (int px = x0; px < x1; px++)
                 {
                     float nx = (px + 0.5f - cx) / rx;
                     float ny = (py + 0.5f - cy) / ry;
                     if ((nx * nx) + (ny * ny) <= 1f)
-                        PutPixel(px, py, ResolveColor(brush, px, py));
+                        PutPixel(px, py, prepared.Sample(px, py));
                 }
             }
         }
@@ -684,6 +1102,8 @@ namespace System.Drawing
 
         private void DrawEllipseCore(Pen pen, RectangleF rect)
         {
+            if (IsDisplay) throw new NotSupportedException("Display path does not implement this operation.");
+
             ArgumentNullException.ThrowIfNull(pen);
             ToDevice(rect, out float x, out float y, out float w, out float h);
             if (w <= 0f || h <= 0f)
@@ -716,22 +1136,33 @@ namespace System.Drawing
 
         private void FillPolygonCore(Brush brush, PointF[] points, FillMode fillMode)
         {
+            if (IsDisplay) throw new NotSupportedException("Display path does not implement this operation.");
+
             ArgumentNullException.ThrowIfNull(brush);
             ArgumentNullException.ThrowIfNull(points);
             if (points.Length < 3)
                 return;
+            if (!TryGetDrawFrame(out int fx0, out int fy0, out int fx1, out int fy1))
+                return;
             var device = new PointF[points.Length];
+            Matrix matrix = DeviceMatrix();
+            float minY = float.PositiveInfinity;
+            float maxY = float.NegativeInfinity;
             for (int i = 0; i < points.Length; i++)
             {
-                DevicePoint(points[i], out float dx, out float dy);
+                matrix.TransformPoint(points[i].X, points[i].Y, out float dx, out float dy);
                 device[i] = new PointF(dx, dy);
+                minY = Math.Min(minY, dy);
+                maxY = Math.Max(maxY, dy);
             }
 
-            float minY = device.Min(p => p.Y);
-            float maxY = device.Max(p => p.Y);
-            for (int y = (int)MathF.Floor(minY); y < maxY; y++)
+            if (!TryBoundRange(minY, maxY, fy0, fy1, out int yStart, out int yEnd))
+                return;
+            PreparedBrush prepared = PrepareBrush(brush);
+            var crossings = new List<float>();
+            for (int y = yStart; y < yEnd; y++)
             {
-                var crossings = new List<float>();
+                crossings.Clear();
                 for (int i = 0, j = device.Length - 1; i < device.Length; j = i++)
                 {
                     float y0 = device[i].Y;
@@ -748,13 +1179,17 @@ namespace System.Drawing
                 if (fillMode == FillMode.Alternate)
                 {
                     for (int k = 0; k + 1 < crossings.Count; k += 2)
-                        for (int x = (int)MathF.Floor(crossings[k]); x < crossings[k + 1]; x++)
-                            PutPixel(x, y, ResolveColor(brush, x, y));
+                    {
+                        if (TryBoundRange(crossings[k], crossings[k + 1], fx0, fx1, out int sx0, out int sx1))
+                            for (int x = sx0; x < sx1; x++)
+                                PutPixel(x, y, prepared.Sample(x, y));
+                    }
                 }
                 else
                 {
-                    for (int x = (int)MathF.Floor(crossings[0]); x < crossings[^1]; x++)
-                        PutPixel(x, y, ResolveColor(brush, x, y));
+                    if (TryBoundRange(crossings[0], crossings[^1], fx0, fx1, out int sx0, out int sx1))
+                        for (int x = sx0; x < sx1; x++)
+                            PutPixel(x, y, prepared.Sample(x, y));
                 }
             }
         }
@@ -1198,6 +1633,8 @@ namespace System.Drawing
 
         private void DrawImageParallelogram(Image image, PointF[] destPoints, RectangleF srcRect)
         {
+            if (IsDisplay && !IsDisplayAxisBlit(destPoints))
+                throw new NotSupportedException("Display path records axis-aligned image blits only.");
             ArgumentNullException.ThrowIfNull(image);
             ArgumentNullException.ThrowIfNull(destPoints);
             if (image is not Bitmap bitmap || destPoints.Length < 3)
@@ -1315,6 +1752,9 @@ namespace System.Drawing
         // branch over live dst), so hits are bit-identical to direct draws.
         private static void ParaCached(Bitmap target, DrawImageEntry hit, bool copy, Region? clip)
         {
+            // Perf item 4 op census (parallelogram recall path; px unknown here).
+            if (TextRasterCounters.PerfEnabled)
+                TextRasterCounters.NoteImage();
             int[] dst = target.Pixels;
             int dstW = target.Width;
             int dstH = target.Height;
@@ -1326,6 +1766,7 @@ namespace System.Drawing
             int[] layer = hit.Pixels;
             byte[]? inked = hit.Inked;
             bool direct = copy || hit.AllOpaque;
+            bool wrotePara = false;
             if (!clipCheck && direct)
             {
                 // Fast replay: the write set is exactly the intersected
@@ -1338,6 +1779,8 @@ namespace System.Drawing
                 if (inked is null)
                 {
                     int count = x1 - x0;
+                    if (count > 0 && y0 < y1)
+                        target.PaintVersion++;
                     for (int y = y0; y < y1; y++)
                         Array.Copy(layer, (y - hit.Oy) * ow + (x0 - ox), dst, y * dstW + x0, count);
                     return;
@@ -1363,14 +1806,20 @@ namespace System.Drawing
                             if ((inked[b >> 3] & (1 << (b & 7))) == 0)
                             {
                                 Array.Copy(layer, rs, dst, y * dstW + ox + (rs - lrow), b - rs);
+                                wrotePara = true;
                                 rs = -1;
                             }
                             b++;
                         }
                     }
                     if (rs >= 0)
+                    {
                         Array.Copy(layer, rs, dst, y * dstW + ox + (rs - lrow), hi - rs);
+                        wrotePara = true;
+                    }
                 }
+                if (wrotePara)
+                    target.PaintVersion++;
                 return;
             }
             for (int y = y0; y < y1; y++)
@@ -1389,8 +1838,11 @@ namespace System.Drawing
                         dst[drow + x] = argb;
                     else
                         dst[drow + x] = BlendOverArgb(dst[drow + x], argb);
+                    wrotePara = true;
                 }
             }
+            if (wrotePara)
+                target.PaintVersion++;
         }
 
         public void DrawImage(Image image, float x, float y, float width, float height) =>
@@ -1511,6 +1963,8 @@ namespace System.Drawing
             ArgumentNullException.ThrowIfNull(image);
             if (callback is not null && callback(callbackData))
                 return;
+            if (IsDisplay && attributes is not null)
+                throw new NotSupportedException("Display path does not implement ImageAttributes.");
             if (attributes is null)
             {
                 DrawImage(image, destRect, srcRect, GraphicsUnit.Pixel);
@@ -1527,6 +1981,8 @@ namespace System.Drawing
             ArgumentNullException.ThrowIfNull(destPoints);
             if (callback is not null && callback(callbackData))
                 return;
+            if (IsDisplay && attributes is not null)
+                throw new NotSupportedException("Display path does not implement ImageAttributes.");
             if (attributes is null)
             {
                 DrawImageParallelogram(image, destPoints, srcRect);
@@ -1600,13 +2056,22 @@ namespace System.Drawing
         {
             if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0)
                 return;
+            if (IsDisplay) { RecordDisplayBlit(src, sx, sy, sw, sh, dx, dy, dw, dh); return; }
             if (_target is null)
                 return;
+            {
+            }
             _target.PaintVersion++;
             // Memoized resample (see DrawImageCache): the sampled layer is a
             // pure function of (src version, src rect, dst size), so position,
             // clip and dst bounds apply fresh at write time and identical draws
             // recall across moves and clip changes.
+            // Perf item 4 op census.
+            if (TextRasterCounters.PerfEnabled)
+            {
+                TextRasterCounters.NoteImage();
+                TextRasterCounters.NoteImagePx((long)dw * dh);
+            }
             bool stash = DrawImageCache.KeyForBlit(src, _target, sx, sy, sw, sh, dw, dh, InterpolationMode, _clip, out DrawImageKey memoKey);
             if (stash && DrawImageCache.TryRecallBlit(src, memoKey, out DrawImageEntry? hit) && hit is not null)
             {
@@ -1669,6 +2134,12 @@ namespace System.Drawing
         // are bit-identical to direct draws.
         private static void BlitCached(Bitmap target, DrawImageEntry hit, int dx, int dy, int dw, int dh, bool copy, Region? clip)
         {
+            // Perf item 4 op census (memoized recall path).
+            if (TextRasterCounters.PerfEnabled)
+            {
+                TextRasterCounters.NoteImage();
+                TextRasterCounters.NoteImagePx((long)dw * dh);
+            }
             int[] dst = target.Pixels;
             int dstW = target.Width;
             int dstH = target.Height;
@@ -1683,10 +2154,13 @@ namespace System.Drawing
             {
                 // Fast replay: rectangular write set, plain stores.
                 int count = x1 - x0;
+                if (count > 0 && y0 < y1)
+                    target.PaintVersion++;
                 for (int y = y0; y < y1; y++)
                     Array.Copy(layer, (y - dy) * dw + (x0 - dx), dst, y * dstW + x0, count);
                 return;
             }
+            bool wroteBlit = false;
             for (int y = y0; y < y1; y++)
             {
                 int drow = y * dstW;
@@ -1700,8 +2174,11 @@ namespace System.Drawing
                         dst[drow + x] = argb;
                     else
                         dst[drow + x] = BlendOverArgb(dst[drow + x], argb);
+                    wroteBlit = true;
                 }
             }
+            if (wroteBlit)
+                target.PaintVersion++;
         }
 
         // Int-ARGB twin of BlendOver (identical math, no Color round trip).
@@ -1739,27 +2216,54 @@ namespace System.Drawing
         public void DrawString(string? text, Font font, Brush brush, PointF point, StringFormat? format) =>
             DrawString(text, font, brush, new RectangleF(point.X, point.Y, 0, 0), format);
 
+        // Bounded DrawString census (tile-text diagnosis): which rects reach
+        // the rasterizer, with what shape. Counters only (no per-call
+        // strings on this hot path); surfaced via DumpDrawStringCensus.
+        private static int s_dsCalls;
+        private static int s_dsEmptyRect;
+        private static int s_dsNullFormat;
+        public static string DumpDrawStringCensus() =>
+            "draws=" + s_dsCalls + " emptyRect=" + s_dsEmptyRect + " nullFormat=" + s_dsNullFormat;
         public void DrawString(string? text, Font font, Brush brush, RectangleF layoutRectangle, StringFormat? format)
         {
 
             ArgumentNullException.ThrowIfNull(font);
             ArgumentNullException.ThrowIfNull(brush);
-            if (string.IsNullOrEmpty(text) || _target is null)
+
+            if (string.IsNullOrEmpty(text))
                 return;
-            if (!BrowserText.IsAvailable)
+            // Display graphics has no CPU target by design; its text hook
+            // fires after rasterization below (glyph island only). Only the
+            // CPU path needs a target here.
+            if (_target is null && !IsDisplay)
+                return;
+            if (!BrowserText.IsAvailable && BrowserText.RasterOverride is null)
                 throw new NotSupportedException("Text rasterization needs the browser canvas bridge.");
+            // Perf item 4: paint volume (which spans reach the rasterizer).
+            s_dsCalls++;
+            if (layoutRectangle.Width <= 0f || layoutRectangle.Height <= 0f) s_dsEmptyRect++;
+            if (format is null) s_dsNullFormat++;
+            long tDraw0 = TextRasterCounters.PerfEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            if (tDraw0 != 0)
+                TextRasterCounters.NoteDraw(text?.Length ?? 0);
             // Glyph pixels come from the browser (white-with-alpha); the
             // tint below is the brush color, so antialiasing blends via
             // the normal SourceOver PutPixel path. Rotation beyond the
             // origin is ignored (matches the rect cores); multiline
             // blocks align as one block, not per line.
-            ToDevice(layoutRectangle, out float dx, out float dy, out float dw, out float dh);
-            int maxW = dw > 0f ? ClampRasterWidth(dw) : Math.Max(1, _target.Width - (int)dx);
+                        ToDevice(layoutRectangle, out float dx, out float dy, out float dw, out float dh);
+            int maxW = dw > 0f ? ClampRasterWidth(dw)
+                : IsDisplay ? 2048  // point layout: unbounded, no CPU target by design
+                : Math.Max(1, _target!.Width - (int)dx);  // CPU path always has a target here
             if (!WrapsText(format))
             maxW = 2048;
             BrowserText.Raster? raster = BrowserText.TryRaster(text, font, DpiY, Math.Min(maxW, 2048));
             if (raster is null)
                 throw new NotSupportedException("Browser text raster failed.");
+            // Perf item 4: blend volume (is the invoke bucket pixel-bound?).
+            if (TextRasterCounters.PerfEnabled)
+                TextRasterCounters.NoteDrawPx((long)raster.Width * raster.Height);
+
             Color ink = brush is SolidBrush solid ? solid.Color : ResolveColor(brush, layoutRectangle.X, layoutRectangle.Y);
             int ox = (int)MathF.Round(dx);
             int oy = (int)MathF.Round(dy);
@@ -1789,28 +2293,70 @@ namespace System.Drawing
             {
                 clipX0 = Math.Max(clipX0, (int)MathF.Floor(dx));
                 clipY0 = Math.Max(clipY0, (int)MathF.Floor(dy));
-                clipX1 = Math.Min(clipX1, (int)MathF.Ceiling(dx + dw));
-                clipY1 = Math.Min(clipY1, (int)MathF.Ceiling(dy + dh));
+                clipX1 = Math.Min(clipX1, SaturateCeilToInt(dx + dw));
+                clipY1 = Math.Min(clipY1, SaturateCeilToInt(dy + dh));
             }
 
+            if (IsDisplay)
+            {
+                // Explicit CPU text island (glyphs only, measured import);
+                // the control surface itself is never rasterized/uploaded.
+                RecordDisplayText(raster.Rgba, raster.Width, raster.Height,
+                    ink.A, ink.R, ink.G, ink.B,
+                    ox, oy, clipX0, clipY0, clipX1, clipY1);
+                return;
+            }
+            // Bit-identical blend hoists: ink channels out of the loop, clip
+            // ranges instead of per-pixel branches, target fields hoisted,
+            // one PaintVersion bump per call (change-detection only needs
+            // bump-on-write: DrawImageCache keys on change, and zero
+            // writes bump nothing either way). NaN geometry draws nothing
+            // either way (PutPixel bounds-swallows), so an explicit finite
+            // guard replaces wraparound reasoning at the ranges below.
+            if (!float.IsFinite(dx) || !float.IsFinite(dy))
+                return;
             byte[] rgba = raster.Rgba;
-            for (int ry = 0; ry < raster.Height; ry++)
+            int rw = raster.Width, rh = raster.Height;
+            Bitmap? target = _target;
+            if (target is null)
+                return;
+            int tw = target.Width, th = target.Height;
+            int[] tpixels = target.Pixels;
+            int inkA = ink.A, inkR = ink.R, inkG = ink.G, inkB = ink.B;
+            bool sourceCopy = CompositingMode == CompositingMode.SourceCopy;
+            Region? drawClip = _clip;
+            bool clipNone = drawClip is null || drawClip.IsInfinite(null);
+            int ry0 = Math.Max(0, Math.Max(clipY0 - oy, 0 - oy));
+            int ry1 = Math.Min(rh, Math.Min(clipY1 - oy, th - oy));
+            int rx0 = Math.Max(0, Math.Max(clipX0 - ox, 0 - ox));
+            int rx1 = Math.Min(rw, Math.Min(clipX1 - ox, tw - ox));
+            bool wrote = false;
+            for (int ry = ry0; ry < ry1; ry++)
             {
                 int py = oy + ry;
-                if (py < clipY0 || py >= clipY1)
-                    continue;
-                for (int rx = 0; rx < raster.Width; rx++)
+                int row = ry * rw;
+                for (int rx = rx0; rx < rx1; rx++)
                 {
-                    int px = ox + rx;
-                    if (px < clipX0 || px >= clipX1)
-                        continue;
-                    int a = rgba[(ry * raster.Width + rx) * 4 + 3];
+                    int a = rgba[(row + rx) * 4 + 3];
                     if (a == 0)
                         continue;
-                    int ea = (a * ink.A) / 255;
-                    PutPixel(px, py, Color.FromArgb(ea, ink.R, ink.G, ink.B));
+                    if (!clipNone)
+                    {
+                        int pxc = ox + rx;
+                        if (!drawClip.IsVisible(pxc, py))
+                            continue;
+                    }
+                    int ea = (a * inkA) / 255;
+                    int src = (ea << 24) | (inkR << 16) | (inkG << 8) | inkB;
+                    int idx = py * tw + ox + rx;
+                    tpixels[idx] = (sourceCopy || ea >= 255) ? src : BlendOverInt(tpixels[idx], ea, inkR, inkG, inkB);
+                    wrote = true;
                 }
             }
+            if (wrote)
+                target.PaintVersion++;
+            if (tDraw0 != 0)
+                TextRasterCounters.NoteDrawTicks(System.Diagnostics.Stopwatch.GetTimestamp() - tDraw0);
         }
 
         public void DrawString(string? text, Font font, Brush brush, float x, float y) =>
@@ -1826,29 +2372,27 @@ namespace System.Drawing
             MeasureReal(text, font, new SizeF(width, 0));
 
         public SizeF MeasureString(string? text, Font font, int width, StringFormat? format) =>
-            MeasureReal(text, font, new SizeF(width, 0), WrapsText(format));
+            MeasureReal(text, font, new SizeF(width, 0), WrapsText(format), format);
 
         public SizeF MeasureString(string? text, Font font, PointF origin, StringFormat? format) =>
-            MeasureReal(text, font, SizeF.Empty);
+            MeasureReal(text, font, SizeF.Empty, true, format);
 
         public SizeF MeasureString(string? text, Font font, SizeF layoutArea) =>
             MeasureReal(text, font, layoutArea);
 
         public SizeF MeasureString(string? text, Font font, SizeF layoutArea, StringFormat? format) =>
-            MeasureReal(text, font, layoutArea, WrapsText(format));
+            MeasureReal(text, font, layoutArea, WrapsText(format), format);
 
         public SizeF MeasureString(string? text, Font font, SizeF layoutArea, StringFormat? format, out int charsFitted, out int linesFilled)
         {
-            SizeF size = MeasureReal(text, font, layoutArea, WrapsText(format));
+            SizeF size = MeasureReal(text, font, layoutArea, WrapsText(format), format);
             charsFitted = text?.Length ?? 0;
-            // Wrapped lines filled (raster-backed): counting only explicit \n
-            // under-reports wrapped titles, starving Telerik text layout.
-            float linePx = font.GetHeight(DpiY);
-            float unit = UnitScale();
-            if (unit == 0f)
-                unit = 1f;
-            linesFilled = linePx > 0f && size.Height > 0f
-                ? Math.Max(1, (int)MathF.Round(size.Height / (unit * linePx)))
+            // Wrapped lines filled counts visual rows off the line-box
+            // grid (the em/8 height pad is under half a line, so plain
+            // rounding absorbs it for 1..N rows alike).
+            float lineH = LineBoxHeight(font);
+            linesFilled = lineH > 0f && size.Height > 0f
+                ? Math.Max(1, (int)MathF.Round(size.Height / lineH))
                 : (text is null ? 0 : Math.Max(1, text.Split('\n').Length));
             return size;
         }
@@ -1858,6 +2402,12 @@ namespace System.Drawing
 
         public SizeF MeasureString(ReadOnlySpan<char> text, Font font, SizeF layoutArea, StringFormat? format) =>
             MeasureString(text.ToString(), font, layoutArea, format);
+
+        internal SizeF MeasureStringTight(string? text, Font font) =>
+            MeasureReal(text, font, SizeF.Empty, true, null, true);
+
+        internal SizeF MeasureStringTight(string? text, Font font, int width, StringFormat? format) =>
+            MeasureReal(text, font, new SizeF(width, 0), WrapsText(format), format, true);
 
         public Region[] MeasureCharacterRanges(string? text, Font font, RectangleF layoutRect, StringFormat? format) =>
             throw new NotSupportedException("Text measurement arrives with the text milestone.");
@@ -1876,14 +2426,45 @@ namespace System.Drawing
         // unchecked context, which Math.Max(1, ..) then pins to a 1px
         // raster: unconstrained Telerik measures (proposedSize=int.MaxValue)
         // collapsed every label to ~1px (selectCategoryLabel rendered "I").
+        // Saturating float->int for clip bounds: layout rects of int.MaxValue
+        // (the standard "don't wrap" idiom, used by Telerik TPF text) make
+        // dx+dw round to 2^31 in float, and an unchecked (int) cast wraps it
+        // to int.MinValue, which empties the clip and paints nothing.
+        private static int SaturateCeilToInt(float v)
+        {
+            float c = MathF.Ceiling(v);
+            if (c >= 2147483647f) return int.MaxValue;
+            if (c <= -2147483648f) return int.MinValue;
+            return (int)c;
+        }
+
         private static int ClampRasterWidth(float w) =>
             w > 0f && w < 2048f ? Math.Max(1, (int)MathF.Ceiling(w)) : 2048;
         // GDI+ wraps at the layout width unless StringFormatFlags.NoWrap;
         // honor it so single-line Telerik labels measure (and render) one line.
         private static bool WrapsText(StringFormat? format) =>
             format is null || (format.FormatFlags & StringFormatFlags.NoWrap) == 0;
+        // GenericTypographic (FitBlackBox|LineLimit|NoClip) measures tight
+        // design advances; every other format gets the GDI+ layout pad
+        // (desktop oracle text-padfit.fsx: all single non-typographic
+        // flag combos keep the full pad).
+        // GDI+ line-box height in graphics units (oracle text-linebox.fsx).
+        private float LineBoxHeight(Font font)
+        {
+            float unit = UnitScale();
+            if (unit == 0f)
+                unit = 1f;
+            float emPx = Math.Max(1f, font.SizeInPoints * DpiY / 72f);
+            return emPx * FontFamily.GdiLineBoxFactor(font.Name) / unit;
+        }
 
-        private SizeF MeasureReal(string? text, Font font, SizeF layoutArea, bool wrap = true)
+        private static bool SkipsGdiPad(StringFormat? format) =>
+            format is not null && (format.FormatFlags &
+                (StringFormatFlags.FitBlackBox | StringFormatFlags.LineLimit | StringFormatFlags.NoClip)) ==
+                (StringFormatFlags.FitBlackBox | StringFormatFlags.LineLimit | StringFormatFlags.NoClip);
+
+        private SizeF MeasureReal(string? text, Font font, SizeF layoutArea, bool wrap = true,
+            StringFormat? format = null, bool tight = false)
         {
 
             ArgumentNullException.ThrowIfNull(font);
@@ -1891,6 +2472,39 @@ namespace System.Drawing
                 return SizeF.Empty;
             try
             {
+                                // GDI+ drops trailing spaces/tabs unless MeasureTrailingSpaces
+                // (desktop oracle gdimeasure: "The "=="The" in both formats).
+                // Whitespace-only is one space wide by default but zero-width
+                // when typographic/tight (" "=4.00 default, -0.00 typo); Telerik
+                // TPF lays out inter-word gaps as space elements, which must
+                // measure zero or every line grows ~4px per gap.
+                if (format is null || (format.FormatFlags & StringFormatFlags.MeasureTrailingSpaces) == 0)
+                {
+                    string trimmed = text is null ? string.Empty : text.TrimEnd(' ', '\t');
+                    if (trimmed.Length == 0)
+                    {
+                        float unit0 = UnitScale();
+                        if (unit0 == 0f)
+                            unit0 = 1f;
+                        if (tight || SkipsGdiPad(format))
+                            return new SizeF(0f, LineBoxHeight(font));
+                        float spaceW = 0f;
+                        try
+                        {
+                            BrowserText.Raster? spaceRaster = BrowserText.TryMeasure(" ", font, DpiY, 2048);
+                            if (spaceRaster is not null && spaceRaster.Width > 0)
+                                spaceW = spaceRaster.Width / unit0;
+                        }
+                        catch
+                        {
+                        }
+                        if (spaceW <= 0f)
+                            spaceW = MeasureApproximate(" ", font, SizeF.Empty).Width;
+                        float emPx0 = Math.Max(1f, font.SizeInPoints * DpiY / 72f);
+                        return new SizeF(spaceW, LineBoxHeight(font) + emPx0 / (8f * unit0));
+                    }
+                    text = trimmed;
+                }
                 int maxW = wrap && layoutArea.Width > 0f ? ClampRasterWidth(layoutArea.Width) : 2048;
                 BrowserText.Raster? raster = BrowserText.TryMeasure(text, font, DpiY, maxW);
                 if (raster is not null && raster.Width > 0 && raster.Height > 0)
@@ -1899,13 +2513,50 @@ namespace System.Drawing
                     if (unit == 0f)
                         unit = 1f;
                     float w = raster.Width / unit;
-                    float h = raster.Height / unit;
+                    if (tight || SkipsGdiPad(format))
+                    {
+                        // Fractional canvas advance (exact GDI+ Typographic
+                        // twin): integer rasters ceil (19.35->20), drifting
+                        // TPF layouts ~+0.6px/word. The padded path keeps the
+                        // integer width (its pad fit absorbs the ceil).
+                        // Headless/tests fall back to raster width.
+                        float? fw = BrowserText.TryMeasureWidth(text, font, DpiY, maxW);
+                        if (fw.HasValue && fw.Value > 0f && fw.Value <= raster.Width + 0.5f)
+                            w = fw.Value / unit;
+                    }
+                    // GDI+ heights are string-independent line boxes; GDI
+                    // extents (tight/Typographic) keep the raster ink box.
+                    bool gdiPad = !tight && !SkipsGdiPad(format);
+                    float emPx = gdiPad ? Math.Max(1f, font.SizeInPoints * DpiY / 72f) : 0f;
+                    float lineH = gdiPad ? LineBoxHeight(font) : raster.Height / unit;
                     if (wrap && layoutArea.Width > 0f && w > layoutArea.Width)
                     {
                         int rows = Math.Max(1, (int)Math.Ceiling(w / layoutArea.Width));
-                        return new SizeF(layoutArea.Width, rows * h);
+                        // GDI+ adds em/8 once over rows x line box (oracle
+                        // text-multi.fsx: 2 lines = 33.42 = 2 x 15.96 + 1.5).
+                        return new SizeF(layoutArea.Width, rows * lineH + emPx / (8f * unit));
                     }
+                    float h = lineH;
 
+                    if (gdiPad)
+                    {
+                        // GDI+ GenericDefault layout pad (desktop oracle
+                        // text-padfit.fsx/text-padgen.fsx, 6 fonts x sizes):
+                        // pad = em/3 + 0.03*tight, minus 0.5px for the
+                        // integer-raster ceil bias. GDI+ breaks words on
+                        // tight advances and pads the result, so the pad
+                        // applies only past the wrap compare above (a pad
+                        // before the compare double-counted rows).
+                        // Headless fallback below stays unpadded (crude
+                        // units, sanity-only).
+                        float tightPx = w * unit;
+                        float padPx = emPx / 3f + 0.03f * tightPx - 0.5f;
+                        if (padPx > 0f)
+                            w += padPx / unit;
+                        // Height: GDI+ line box + em/8 (oracle
+                        // text-height-ink.fsx: Segoe 9 = 17.46).
+                        h = lineH + emPx / (8f * unit);
+                    }
                     return new SizeF(w, h);
                 }
             }
@@ -1914,10 +2565,10 @@ namespace System.Drawing
                 // Fall through to the approximation below.
             }
 
-            return MeasureApproximate(text, font, layoutArea);
+            return MeasureApproximate(text, font, layoutArea, wrap);
         }
 
-        private static SizeF MeasureApproximate(string? text, Font font, SizeF layoutArea)
+        private static SizeF MeasureApproximate(string? text, Font font, SizeF layoutArea, bool wrap = true)
         {
             ArgumentNullException.ThrowIfNull(font);
             if (string.IsNullOrEmpty(text))
@@ -1928,6 +2579,11 @@ namespace System.Drawing
             float maxWidth = 0f;
             foreach (string line in lines)
                 maxWidth = Math.Max(maxWidth, line.Length * em * 0.5f);
+                        // NoWrap (GDI SingleLine/Default): one row per embedded \n, never
+            // word-wrapped (desktop parity; the old code wrapped SingleLine
+            // measures to 3 rows, e.g. Telerik tile titles).
+            if (!wrap)
+                return new SizeF(maxWidth, lines.Length * lineHeight);
             if (layoutArea.Width > 0f && maxWidth > layoutArea.Width)
             {
                 int wrapped = 0;
@@ -2062,7 +2718,7 @@ namespace System.Drawing
         public void TranslateClip(int dx, int dy) => _clip?.Translate(dx, dy);
 
         public bool IsVisible(float x, float y, float width, float height) =>
-            _clip?.IsVisible(new RectangleF(x, y, width, height)) ?? true;
+            IntersectsDevice(new RectangleF(x, y, width, height));
 
         public Color GetNearestColor(Color color) => color;
 
@@ -2073,6 +2729,7 @@ namespace System.Drawing
 
         public void ReleaseHdcInternal(IntPtr hdc)
         {
+            try { HdcReleaseHook?.Invoke(hdc); } catch { }
         }
 
         public void GetContextInfo(out PointF dpi) => dpi = new PointF(DpiX, DpiY);
@@ -2212,6 +2869,7 @@ namespace System.Drawing
 
         private void EnumerateMetafileCore(Imaging.Metafile metafile, EnumerateMetafileProc callback, IntPtr callbackData, Imaging.ImageAttributes? imageAttr)
         {
+            if (IsDisplay) throw new NotSupportedException("Display path does not implement this operation.");
             ArgumentNullException.ThrowIfNull(metafile);
             ArgumentNullException.ThrowIfNull(callback);
         }

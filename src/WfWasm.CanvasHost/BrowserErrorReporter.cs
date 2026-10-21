@@ -26,6 +26,12 @@ public static class BrowserErrorReporter
     // its repro steps (replay on desktop WinForms and compare).
     public static Func<string?>? InputContextProvider { get; set; }
 
+    // App-attribution hook: Home.razor answers the current scene slug so
+    // every report carries its app (server filters on it via ?app=).
+    public static Func<string?>? AppProvider { get; set; }
+    public static Func<string?>? AppLabelProvider { get; set; }
+    public static Func<string?>? SessionProvider { get; set; }
+
     public static string ComputeSignature(Exception ex)
     {
         string type = ex.GetType().Name;
@@ -90,7 +96,7 @@ public static class BrowserErrorReporter
         // TaskCanceledException when the backend is gone (notably during a
         // fatal runtime spiral): reporting those would amplify one crash
         // into thousands of fetch-error reports. Console only.
-        if (ex is HttpRequestException || ex is JSException || ex is TaskCanceledException)
+        if (source != "app-load" && (ex is HttpRequestException || ex is JSException || ex is TaskCanceledException))
         {
             Console.WriteLine($"[report:{source}] suppressed-transport {ex.GetType().Name}: {(ex.Message ?? "").Split('\n')[0].Trim()}");
             return;
@@ -113,19 +119,25 @@ public static class BrowserErrorReporter
             signature = "unknown||";
         }
 
+        string? reportApp = Capture(AppProvider);
+        string? reportLabel = Capture(AppLabelProvider);
+        string? reportSession = Capture(SessionProvider);
+        string rateKey = reportApp + "\n" + reportSession + "\n" + signature;
         lock (s_rateGate)
         {
-            s_sentCounts.TryGetValue(signature, out int sent);
+            s_sentCounts.TryGetValue(rateKey, out int sent);
             if (sent >= MaxPostsPerSignature)
             {
                 Console.WriteLine($"[report:{source}] suppressed-rate {signature}");
                 return;
             }
 
-            s_sentCounts[signature] = sent + 1;
+            s_sentCounts[rateKey] = sent + 1;
         }
 
-        Console.WriteLine($"[report:{source}] {signature}");
+        Console.WriteLine(reportApp == null
+            ? $"[report:{source}] {signature}"
+            : $"[report:{source}] app={reportApp} {signature}");
         string chain = BuildInnerChainText(ex, out string[] innerLines);
         foreach (string innerLine in innerLines)
             Console.WriteLine($"[report:{source}] inner: {innerLine}");
@@ -166,6 +178,9 @@ public static class BrowserErrorReporter
                         source,
                         time = DateTimeOffset.UtcNow,
                         context = inputContext,
+                        app = reportApp,
+                        appLabel = reportLabel,
+                        sessionId = reportSession,
                     },
                 });
             }
@@ -174,6 +189,12 @@ public static class BrowserErrorReporter
                 // Backend absent (dev-server) or unreachable: console line above is the record.
             }
         }
+    }
+
+    private static string? Capture(Func<string?>? provider)
+    {
+        try { string? value = provider?.Invoke(); return string.IsNullOrWhiteSpace(value) ? null : value; }
+        catch { return null; }
     }
 
     // Catch-site reports (click handlers, bootstrap) catch reflection

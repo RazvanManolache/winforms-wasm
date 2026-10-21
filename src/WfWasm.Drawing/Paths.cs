@@ -437,10 +437,21 @@ namespace System.Drawing.Drawing2D
                 var c0 = new PointF(p0.X - kappa * rx * MathF.Sin(a0), p0.Y + kappa * ry * MathF.Cos(a0));
                 var c1 = new PointF(p1.X + kappa * rx * MathF.Sin(a1), p1.Y - kappa * ry * MathF.Cos(a1));
                 Figure figure = OpenFigure();
-                if (first && figure.Points.Count == 0)
+                if (first)
                 {
-                    figure.Points.Add(p0);
-                    figure.Types.Add(Start);
+                    // GDI+ joins an appended arc to its own start with a
+                    // straight line. Omitting p0 makes the first Bezier span
+                    // the gap between corners instead of just the new arc.
+                    if (figure.Points.Count == 0)
+                    {
+                        figure.Points.Add(p0);
+                        figure.Types.Add(Start);
+                    }
+                    else if (figure.Points[^1] != p0)
+                    {
+                        figure.Points.Add(p0);
+                        figure.Types.Add(Line);
+                    }
                     first = false;
                 }
 
@@ -1311,8 +1322,15 @@ namespace System.Drawing
 
         public IntPtr GetHrgn(Graphics? g) => IntPtr.Zero;
 
+        // GDI handles do not exist on web, but GDI-region P/Invokes are
+        // stubbed to return placeholder handles, so callers (Telerik
+        // ApplyShape via CreateRoundRectRgn) still arrive here. There is
+        // no way back from an opaque handle to its shape; answer an
+        // infinite region (no clipping), which matches unset-Region
+        // behavior everywhere instead of faulting the input that built
+        // the shape (telerik-richtexteditor Ctrl+Home, eval9).
         public static Region FromHrgn(IntPtr hrgn) =>
-            throw new NotSupportedException("GDI handles are not available on web.");
+            new();
 
         public void ReleaseHrgn(IntPtr regionHandle)
         {

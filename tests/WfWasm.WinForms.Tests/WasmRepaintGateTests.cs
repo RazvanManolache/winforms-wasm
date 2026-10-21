@@ -176,18 +176,90 @@ public sealed class WasmRepaintGateTests
     }
 
     [Fact]
-    public void RequestRepaint_Region_Overload_Marks_Whole_Control()
+    public void RequestRepaint_Region_Overload_Scopes_Dirty_Rect()
     {
         try
         {
             using var control = new System.Windows.Forms.Control();
+            // Rect regions record their bounds (the rect-list Region
+            // model is exact for finite operands): the host repaints
+            // the patch instead of the whole layer.
             using var region = new WfRegion(new WfRect(4, 4, 8, 8));
             System.Windows.Forms.WasmRepaintGate.RequestRepaint(control, region);
             System.Windows.Forms.WasmRepaintGate.DrainDirty(out var dirty);
-            Assert.Null(dirty[control]);
+            Assert.Equal(new WfRect(4, 4, 8, 8), dirty[control]);
+
+            // Infinite (and null) regions still mark whole-control.
+            using var infinite = new WfRegion();
+            Assert.True(infinite.IsInfinite(null));
+            System.Windows.Forms.WasmRepaintGate.RequestRepaint(control, infinite);
+            System.Windows.Forms.WasmRepaintGate.RequestRepaint(control, (WfRegion?)null);
+            System.Windows.Forms.WasmRepaintGate.DrainDirty(out var whole);
+            Assert.Null(whole[control]);
+
+            // Empty regions keep their empty rect (desktop paints
+            // nothing: the host intersects to empty and re-blits).
+            using var empty = new WfRegion(new WfRect(4, 4, 8, 8));
+            empty.MakeEmpty();
+            System.Windows.Forms.WasmRepaintGate.RequestRepaint(control, empty);
+            System.Windows.Forms.WasmRepaintGate.DrainDirty(out var none);
+            Assert.Equal(new WfRect(0, 0, 0, 0), none[control]);
         }
         finally
         {
+            System.Windows.Forms.WasmRepaintGate.DrainDirty(out _);
+        }
+    }
+
+    [Fact]
+    public void TakeMarkCaller_Samples_Markers_And_Drains()
+    {
+        bool was = System.Windows.Forms.WasmFrameCounters.PerfEnabled;
+        System.Windows.Forms.WasmFrameCounters.PerfEnabled = true;
+        try
+        {
+            using var control = new System.Windows.Forms.Control();
+            System.Windows.Forms.WasmRepaintGate.TakeMarkCaller();
+            // 1-in-8 sampling: 16 marks guarantee a sample either way.
+            for (int i = 0; i < 16; i++)
+                System.Windows.Forms.WasmRepaintGate.RequestRepaint(control);
+            var census = System.Windows.Forms.WasmRepaintGate.TakeMarkCaller();
+            Assert.NotEmpty(census);
+            Assert.True(census.Values.Sum() >= 1);
+            Assert.Empty(System.Windows.Forms.WasmRepaintGate.TakeMarkCaller());
+            // First-marker capture names the direct marker + originator.
+            System.Windows.Forms.WasmRepaintGate.TakeFirstMarkCaller();
+            System.Windows.Forms.WasmRepaintGate.RequestRepaint(control);
+            string? first = System.Windows.Forms.WasmRepaintGate.TakeFirstMarkCaller();
+            Assert.NotNull(first);
+            Assert.Contains("TakeMarkCaller", first);
+            Assert.Null(System.Windows.Forms.WasmRepaintGate.TakeFirstMarkCaller());
+        }
+        finally
+        {
+            System.Windows.Forms.WasmFrameCounters.PerfEnabled = was;
+            System.Windows.Forms.WasmRepaintGate.DrainDirty(out _);
+            // RequestRepaint above accumulates live frame marks; reset so
+            // mark-snapshot tests keep their clean-slate assumption.
+            System.Windows.Forms.WasmFrameCounters.ResetFrame();
+            System.Windows.Forms.WasmFrameCounters.TakeMarks();
+        }
+    }
+
+    [Fact]
+    public void Wake_Without_Subscribers_Neither_Throws_Nor_Dirties()
+    {
+        bool was = System.Windows.Forms.WasmFrameCounters.PerfEnabled;
+        System.Windows.Forms.WasmFrameCounters.PerfEnabled = true;
+        try
+        {
+            System.Windows.Forms.WasmRepaintGate.Wake();
+            Assert.False(System.Windows.Forms.WasmRepaintGate.HasDirty);
+            System.Windows.Forms.WasmRepaintGate.TakeMarkCaller();
+        }
+        finally
+        {
+            System.Windows.Forms.WasmFrameCounters.PerfEnabled = was;
             System.Windows.Forms.WasmRepaintGate.DrainDirty(out _);
         }
     }

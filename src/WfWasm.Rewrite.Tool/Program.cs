@@ -19,6 +19,54 @@ if (args.Length >= 3 && args[0] == "--patch-probes")
     return 0;
 }
 
+if (args.Length >= 3 && args[0] == "--refonly")
+{
+    int sites = AssemblyRewriter.NeutralizeReflectionOnlyGuards(args[1], args[2]);
+    Console.WriteLine($"Neutralized {sites} ReflectionOnly site(s) in {args[1]} -> {args[2]}");
+    return 0;
+}
+
+// Diagnostic only: --calls <dll> <Type::Method>... prints every method,
+// PInvoke and member reference used by the named method bodies, for
+// instant-death triage (a native-only trap with no managed throw is
+// usually one of these calls). Read-only; never modifies the input.
+// Diagnostic/fix application: --neutralize-olecb <dll> rewrites the
+// UpdateOleCallback body in place (COM absent headless). Used to apply
+// the rev69 neutralization to fork bytes that ship without passing
+// through the rewriter (the browser bundle embeds the raw build output).
+if (args.Length >= 2 && args[0] == "--neutralize-olecb")
+{
+    AssemblyRewriter.NeutralizeFileRichEditOleCallback(args[1]);
+    Console.WriteLine($"Neutralized UpdateOleCallback in {args[1]}");
+    return 0;
+}
+
+// Fix application: --managed-rtf <dll> replaces the StreamIn/StreamOut
+// bodies with trampolines to managed WasmRtf (native EDITSTREAM thunks
+// trap the wasm interpreter). Used for fork bytes that ship through the
+// rewriter (the migration applies the rule automatically via the
+// WfWasm.WinForms hook; this covers manual refreshes).
+if (args.Length >= 2 && args[0] == "--managed-rtf")
+{
+    AssemblyRewriter.ManagedRtfFile(args[1]);
+    Console.WriteLine($"Managed RTF streams in {args[1]}");
+    return 0;
+}
+
+if (args.Length >= 3 && args[0] == "--ildump")
+{
+    int dumped = AssemblyRewriter.DumpIL(args[1], args.Skip(2));
+    Console.WriteLine($"Dumped IL for {dumped} method(s) in {args[1]}");
+    return 0;
+}
+
+if (args.Length >= 3 && args[0] == "--calls")
+{
+    int dumped = AssemblyRewriter.DumpMethodCalls(args[1], args.Skip(2));
+    Console.WriteLine($"Dumped calls for {dumped} method(s) in {args[1]}");
+    return 0;
+}
+
 // Diagnostic only: --probe <in> <out> <Type::Method>... inserts
 // ENTER/EXIT Console.WriteLine breadcrumbs for instant-death triage.
 // Never wired into the regen scripts; wiped by the next regen.
@@ -78,6 +126,10 @@ if (drawing is not null)
 }
 
 var typeMap = GapAnalyzer.AutoMap(app, assemblyMap);
+// WinRT interop token missing from the browser CoreLib; the
+// FoundationContract stub defines it (served by the host server).
+typeMap["System.Runtime.InteropServices.WindowsRuntime.EventRegistrationToken"] = ("Windows.Foundation.FoundationContract", "System.Runtime.InteropServices.WindowsRuntime.EventRegistrationToken");
+typeMap["System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeMarshal"] = ("Windows.Foundation.FoundationContract", "System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeMarshal");
 if (mapFile is not null)
 {
     // Hand map: lines "Source.Full.Name=AssemblyName:Target.Full.Name".

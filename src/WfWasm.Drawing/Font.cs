@@ -71,6 +71,28 @@ public sealed class FontFamily : IEquatable<FontFamily>, IDisposable
         };
 
     /// <summary>
+    /// GDI+ typographic line-box height as a multiple of the em size
+    /// (desktop oracle text-linebox.fsx). GDI+ picks per-font vertical
+    /// metrics that only sometimes equal the design line spacing
+    /// (Segoe UI 1.33 vs design 1.13!); unknown families fall back to
+    /// the design ratio.
+    /// </summary>
+    internal static float GdiLineBoxFactor(string name) =>
+        name switch
+        {
+            "Segoe UI" => 1.3301f,
+            "Tahoma" => 1.2070f,
+            "Verdana" => 1.2153f,
+            "Trebuchet MS" => 1.1611f,
+            "Georgia" => 1.1362f,
+            "Times New Roman" => 1.1074f,
+            "Courier New" => 1.1328f,
+            "Arial" => 1.1172f,
+            "Microsoft Sans Serif" => 1.1318f,
+            _ => MetricsFor(name).LineSpacing / 2048f,
+        };
+
+    /// <summary>
     /// The canvas backend renders every style from the same outlines, so all
     /// styles report available (cf. IsStyleAvailable).
     /// </summary>
@@ -241,6 +263,12 @@ public sealed class Font : IEquatable<Font>, IDisposable, ICloneable
         if (s_fontHandles.TryGetValue(hfont, out var wr) && wr.TryGetTarget(out var font))
             return font;
         return SystemFonts.DefaultFont;
+    }
+
+    public static bool TryFromHfont(IntPtr hfont, out Font? font)
+    {
+        font = null;
+        return s_fontHandles.TryGetValue(hfont, out var wr) && wr.TryGetTarget(out font);
     }
 
     public static Font FromHdc(IntPtr hdc) =>

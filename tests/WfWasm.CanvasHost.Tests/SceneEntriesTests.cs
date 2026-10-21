@@ -55,27 +55,6 @@ public sealed class SceneEntriesTests
     private static string SourceFile([System.Runtime.CompilerServices.CallerFilePath] string path = "") => path;
 
     [Fact]
-    public void Base_Checkout_Only_Shows_Smoke_And_Ignores_Unavailable_Selections()
-    {
-        var state = new SceneState();
-        state.LimitToAvailableApps([]);
-        Assert.Equal(AppScene.Smoke, Assert.Single(state.Entries).Scene);
-        state.Select(AppScene.Paint);
-        Assert.Equal(AppScene.Smoke, state.CurrentEntry.Scene);
-    }
-
-    [Fact]
-    public void Supplied_App_Is_Added_Without_Advertising_Missing_Apps()
-    {
-        var state = new SceneState();
-        state.LimitToAvailableApps(["calculator"]);
-        Assert.Equal(2, state.Entries.Count);
-        state.Select(AppScene.Calculator);
-        Assert.Equal(AppScene.Calculator, state.CurrentEntry.Scene);
-        Assert.DoesNotContain(state.Entries, e => e.Scene == AppScene.Paint);
-    }
-
-    [Fact]
     public void Toggling_Reference_Flips_And_Raises_Changed()
     {
         var state = new SceneState();
@@ -122,5 +101,31 @@ public sealed class SceneEntriesTests
         Assert.True(raised);
         Assert.Equal(AppScene.Paint, state.CurrentEntry.Scene);
         Assert.Equal("Paint", state.CurrentEntry.Label);
+    }
+
+    // F4: folder spellings and hyphenless deep links resolve to the
+    // same app instead of silently landing on the default scene.
+    [Theory]
+    [InlineData("tic-tac-toe", AppScene.TicTacToe)]
+    [InlineData("tictactoe", AppScene.TicTacToe)]
+    [InlineData("TicTacToe", AppScene.TicTacToe)]
+    [InlineData("paintnet", AppScene.Paint)]
+    [InlineData("paint", AppScene.Paint)]
+    [InlineData("TELERIK-PHOTO", AppScene.TelerikPhoto)]
+    [InlineData("telerikphoto", AppScene.TelerikPhoto)]
+    public void Slug_Spellings_Resolve(string slug, AppScene expected)
+    {
+        Assert.True(SceneState.TryParseSlug(slug, out var scene), slug);
+        Assert.Equal(expected, scene);
+    }
+
+    [Theory]
+    [InlineData("nope")]
+    [InlineData("")]
+    [InlineData(null)]
+    [InlineData("tic-tac")]
+    public void Unknown_Slugs_Do_Not_Resolve(string? slug)
+    {
+        Assert.False(SceneState.TryParseSlug(slug, out _));
     }
 }

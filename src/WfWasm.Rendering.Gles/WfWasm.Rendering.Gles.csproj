@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../WfWasm.Rendering/WfWasm.Rendering.csproj" />
+  </ItemGroup>
+  <!-- Backend leaf: references only WfWasm.Rendering. NOT wired into WfWasm.sln (milestone 1). -->
+</Project>

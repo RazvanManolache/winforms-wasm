@@ -108,6 +108,26 @@ public sealed class ColorTests
     }
 
     [Fact]
+    public void Translator_Html_Trims_Whitespace_DesktopParity()
+    {
+        // Oracle-verified against desktop .NET 9 (mdi-oracle color mode):
+        // surrounding whitespace is ignored, null/empty read Empty,
+        // unknown names still throw.
+        Assert.Equal(unchecked((int)0xFF444444), ColorTranslator.FromHtml(" #444444").ToArgb());
+        Assert.Equal(unchecked((int)0xFFC5C5C5), ColorTranslator.FromHtml(" #c5c5c5 ").ToArgb());
+        Assert.Equal(Color.Red.ToArgb(), ColorTranslator.FromHtml("  red  ").ToArgb());
+        Assert.Equal(Color.White.ToArgb(), ColorTranslator.FromHtml("  #ffffff").ToArgb());
+        Assert.Equal(unchecked((int)0xFF123456), ColorTranslator.FromHtml("  #123456  ").ToArgb());
+        Assert.Equal(unchecked((int)0x00012345), ColorTranslator.FromHtml("#12345").ToArgb());
+        Assert.Equal(unchecked((int)0x00000FFF), ColorTranslator.FromHtml("\t #fff\t").ToArgb());
+        Assert.True(ColorTranslator.FromHtml("").IsEmpty);
+        Assert.True(ColorTranslator.FromHtml("   ").IsEmpty);
+        Assert.True(ColorTranslator.FromHtml(null).IsEmpty);
+        Assert.Throws<ArgumentException>(() => ColorTranslator.FromHtml("NotAColor"));
+        Assert.Throws<FormatException>(() => ColorTranslator.FromHtml("#GGGGGG"));
+    }
+
+    [Fact]
     public void Translator_Ole_Win32()
     {
         Assert.Equal(unchecked((int)0xFFFF0000), ColorTranslator.FromOle(0xFF).ToArgb());

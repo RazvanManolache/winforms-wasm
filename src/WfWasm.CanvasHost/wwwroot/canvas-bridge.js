@@ -14,7 +14,118 @@
 window.wfwasm = window.wfwasm || {};
 window.wfwasm._frames = 0;
 window.wfwasm._fts = [];
-window.wfwasm.paint = function (canvasId, commandsJson) {
+// v1 JS-side input-timeline instrumentation. STRICTLY inert unless
+// wfwasm.perfEnable() runs: no listeners, no rAF, no extra clocks.
+window.wfwasm._perfOn = false;
+window.wfwasm._perfIn = { buf: new Array(1024), i: 0, n: 0 };
+window.wfwasm._fms = { buf: new Array(600), i: 0, n: 0 };
+window.wfwasm._perfLastMove = null;
+window.wfwasmPerfLastMove = function () { return window.wfwasm._perfLastMove; };
+window.wfwasm._perfSeq = 0;
+window.wfwasm._perfTsOffset = 0;
+window.wfwasm._perfTsNorm = false;
+window.wfwasm._perfTsSeen = {};
+window.wfwasmNow = function () { return performance.now(); };
+window.wfwasm._perfPush = function (ring, slot) {
+    ring.buf[ring.i] = slot;
+    ring.i++;
+    if (ring.i >= ring.buf.length) ring.i = 0;
+    if (ring.n < ring.buf.length) ring.n++;
+};
+window.wfwasm._perfUnwrap = function (ring) {
+    var out = new Array(ring.n);
+    var len = ring.buf.length;
+    var start = ring.i - ring.n;
+    if (start < 0) start += len;
+    for (var j = 0; j < ring.n; j++) {
+        var k = start + j;
+        if (k >= len) k -= len;
+        out[j] = ring.buf[k];
+    }
+    return out;
+};
+window.wfwasm._perfNormTs = function (e, kind, tJsIn) {
+    // e.timeStamp basis varies (epoch vs navigation-start); detect once
+    // per kind by comparing against performance.now() in this handler.
+    if (!window.wfwasm._perfTsNorm && !window.wfwasm._perfTsSeen[kind]) {
+        window.wfwasm._perfTsSeen[kind] = 1;
+        var diff = e.timeStamp - tJsIn;
+        if (diff > 5000 || diff < -5000) {
+            window.wfwasm._perfTsOffset = tJsIn - e.timeStamp;
+            window.wfwasm._perfTsNorm = true;
+        }
+    }
+    return e.timeStamp + window.wfwasm._perfTsOffset;
+};
+window.wfwasm._perfKeyHash = function (key) {
+    var s = String(key === null || key === undefined ? "" : key);
+    var h = 0;
+    for (var i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+    return h;
+};
+window.wfwasm._perfHookCanvas = function (canvas) {
+    if (!canvas || canvas._wfPerfHook) return;
+    canvas._wfPerfHook = true;
+    var W = window.wfwasm;
+    function rec(kind, e, x, y, extra) {
+        if (!W._perfOn) return;
+        var tJsIn = performance.now();
+        var tEvent = W._perfNormTs(e, kind, tJsIn);
+        var jsSeq = ++W._perfSeq;
+        W._perfPush(W._perfIn, [jsSeq, kind, tEvent, tJsIn, x, y, extra]);
+        if (kind === 3) W._perfLastMove = [jsSeq, tEvent, tJsIn, x, y];
+    }
+    canvas.addEventListener("mousedown", function (e) { rec(1, e, e.clientX, e.clientY, e.buttons | 0); }, { passive: true });
+    canvas.addEventListener("mouseup", function (e) { rec(2, e, e.clientX, e.clientY, e.buttons | 0); }, { passive: true });
+    canvas.addEventListener("mousemove", function (e) { rec(3, e, e.clientX, e.clientY, e.buttons | 0); }, { passive: true });
+    canvas.addEventListener("wheel", function (e) { rec(4, e, e.clientX, e.clientY, e.buttons | 0); }, { passive: true });
+    canvas.addEventListener("keydown", function (e) { rec(5, e, 0, 0, W._perfKeyHash(e.key)); }, { passive: true });
+    canvas.addEventListener("keyup", function (e) { rec(6, e, 0, 0, W._perfKeyHash(e.key)); }, { passive: true });
+};
+window.wfwasm._perfWrapFetch = function () {
+    if (window.wfwasm._perfFetchWrapped) return;
+    if (typeof window.wfwasmFetchAssembly !== "function") return;
+    window.wfwasm._perfFetchWrapped = true;
+    var orig = window.wfwasmFetchAssembly;
+    window.wfwasmFetchAssembly = function (app, name) {
+        if (!window.wfwasm._perfOn) return orig(app, name);
+        var t0 = performance.now();
+        try {
+            var r = orig(app, name);
+            window.wfwasm._perfPush(window.wfwasm._perfIn, [8, t0, performance.now(), r ? r.length : 0]);
+            return r;
+        } catch (e) {
+            window.wfwasm._perfPush(window.wfwasm._perfIn, [8, t0, performance.now(), 0]);
+            throw e;
+        }
+    };
+};
+window.wfwasm.perfEnable = function () {
+    window.wfwasm._perfOn = true;
+    window.wfwasm._perfWrapFetch();
+    window.wfwasm._perfHookCanvas(document.getElementById("wfcanvas"));
+    return "ok";
+};
+window.wfwasm.perfDump = function () {
+    var c = document.getElementById("wfcanvas");
+    return JSON.stringify({
+        header: {
+            dpr: window.devicePixelRatio || 1,
+            canvasW: c ? c.width : 0,
+            canvasH: c ? c.height : 0,
+            frames: window.wfwasm._frames,
+            timeStampNormalized: window.wfwasm._perfTsNorm,
+            tsOffset: window.wfwasm._perfTsOffset,
+            userAgent: navigator.userAgent
+        },
+        inputs: window.wfwasm._perfUnwrap(window.wfwasm._perfIn),
+        frames: window.wfwasm._perfUnwrap(window.wfwasm._fms)
+    });
+};
+window.wfwasm._perfWrapFetch();
+window.wfwasm.paint = function (canvasId, commandsJson, frameSeq) {
+    var perf = window.wfwasm._perfOn && frameSeq > 0;
+    var tEntry = perf ? performance.now() : 0;
     window.wfwasm._frames++;
     var fts = window.wfwasm._fts;
     fts.push(Math.round(performance.now()));
@@ -23,7 +134,9 @@ window.wfwasm.paint = function (canvasId, commandsJson) {
     if (!canvas) return "no-canvas";
     var ctx = canvas.getContext("2d");
     if (!ctx) return "no-2d";
+    var tParse0 = perf ? performance.now() : 0;
     var commands = JSON.parse(commandsJson);
+    var tAfterParse = perf ? performance.now() : 0;
     var hAligns = ["left", "center", "right"];
     var vAligns = ["alphabetic", "top", "middle", "bottom"];
     for (var i = 0; i < commands.length; i++) {
@@ -119,6 +232,15 @@ window.wfwasm.paint = function (canvasId, commandsJson) {
             // only for hand-built streams). No-op by design.
         }
     }
+    if (perf) {
+        var tDone = performance.now();
+        var slot = [frameSeq, tAfterParse - tParse0, tDone - tAfterParse, commands.length, tEntry, tDone, 0, 0];
+        window.wfwasm._perfPush(window.wfwasm._fms, slot);
+        requestAnimationFrame(function (t1) {
+            slot[6] = t1;
+            requestAnimationFrame(function (t2) { slot[7] = t2; });
+        });
+    }
     return "ok:" + commands.length;
 };
 // Binary layer upload (bound via [JSImport], synchronous): stores RGBA
@@ -165,6 +287,10 @@ window.wfwasmTexPatch = function (layerId, bytes, x, y, w, h) {
 window.wfwasm.fitCanvas = function (canvasId, dotNet) {
     var canvas = document.getElementById(canvasId);
     if (!canvas) return "no-canvas";
+    window.wfwasm._dotNet = dotNet;
+    // Re-fitting the same canvas (re-render) must not stack observers:
+    // release any previous fitting first (idempotent).
+    window.wfwasm.releaseCanvas(canvasId);
     var apply = function () {
         var w = Math.max(1, Math.floor(canvas.clientWidth));
         var h = Math.max(1, Math.floor(canvas.clientHeight));
@@ -175,9 +301,51 @@ window.wfwasm.fitCanvas = function (canvasId, dotNet) {
         }
     };
     apply();
-    if (window.ResizeObserver) new ResizeObserver(apply).observe(canvas);
-    else window.addEventListener("resize", apply);
+    var fit = window.wfwasm._fit || (window.wfwasm._fit = {});
+    if (window.ResizeObserver) {
+        var ro = new ResizeObserver(apply);
+        ro.observe(canvas);
+        fit[canvasId] = { observer: ro };
+    } else {
+        window.addEventListener("resize", apply);
+        fit[canvasId] = { windowHandler: apply };
+    }
+    // Both paths stash their handle in fit[] so releaseCanvas can undo them.
+    // Keyboard delivery needs DOM focus on the canvas (Blazor @onkeydown is
+    // bound to the element). Synthesized and some real pointer presses do
+    // not move focus by default, so take it explicitly on pointer down;
+    // scoped to the canvas so page inputs (search) keep their own keys.
+    if (!canvas._wfFocusHook) {
+        canvas._wfFocusHook = true;
+        canvas.addEventListener("pointerdown", function (e) {
+            // Press-drag-release outside the canvas must still deliver its
+            // move/up (strokes, scrollbar/modal drags): capture the pointer
+            // to the canvas for the gesture (released implicitly on up).
+            try { if (e && e.pointerId !== undefined && canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId); } catch (err) { }
+            if (document.activeElement !== canvas) {
+                try { canvas.focus({ preventScroll: true }); } catch (e) { try { canvas.focus(); } catch (e2) {} }
+            }
+        });
+    }
+    if (window.wfwasm._perfOn) window.wfwasm._perfHookCanvas(canvas);
     return "ok";
+};
+window.wfwasm.releaseCanvas = function (canvasId) {
+    try {
+        var fit = window.wfwasm._fit;
+        if (!fit || !fit[canvasId]) return "unknown";
+        var entry = fit[canvasId];
+        delete fit[canvasId];
+        if (entry.observer) {
+            try { entry.observer.disconnect(); } catch (e) {}
+        }
+        if (entry.windowHandler) {
+            try { window.removeEventListener("resize", entry.windowHandler); } catch (e) {}
+        }
+        return "ok";
+    } catch (e) {
+        return "error:" + ((e && e.message) || e);
+    }
 };
 // VFS bootstrap decode: the managed PNG codec cannot read JPEG, so
 // loose JPEG content is decoded by the browser here. Input is the
@@ -237,7 +405,7 @@ window.wfwasmTextRaster = function (text, fontCss, fontPx, maxW) {
         fontPx = Math.max(1, fontPx | 0);
         maxW = Math.max(1, maxW | 0);
         var c = window.wfwasm._txt || (window.wfwasm._txt = document.createElement("canvas"));
-        var g = c.getContext("2d");
+        var g = c.getContext("2d", { willReadFrequently: true });
         g.font = String(fontCss);
         var paras = text.split("\n");
         // Greedy word wrap at maxW (GDI+ rect semantics): explicit
@@ -287,6 +455,46 @@ window.wfwasmTextRaster = function (text, fontCss, fontPx, maxW) {
         return null;
     }
 };
+// Fractional advance twin of wfwasmTextRaster (same word-wrap, no
+// pixels): GDI+ Typographic measures are fractional (oracle "The"
+// = 19.35) but raster widths ceil (20), drifting TPF layouts
+// ~+0.6px/word. Kept separate so the raster hot path is untouched.
+window.wfwasmTextMeasure = function (text, fontCss, fontPx, maxW) {
+    try {
+        text = String(text === null || text === undefined ? "" : text);
+        if (!text) return 0;
+        fontPx = Math.max(1, fontPx | 0);
+        maxW = Math.max(1, maxW | 0);
+        var c = window.wfwasm._txt || (window.wfwasm._txt = document.createElement("canvas"));
+        var g = c.getContext("2d", { willReadFrequently: true });
+        g.font = String(fontCss);
+        var paras = text.split("\n");
+        var lines = [];
+        for (var pi = 0; pi < paras.length; pi++) {
+            var words = paras[pi].split(" ");
+            var cur = "";
+            for (var wi = 0; wi < words.length; wi++) {
+                var trial = cur ? cur + " " + words[wi] : words[wi];
+                if (!cur || g.measureText(trial).width <= maxW) cur = trial;
+                else { lines.push(cur); cur = words[wi]; }
+            }
+            while (cur && g.measureText(cur).width > maxW) {
+                var k = cur.length - 1;
+                while (k > 1 && g.measureText(cur.slice(0, k)).width > maxW) k--;
+                if (k < 1) k = 1;
+                lines.push(cur.slice(0, k));
+                cur = cur.slice(k);
+            }
+            lines.push(cur || "");
+        }
+        var w = 0;
+        for (var i = 0; i < lines.length; i++)
+            w = Math.max(w, g.measureText(lines[i] || " ").width);
+        return Math.min(w, maxW);
+    } catch (e) {
+        return 0;
+    }
+};
 window.wfwasm.savePng = function (canvasId, filename) {
     var canvas = document.getElementById(canvasId);
     if (!canvas) return "no-canvas";
@@ -333,6 +541,8 @@ window.wfwasm.installErrorReporting = function () {
             // "found via __Internal" line right after). Real failures
             // still surface as managed DllNotFound/EntryPointNotFound.
             if (text.indexOf("[MONO] DllImport error loading library '__Internal'") === 0) return;
+            if (level === "error" && /Aborted\(|MONO.*Assertion|crit: Microsoft\.AspNetCore\.Components\.WebAssembly\.Rendering/.test(text))
+                push("runtime-console", "RuntimeError", text, null, true);
             return orig.apply(null, arguments);
         };
     });
@@ -341,7 +551,15 @@ window.wfwasm.installErrorReporting = function () {
         var lines = String(stack).split("\n");
         for (var i = 0; i < lines.length; i++) {
             var m = /^\s*at\s+([^\s(]+)/.exec(lines[i]);
-            if (m) return m[1].split(".").slice(-2).join(".");
+            if (m) {
+                // Anonymous frames contain the navigation URL, whose session
+                // query must never split identical crashes into unique rows.
+                if (/^https?:\/\//.test(m[1])) {
+                    var site = /^(.*?)(:\d+:\d+)$/.exec(m[1]);
+                    try { return new URL(site ? site[1] : m[1]).pathname + (site ? site[2] : ""); } catch (e) { }
+                }
+                return m[1].split(".").slice(-2).join(".");
+            }
         }
         return "";
     }
@@ -359,9 +577,17 @@ window.wfwasm.installErrorReporting = function () {
             fetch("/api/client-errors", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(batch)
+                body: JSON.stringify(batch),
+                keepalive: true
             }).catch(function () { });
         } catch (e) { /* reporting must never break the app */ }
+    }
+    function appSlug() {
+        try {
+            if (window.wfwasmRuntime) return window.wfwasmRuntime.app;
+            var m = /^\/app\/([^\/?#]+)/.exec(location.pathname);
+            return m ? decodeURIComponent(m[1]) : null;
+        } catch (e) { return null; }
     }
     function push(source, name, message, stack, fatal) {
         name = String(name == null || name === "" ? "Error" : name);
@@ -371,8 +597,12 @@ window.wfwasm.installErrorReporting = function () {
             stack: stack == null ? null : String(stack),
             source: source,
             time: new Date().toISOString(),
-            context: fatal ? ring.join("\n").slice(-8000) : null
+            context: fatal ? ring.join("\n").slice(-8000) : null,
+            app: appSlug(),
+            appLabel: window.wfwasmRuntime?.label ?? null,
+            sessionId: window.wfwasmRuntime?.session ?? null
         });
+        if (fatal) window.wfwasmRuntime?.fail(firstLine(message));
         if (fatal) { if (timer) { clearTimeout(timer); timer = 0; } flush(); }
         else if (queue.length >= 10) { if (timer) { clearTimeout(timer); timer = 0; } flush(); }
         else if (!timer) timer = setTimeout(flush, 1000);
@@ -387,4 +617,7 @@ window.wfwasm.installErrorReporting = function () {
         var msg = (r && r.message) || String(r);
         push("unhandledrejection", name, msg, r && r.stack, true);
     });
+    window.wfwasm.reportRuntimeFailure = function (error) {
+        push("runtime-start", error?.name || "Error", error?.message || String(error), error?.stack, true);
+    };
 };

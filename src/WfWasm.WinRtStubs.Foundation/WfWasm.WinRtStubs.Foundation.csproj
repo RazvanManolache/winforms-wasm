@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <AssemblyName>Windows.Foundation.FoundationContract</AssemblyName>
+    <AssemblyVersion>4.0.0.0</AssemblyVersion>
+    <Version>4.0.0.0</Version>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <SignAssembly>false</SignAssembly>
+    <Description>Web-loadable stub of the WinRT FoundationContract. Satisfies type loads for desktop apps that reference Windows.* APIs; members are inert.</Description>
+  </PropertyGroup>
+
+</Project>

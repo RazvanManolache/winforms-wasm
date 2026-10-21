@@ -1,9 +1,9 @@
 // PNG decode: minimal spec reader for Image.FromStream/FromFile.
 // Supports non-interlaced PNG (color types 0/2/3/4/6, 1/2/4/8/16-bit) via
 // DeflateStream + all five filters, mapped to 32bpp ARGB. Interlaced
-// (Adam7) files and formats other than PNG/BMP throw
+// (Adam7) files and formats other than PNG/BMP/GIF/JPEG throw
 // NotSupportedException; corrupt data throws OutOfMemoryException
-// (the documented GDI+ quirk). BMP routes to BmpCodec.
+// (the documented GDI+ quirk). BMP/GIF/JPEG route to BmpCodec/GifCodec/JpegCodec.
 
 namespace System.Drawing;
 
@@ -25,7 +25,7 @@ internal static class PngCodec
     }
 
     /// <summary>
-    /// Decodes an image stream by format sniffing. PNG and BMP decode
+    /// Decodes an image stream by format sniffing. PNG, BMP, GIF and JPEG decode
     /// fully; other recognized formats name their follow-up milestone;
     /// anything else reports corrupt data (the
     /// <see cref="OutOfMemoryException"/> GDI+ raises for unrecognized
@@ -34,17 +34,26 @@ internal static class PngCodec
     internal static Bitmap DecodeStream(Stream stream)
     {
         ArgumentNullException.ThrowIfNull(stream);
+        // GDI+ parity: Image.FromStream reads from the start of the
+        // stream however it is positioned (verified against
+        // System.Drawing.Common 9.0.0: at-end and mid-stream positions
+        // decode; a junk prefix with the position past it does not).
+        // Syncfusion BitmapNode.Base64ToImage depends on this: it
+        // builds a MemoryStream over the payload, writes the payload
+        // again (leaving Position at the end), then calls FromStream.
+        if (stream.CanSeek)
+            stream.Position = 0;
         var buffer = new MemoryStream();
         stream.CopyTo(buffer);
         byte[] bytes = buffer.ToArray();
         if (HasSignature(bytes))
             return Decode(new MemoryStream(bytes, false));
         if (StartsWith(bytes, 0xFF, 0xD8, 0xFF))
-            throw new NotSupportedException("JPEG decode arrives with the codec milestone.");
+            return JpegCodec.Decode(bytes);
         if (StartsWith(bytes, (byte)'B', (byte)'M'))
             return BmpCodec.Decode(bytes);
         if (StartsWith(bytes, (byte)'G', (byte)'I', (byte)'F'))
-            throw new NotSupportedException("GIF decode arrives with the codec milestone.");
+            return GifCodec.Decode(bytes);
         if (StartsWith(bytes, (byte)'I', (byte)'I', 0x2A, 0x00) || StartsWith(bytes, (byte)'M', (byte)'M', 0x00, 0x2A))
             throw new NotSupportedException("TIFF decode arrives with the codec milestone.");
         if (StartsWith(bytes, 0x00, 0x00, 0x01, 0x00))
@@ -398,4 +407,123 @@ internal static class PngCodec
 
     private static int ReadInt32(byte[] data, int offset) =>
         (data[offset] << 24) | (data[offset + 1] << 16) | (data[offset + 2] << 8) | data[offset + 3];
+
+    // PNG encode: minimal spec writer for Image.Save(Stream/File, Png).
+    // Writes non-interlaced 8-bit RGBA (color type 6) with filter-None
+    // scanlines compressed by DeflateStream; chunk CRCs are real (a
+    // strict reader must accept the output: round-trip through Decode).
+    // Other formats keep throwing their milestone NotSupportedException.
+    internal static void Encode(Stream output, Bitmap bitmap)
+    {
+        ArgumentNullException.ThrowIfNull(output);
+        ArgumentNullException.ThrowIfNull(bitmap);
+        int width = bitmap.Width;
+        int height = bitmap.Height;
+        if (width <= 0 || height <= 0)
+            throw new ArgumentException("Cannot encode an empty bitmap.");
+
+        byte[] raw = new byte[height * (1 + width * 4)];
+        int o = 0;
+        for (int y = 0; y < height; y++)
+        {
+            raw[o++] = 0;
+            for (int x = 0; x < width; x++)
+            {
+                Color c = bitmap.GetPixel(x, y);
+                raw[o++] = c.R;
+                raw[o++] = c.G;
+                raw[o++] = c.B;
+                raw[o++] = c.A;
+            }
+        }
+
+        byte[] zlib;
+        using (var compressor = new MemoryStream())
+        {
+            compressor.WriteByte(0x78);
+            compressor.WriteByte(0x9C);
+            using (var deflate = new DeflateStream(compressor, CompressionLevel.Optimal, leaveOpen: true))
+                deflate.Write(raw, 0, raw.Length);
+            WriteUInt32BigEndian(compressor, Adler32(raw));
+            zlib = compressor.ToArray();
+        }
+
+        output.Write(Signature, 0, Signature.Length);
+        using (var ihdr = new MemoryStream())
+        {
+            WriteUInt32BigEndian(ihdr, (uint)width);
+            WriteUInt32BigEndian(ihdr, (uint)height);
+            ihdr.WriteByte(8);
+            ihdr.WriteByte(6);
+            ihdr.WriteByte(0);
+            ihdr.WriteByte(0);
+            ihdr.WriteByte(0);
+            WriteChunk(output, "IHDR", ihdr.ToArray());
+        }
+
+        WriteChunk(output, "IDAT", zlib);
+        WriteChunk(output, "IEND", []);
+    }
+
+    private static void WriteChunk(Stream output, string name, byte[] data)
+    {
+        byte[] nameBytes = System.Text.Encoding.ASCII.GetBytes(name);
+        WriteUInt32BigEndian(output, (uint)data.Length);
+        output.Write(nameBytes, 0, nameBytes.Length);
+        output.Write(data, 0, data.Length);
+        uint crc = Crc32(nameBytes, data);
+        byte[] crcBytes = new byte[4];
+        crcBytes[0] = (byte)(crc >> 24);
+        crcBytes[1] = (byte)(crc >> 16);
+        crcBytes[2] = (byte)(crc >> 8);
+        crcBytes[3] = (byte)crc;
+        output.Write(crcBytes, 0, 4);
+    }
+
+    private static void WriteUInt32BigEndian(Stream output, uint value)
+    {
+        output.WriteByte((byte)(value >> 24));
+        output.WriteByte((byte)(value >> 16));
+        output.WriteByte((byte)(value >> 8));
+        output.WriteByte((byte)value);
+    }
+
+    private static readonly uint[] CrcTable = BuildCrcTable();
+
+    private static uint[] BuildCrcTable()
+    {
+        var table = new uint[256];
+        for (uint n = 0; n < 256; n++)
+        {
+            uint c = n;
+            for (int k = 0; k < 8; k++)
+                c = (c & 1) != 0 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            table[n] = c;
+        }
+
+        return table;
+    }
+
+    private static uint Crc32(byte[] name, byte[] data)
+    {
+        uint c = uint.MaxValue;
+        foreach (byte b in name)
+            c = CrcTable[(c ^ b) & 0xFF] ^ (c >> 8);
+        foreach (byte b in data)
+            c = CrcTable[(c ^ b) & 0xFF] ^ (c >> 8);
+        return c ^ uint.MaxValue;
+    }
+
+    private static uint Adler32(byte[] data)
+    {
+        uint a = 1;
+        uint b = 0;
+        foreach (byte v in data)
+        {
+            a = (a + v) % 65521;
+            b = (b + a) % 65521;
+        }
+
+        return (b << 16) | a;
+    }
 }

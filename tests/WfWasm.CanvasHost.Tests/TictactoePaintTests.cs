@@ -42,12 +42,14 @@ public sealed class TictactoePaintTests
     public void Move_Paints_Piece_Image_Command()
     {
         // Clicking a cell sets its piece image; the paint walk must then
-        // emit a DrawImageCommand (covers the shared centered-bitmap path
-        // used by Button and ToolStripItem).
+        // emit the piece bitmap through the shared centered-bitmap path
+        // used by Button and ToolStripItem. RecordingRenderer is a
+        // layered canvas, so the bitmap travels as Def+Blit (the
+        // non-layered DrawImageCommand shape predates retained layers).
         // Same regenerable-data coupling as the fork file reference in this
         // test project: the rewritten app must exist in E:\tmp.
         string app = TestPaths.Repo(@".artifacts\runtime\TicTacToe.dll");
-        Assert.True(File.Exists(app), $"supply the optional local converted test fixture: {app}");
+        Assert.True(File.Exists(app), $"regenerate via E:/tmp/rewrite-small.ps1: {app}");
         var ttt = Assembly.LoadFrom(app);
         // The file is TicTacToe.dll but the assembly name kept its spaces
         // ("Tic Tac Toe"); the host looks it up as "TicTacToe" (which the
@@ -57,7 +59,7 @@ public sealed class TictactoePaintTests
         AppDomain.CurrentDomain.AssemblyResolve += resolver;
         try
         {
-            var host = new WinFormsAppHost();
+            using var host = new WinFormsAppHost();
             host.SelectScene(AppScene.TicTacToe);
             var form = host.GetOrCreateForm(AppScene.TicTacToe);
             Assert.NotNull(form);
@@ -66,10 +68,15 @@ public sealed class TictactoePaintTests
             host.OnClick(AbsX(cell, form.Location.X) + (cell.Width / 2),
                 AbsY(cell, form.Location.Y) + (cell.Height / 2));
             Assert.Equal("X", cell.Tag?.ToString());
+            var piece = Assert.IsType<System.Drawing.Bitmap>(cell.Image);
+            Assert.Equal(50, piece.Width);
+            Assert.Equal(50, piece.Height);
 
             var recorder = new RecordingRenderer();
             host.Paint(recorder);
-            Assert.Contains(recorder.Commands, c => c is DrawImageCommand);
+            Assert.Contains(recorder.Commands,
+                c => c is DefBitmapCommand { Width: 50, Height: 50 });
+            Assert.Contains(recorder.Commands, c => c is BlitBitmapCommand);
         }
         finally
         {

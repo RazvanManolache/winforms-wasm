@@ -12,7 +12,7 @@ public sealed class DockWindowTests
         // Modeless tracked windows (PDN docks) paint above the scene, so
         // clicks route into their controls even though they are not scene
         // children and no modal is open.
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         host.SelectScene(AppScene.Smoke);
         using var dlg = new FormsForm { Text = "Dock", Width = 360, Height = 240 };
         bool okClicked = false;
@@ -44,7 +44,7 @@ public sealed class DockWindowTests
     [Fact]
     public void Title_Drag_Moves_Modeless_Dock()
     {
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         host.SelectScene(AppScene.Smoke);
         using var dlg = new FormsForm { Text = "Dock", Width = 360, Height = 240 };
         dlg.StartPosition = System.Windows.Forms.FormStartPosition.Manual; dlg.Left = 500; dlg.Top = 500; dlg.Show();
@@ -65,7 +65,7 @@ public sealed class DockWindowTests
     [Fact]
     public void Close_X_Hides_Modeless_Dock()
     {
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         host.SelectScene(AppScene.Smoke);
         using var dlg = new FormsForm { Text = "Dock", Width = 360, Height = 240 };
         dlg.StartPosition = System.Windows.Forms.FormStartPosition.Manual; dlg.Left = 500; dlg.Top = 500; dlg.Show();
@@ -88,7 +88,7 @@ public sealed class DockWindowTests
         // (Colors 209x217 vs ~376x250 of sliders); placement grows the
         // frame to the visible-children union and pulls it into view so
         // no drag is needed to reveal the clipped rows.
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         host.SelectScene(AppScene.Smoke);
         host.ViewWidth = 500;
         host.ViewHeight = 400;
@@ -115,7 +115,7 @@ public sealed class DockWindowTests
     [Fact]
     public void Placement_Never_Shrinks_Dock()
     {
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         host.SelectScene(AppScene.Smoke);
         host.ViewWidth = 500;
         host.ViewHeight = 400;

@@ -1,0 +1,21 @@
+<!doctype html><meta charset="utf-8"><title>WinForms WebGL pixel contracts</title>
+<style>body{font:15px system-ui;margin:28px;background:#fafafa}table{border-collapse:collapse;width:100%}td,th{padding:7px;border-bottom:1px solid #ddd;text-align:left}.fail{color:#b3261e}.pass{color:#137333}canvas{display:none}</style>
+<h1>Production WebGL binding: pixel contracts</h1><p id="status">Running real GPU checks...</p>
+<canvas id="binding-contract" width="8" height="8"></canvas><table id="checks"></table><p id="identity"></p>
+<script src="/binding.js"></script><script type="module">
+import {runBindingPixelCases,BINDING_CASES} from '/cases.mjs';
+const meta=await(await fetch('/meta.json')).json();
+let report={version:1,...meta,createdUtc:new Date().toISOString()};
+try{Object.assign(report,runBindingPixelCases(window.wfwasmGpu,'binding-contract'));}
+catch(e){report.error=String(e.stack||e);report.checks=[];}
+const table=document.getElementById('checks');
+for(const cells of [['Check','Expected RGBA','Actual RGBA','Result'],...(report.checks||[]).map(c=>
+ [c.id,BINDING_CASES.find(s=>s.id===c.id).expected.join(', '),c.error||c.actual?.join(', '),c.passed?'PASS':'FAIL'])]){
+ const tr=document.createElement('tr');for(const text of cells){const td=document.createElement('td');td.textContent=text;td.className=text==='FAIL'?'fail':text==='PASS'?'pass':'';tr.append(td);}table.append(tr);
+}
+const failures=(report.checks||[]).filter(c=>!c.passed).length;
+document.getElementById('status').textContent=report.error||`${failures} failures in ${report.checks.length} checks. Renderer: ${report.hardware?.renderer}`;
+document.getElementById('identity').textContent=`Run ${meta.runId} | Binding SHA256 ${meta.bindingSha256}`;
+const response=await fetch('/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(report)});
+const verdict=await response.json();document.getElementById('status').textContent+=' | Receipt '+(verdict.accepted?'PASS':'FAIL')+' saved.';
+</script>

@@ -112,4 +112,40 @@ public partial class NativeWindow
             _windProc = Callback;
         }
     }
+
+    /// <summary>
+    ///  Fork: CreateWindowEx is minted locally, so the OS never calls the
+    ///  window-class proc. Dispatch the creation messages (WM_NCCREATE,
+    ///  then WM_CREATE) to the pending target window, mirroring native
+    ///  CreateWindowEx, which delivers both before returning the handle.
+    ///  This is what assigns the handle and raises OnHandleCreated.
+    /// </summary>
+
+    internal static unsafe void DispatchCreateWindow(HWND hwnd, char* lpClassName)
+    {
+        if ((nuint)lpClassName <= 0xFFFF)
+        {
+            return; // Class atom: not one of our registered classes.
+        }
+
+        string className = new string(lpClassName);
+        WindowClass? wc = WindowClass.s_cache;
+        while (wc is not null && wc._windowClassName != className && wc._className != className)
+        {
+            wc = wc._next;
+        }
+
+        if (wc?._targetWindow is not { } target)
+        {
+            return;
+        }
+
+        // The class proc assigns the handle on the first message and switches
+        // the window proc; later messages reach the target's own Callback.
+        wc.Callback(hwnd, PInvokeCore.WM_NCCREATE, default, default);
+        target.Callback(hwnd, PInvokeCore.WM_CREATE, default, default);
+        // Visible parentless controls own top-level windows: track popups here
+        // (some never call ShowWindow; see WasmPopupHost.NoteHandleCreated).
+        WasmPopupHost.NoteHandleCreated((IntPtr)hwnd.Value);
+    }
 }

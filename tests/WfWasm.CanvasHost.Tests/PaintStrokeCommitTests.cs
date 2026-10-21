@@ -9,8 +9,16 @@ namespace WfWasm.CanvasHost.Tests;
 // Regression cover: input delivery (DocPress/moves/release) can succeed
 // with zero errors while the layer stays blank (broken commit or broken
 // surface binding), which is exactly what "can't draw" looks like.
+[Collection("Paint")]
 public sealed class PaintStrokeCommitTests
 {
+    private readonly WinFormsAppHost _host;
+
+    public PaintStrokeCommitTests(PaintHostFixture fx)
+    {
+        _host = fx.Host;
+    }
+
     private static T InvokePrivate<T>(object target, string name, object?[]? args = null)
     {
         var m = target.GetType().GetMethod(name,
@@ -20,24 +28,24 @@ public sealed class PaintStrokeCommitTests
     }
 
     [Fact]
-    public void BrushDrag_Commits_Ink_To_Active_Layer()
+    public async Task BrushDrag_Commits_Ink_To_Active_Layer()
     {
-        var host = new WinFormsAppHost();
-        host.SelectScene(AppScene.Paint);
-        Assert.NotNull(host.GetOrCreateForm(AppScene.Paint));
-
-        // The workspace finishes tool init on paint (same as the browser,
-        // which repaints continuously); without this the tool stays null.
+        var host = _host;
+        // Fixture pre-waits for tool readiness; re-check briefly (paint
+        // settles tool init) in case collection ordering ever shifts.
         host.Paint(new RecordingRenderer());
-
-        for (int i = 0; i < 40; i++)
+        string tool = "";
+        for (int i = 0; i < 20; i++)
         {
-            if (InvokePrivate<string>(host, "GetActiveDocToolName").StartsWith("PaintBrushTool", StringComparison.Ordinal))
+            tool = InvokePrivate<string>(host, "GetActiveDocToolName");
+            if (tool.StartsWith("PaintBrushTool", StringComparison.Ordinal))
                 break;
             InvokePrivate<object?>(host, "CycleNextTool");
+            host.Paint(new RecordingRenderer());
+            await Task.Delay(25);
         }
 
-        Assert.StartsWith("PaintBrushTool", InvokePrivate<string>(host, "GetActiveDocToolName"));
+        Assert.StartsWith("PaintBrushTool", tool);
 
         host.Paint(new RecordingRenderer());
         dynamic bounds = host.GetType()

@@ -37,7 +37,7 @@ public sealed class DirtyTrackingTests
         // A pump tick with no app Invalidate and no host marking must
         // not raster, serialize, or interop anything (the razor skips
         // empty command lists). SelectScene primes one global frame.
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         host.SelectScene(AppScene.Smoke);
         var form = host.GetOrCreateForm(AppScene.Smoke);
         Assert.NotNull(form);
@@ -57,7 +57,7 @@ public sealed class DirtyTrackingTests
         // Second frame with no dirty marks: the self-painted control's
         // OnPaint must NOT re-run, but its retained layer still blits
         // (full replay needs the blit command every frame).
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         host.SelectScene(AppScene.Smoke);
         var form = host.GetOrCreateForm(AppScene.Smoke);
         Assert.NotNull(form);
@@ -91,7 +91,7 @@ public sealed class DirtyTrackingTests
     {
         // Marking the control dirty re-runs OnPaint and re-defines the
         // layer on the next frame.
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         host.SelectScene(AppScene.Smoke);
         var form = host.GetOrCreateForm(AppScene.Smoke);
         Assert.NotNull(form);
@@ -126,7 +126,7 @@ public sealed class DirtyTrackingTests
         // patch-uploads the rect: no pre-paint snapshot (a full rect
         // swizzle per frame costs more than uploading small identical
         // regions). Full paints keep hash-skip; regions never Def.
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         host.SelectScene(AppScene.Smoke);
         var form = host.GetOrCreateForm(AppScene.Smoke);
         Assert.NotNull(form);
@@ -164,7 +164,7 @@ public sealed class DirtyTrackingTests
     {
         // Changed pixels inside the dirty rect upload as a patch (not a
         // full Def); the patch bytes carry the new paint.
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         host.SelectScene(AppScene.Smoke);
         var form = host.GetOrCreateForm(AppScene.Smoke);
         Assert.NotNull(form);
@@ -206,7 +206,7 @@ public sealed class DirtyTrackingTests
     {
         // A resized control has no matching retained surface: the rect
         // mark takes the full path (Def, never a patch splice).
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         host.SelectScene(AppScene.Smoke);
         var form = host.GetOrCreateForm(AppScene.Smoke);
         Assert.NotNull(form);
@@ -240,7 +240,7 @@ public sealed class DirtyTrackingTests
     {
         // Desktop passes the invalid region as ClipRectangle: full
         // paints see the whole surface, region paints see the rect.
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         host.SelectScene(AppScene.Smoke);
         var form = host.GetOrCreateForm(AppScene.Smoke);
         Assert.NotNull(form);
@@ -270,7 +270,7 @@ public sealed class DirtyTrackingTests
         // Size-change backstop: when a frame runs for another control,
         // a resized-but-unmarked control must still re-raster (the
         // retained pixels are the wrong size).
-        var host = new WinFormsAppHost();
+        using var host = new WinFormsAppHost();
         host.SelectScene(AppScene.Smoke);
         var form = host.GetOrCreateForm(AppScene.Smoke);
         Assert.NotNull(form);

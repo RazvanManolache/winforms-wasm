@@ -211,10 +211,13 @@ public sealed class PngCodecTests
     }
 
     [Theory]
-    [InlineData(new byte[] { 0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 1, 2 })]
+    [InlineData(new byte[] { (byte)'I', (byte)'I', 0x2A, 0x00, 0, 0, 1, 2 })]
+    [InlineData(new byte[] { (byte)'M', (byte)'M', 0x00, 0x2A, 0, 0, 1, 2 })]
+    [InlineData(new byte[] { 0x00, 0x00, 0x01, 0x00, 1, 2, 3, 4 })]
     // BM used to throw here; BMP now decodes (BmpCodec) — short/truncated
     // BM bytes report OutOfMemory instead (see BmpCodecTests).
-    [InlineData(new byte[] { (byte)'G', (byte)'I', (byte)'F', (byte)'8', (byte)'9', (byte)'a', 1, 2 })]
+    // GIF likewise decodes now (GifCodec; see GifCodecTests).
+    // JPEG likewise decodes now (JpegCodec; see JpegCodecTests).
     public void OtherFormats_ThrowNotSupported(byte[] magic)
     {
         var ex = Assert.Throws<NotSupportedException>(() => DecodePng(magic));
@@ -232,6 +235,111 @@ public sealed class PngCodecTests
     public void FromFile_Missing_ThrowsFileNotFound()
     {
         Assert.Throws<System.IO.FileNotFoundException>(() => WfImage.FromFile(Path.Combine(Path.GetTempPath(), "wfwasm-nope-" + Guid.NewGuid() + ".png")));
+    }
+
+    [Fact]
+    public void Encode_RoundTrips_ExactPixels()
+    {
+        using var src = new WfBitmap(3, 2);
+        var colors = new WfColor[2, 3];
+        for (int y = 0; y < 2; y++)
+            for (int x = 0; x < 3; x++)
+            {
+                colors[y, x] = WfColor.FromArgb(200 - y * 10 - x, 10 + x * 20, 20 + y * 30, 30 + x + y);
+                src.SetPixel(x, y, colors[y, x]);
+            }
+
+        using var encoded = new MemoryStream();
+        src.Save(encoded, WfDraw::System.Drawing.Imaging.ImageFormat.Png);
+        byte[] bytes = encoded.ToArray();
+        Assert.True(bytes.Length > 8);
+        Assert.Equal(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 }, bytes[..8]);
+
+        using var back = DecodePng(bytes);
+        Assert.Equal(new WfDraw::System.Drawing.Size(3, 2), back.Size);
+        for (int y = 0; y < 2; y++)
+            for (int x = 0; x < 3; x++)
+                Assert.Equal(colors[y, x].ToArgb(), back.GetPixel(x, y).ToArgb());
+    }
+
+    [Fact]
+    public void Encode_Transparent_RoundTrips_Alpha()
+    {
+        using var src = new WfBitmap(1, 1);
+        src.SetPixel(0, 0, WfColor.FromArgb(0, 255, 0, 0));
+        using var encoded = new MemoryStream();
+        src.Save(encoded, WfDraw::System.Drawing.Imaging.ImageFormat.Png);
+        using var back = DecodePng(encoded.ToArray());
+        Assert.Equal(0, back.GetPixel(0, 0).A);
+    }
+
+    [Fact]
+    public void Encode_NonPng_StillThrowsMilestone()
+    {
+        using var src = new WfBitmap(1, 1);
+        using var encoded = new MemoryStream();
+        Assert.Throws<NotSupportedException>(() => src.Save(encoded, WfDraw::System.Drawing.Imaging.ImageFormat.Jpeg));
+        Assert.Throws<NotSupportedException>(() => src.Save(encoded, WfDraw::System.Drawing.Imaging.ImageFormat.Bmp));
+    }
+
+    [Fact]
+    public void Encode_Base64_RoundTrips_Through_FromStream()
+    {
+        // Mirrors the diagram BitmapNode.ImageToBase64 snapshot path.
+        using var src = new WfBitmap(2, 1);
+        src.SetPixel(0, 0, WfColor.FromArgb(255, 1, 2, 3));
+        src.SetPixel(1, 0, WfColor.FromArgb(255, 4, 5, 6));
+        string b64;
+        using (var ms = new MemoryStream())
+        {
+            src.Save(ms, WfDraw::System.Drawing.Imaging.ImageFormat.Png);
+            b64 = Convert.ToBase64String(ms.ToArray());
+        }
+
+        using var back = new WfBitmap(new MemoryStream(Convert.FromBase64String(b64), false));
+        Assert.Equal(WfColor.FromArgb(255, 1, 2, 3).ToArgb(), back.GetPixel(0, 0).ToArgb());
+        Assert.Equal(WfColor.FromArgb(255, 4, 5, 6).ToArgb(), back.GetPixel(1, 0).ToArgb());
+    }
+
+    [Fact]
+    public void FromStream_PositionedAtEnd_DecodesLikeGdiPlus()
+    {
+        // Syncfusion BitmapNode.Base64ToImage shape: a MemoryStream over
+        // the payload, payload written again (Position ends at Length),
+        // then Image.FromStream. Real GDI+ (System.Drawing.Common 9.0.0,
+        // probed in E:/tmp/gdiprobe) decodes this; the fork must too.
+        byte[] png = BuildPng(3, 1, 8, 6,
+            [[0, 255, 0, 0, 255, 255, 255, 255, 255, 0, 0, 255, 255]]);
+        using var stream = new MemoryStream(png, 0, png.Length);
+        stream.Write(png, 0, png.Length);
+        Assert.Equal(png.Length, stream.Position);
+
+        var back = Assert.IsType<WfBitmap>(WfImage.FromStream(stream, true));
+        using (back)
+        {
+            Assert.Equal(new WfDraw::System.Drawing.Size(3, 1), back.Size);
+            Assert.Equal(WfColor.FromArgb(255, 255, 0, 0).ToArgb(), back.GetPixel(0, 0).ToArgb());
+            Assert.Equal(WfColor.FromArgb(255, 0, 0, 255).ToArgb(), back.GetPixel(2, 0).ToArgb());
+        }
+    }
+
+    [Fact]
+    public void FromStream_PositionedMid_DecodesLikeGdiPlus()
+    {
+        // Same oracle: GDI+ seeks back to the start, so a mid-stream
+        // position still decodes (but a junk prefix with the position
+        // past it does not: the rewind only helps true positioned reads).
+        byte[] png = BuildPng(3, 1, 8, 6,
+            [[0, 255, 0, 0, 255, 255, 255, 255, 255, 0, 0, 255, 255]]);
+        using var stream = new MemoryStream(png, false);
+        stream.Position = png.Length / 2;
+
+        var back = Assert.IsType<WfBitmap>(WfImage.FromStream(stream));
+        using (back)
+        {
+            Assert.Equal(new WfDraw::System.Drawing.Size(3, 1), back.Size);
+            Assert.Equal(WfColor.FromArgb(255, 255, 255, 255).ToArgb(), back.GetPixel(1, 0).ToArgb());
+        }
     }
 
     private static WfBitmap DecodePng(byte[] bytes)

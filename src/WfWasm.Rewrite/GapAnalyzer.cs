@@ -34,8 +34,7 @@ public static class GapAnalyzer
         var targets = new Dictionary<string, Dictionary<string, TypeDefinition>>(StringComparer.Ordinal);
         foreach ((string from, string file) in assemblyMap)
         {
-            var resolver = new DefaultAssemblyResolver();
-            resolver.AddSearchDirectory(Path.GetDirectoryName(Path.GetFullPath(file))!);
+            var resolver = new FrameworkResolver(Path.GetDirectoryName(Path.GetFullPath(file)));
             var parameters = new ReaderParameters { AssemblyResolver = resolver };
             var target = AssemblyDefinition.ReadAssembly(file, parameters);
             var index = new Dictionary<string, TypeDefinition>(StringComparer.Ordinal);
@@ -113,6 +112,10 @@ public static class GapAnalyzer
                     return Identity(pointer.ElementType) + "*";
                 if (type is RequiredModifierType mod)
                     return Identity(mod.ElementType);
+                if (type is FunctionPointerType fnptr)
+                    return "fnptr:" + Identity(fnptr.ReturnType) + "(" + string.Join(",", fnptr.Parameters.Select(p => Identity(p.ParameterType))) + ")";
+                if (spec.ElementType is null)
+                    return "<exotic:" + spec.GetType().Name + ">";
                 type = spec.ElementType;
             }
             string full = type.FullName.Replace('/', '+');

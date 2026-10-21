@@ -74,6 +74,46 @@ public sealed class ErrorLogTests
     }
 
     [Fact]
+    public void Log_Merges_Apps_And_ReadIndex_Filters_By_App()
+    {
+        string dir = NewDir();
+        ErrorLog.Log(dir, Report() with { App = "calculator" });
+        ErrorLog.Log(dir, Report() with { App = "calendar" });
+        var entry = ErrorLog.Log(dir, Report());
+
+        Assert.Equal(["calculator", "calendar"], entry.Apps ?? []);
+        Assert.Single(ErrorLog.ReadIndex(dir, "calculator"));
+        Assert.Single(ErrorLog.ReadIndex(dir, "CALCULATOR"));
+        Assert.Empty(ErrorLog.ReadIndex(dir, "nope"));
+        Assert.Single(ErrorLog.ReadIndex(dir));
+        Assert.Single(ErrorLog.ReadIndex(dir, null));
+    }
+
+    [Fact]
+    public void ReadIndex_Legacy_Rows_Without_Apps_Deserialize_With_Empty_Apps()
+    {
+        string dir = NewDir();
+        File.WriteAllText(Path.Combine(dir, ErrorLog.IndexFileName),
+            """[{"signature":"s","message":"m","source":"src","firstSeen":"2026-10-15T00:00:00Z","lastSeen":"2026-10-15T00:00:00Z","count":1,"status":"open","fixedNote":null,"postFixCount":0}]""");
+
+        var entry = Assert.Single(ErrorLog.ReadIndex(dir));
+        Assert.Empty(entry.Apps ?? []);
+        Assert.Empty(ErrorLog.ReadIndex(dir, "calculator"));
+    }
+
+    [Fact]
+    public void InventoryPage_Renders_Apps_Column_Escaped()
+    {
+        string dir = NewDir();
+        ErrorLog.Log(dir, Report() with { App = "<b>calculator</b>" });
+
+        string html = ErrorInventoryPage.Render(ErrorLog.ReadIndex(dir));
+        Assert.Contains("Apps</th>", html);
+        Assert.DoesNotContain("<b>calculator</b>", html);
+        Assert.Contains("&lt;b&gt;calculator&lt;/b&gt;", html);
+    }
+
+    [Fact]
     public void ComputeSignature_Is_Stable_And_Truncates()
     {
         string a = ErrorLog.ComputeSignature("Ex", "T.M", "line");

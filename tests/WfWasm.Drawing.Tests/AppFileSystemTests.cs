@@ -104,6 +104,35 @@ public sealed class AppFileSystemTests
     }
 
     [Fact]
+    public void Exists_Sees_Decoded_Pixels_By_Tail()
+    {
+        // Diagram BitmapNode guards on AppFileSystem.Exists (rewriter
+        // redirect of File.Exists): browser-decoded PNG registers
+        // decoded-only and loads fine through new Bitmap(path), but never
+        // touches s_files. Exists must answer true for the dev-layout
+        // relative path or the node throws FileNotFound even though the
+        // pixels are registered.
+        const string devPath = @"..\..\..\..\..\..\..\common\Images\Diagram\OrgChart Layout\image3.png";
+        try
+        {
+            byte[] px = new byte[] { 255, 0, 0, 255 };
+            WfVfs.RegisterDecoded("image3.png", 1, 1, px);
+            Assert.True(WfVfs.TryGetDecoded(devPath, out _));
+            Assert.True(WfVfs.Exists("image3.png"));
+            Assert.True(WfVfs.Exists(devPath));
+            using var bmp = new WfBitmap(devPath);
+            Assert.Equal(1, bmp.Width);
+            var c = bmp.GetPixel(0, 0);
+            Assert.Equal(255, c.A);
+            Assert.Equal(255, c.R);
+        }
+        finally
+        {
+            WfVfs.Clear();
+        }
+    }
+
+    [Fact]
     public void Raw_Non_Png_Bytes_Throw_Actionable()
     {
         // Registered-but-undecoded JPEG is a bootstrap bug, not a missing
@@ -301,6 +330,48 @@ public sealed class AppFileSystemTests
         finally
         {
             WfVfs.Clear();
+        }
+    }
+
+    [Fact]
+    public void ReadAllText_Serves_Vfs_With_Backslash_Spelling()
+    {
+        // ERP.Repository.LoadData Exists-checks then ReadAllTexts
+        // GetFullPath(dir) + "\X.json": the backslash Concat must hit
+        // the registry. Regression: Purchases grid silently empty
+        // (Exists was never rewritten for the data-only DLL, and
+        // ReadAllText had no redirect at all).
+        try
+        {
+            WfVfs.Register("Data/Widget.json", System.Text.Encoding.UTF8.GetBytes("{\"a\":1}"));
+            Assert.Equal("{\"a\":1}", WfVfs.ReadAllText("/Data\\Widget.json"));
+            Assert.Equal("{\"a\":1}", WfVfs.ReadAllText("C:\\dev\\ERP\\bin\\..\\Data\\Widget.json"));
+            byte[] latin = new byte[] { 0x63, 0x61, 0x66, 0xE9 };
+            WfVfs.Register("Data/Latin.txt", latin);
+            Assert.Equal("café", WfVfs.ReadAllText("Data/Latin.txt", System.Text.Encoding.Latin1));
+        }
+        finally
+        {
+            WfVfs.Clear();
+        }
+    }
+
+    [Fact]
+    public void ReadAllText_Miss_Matches_Bcl_Semantics()
+    {
+        string temp = Path.Combine(Path.GetTempPath(), $"vfsrt_{Guid.NewGuid()}.txt");
+        try
+        {
+            File.WriteAllText(temp, "disk-bytes");
+            Assert.Equal("disk-bytes", WfVfs.ReadAllText(temp));
+            Assert.Throws<System.IO.FileNotFoundException>(() =>
+                WfVfs.ReadAllText(Path.Combine(Path.GetTempPath(), $"vfsno_{Guid.NewGuid()}.txt")));
+            Assert.Throws<System.ArgumentNullException>(() => WfVfs.ReadAllText(null));
+        }
+        finally
+        {
+            WfVfs.Clear();
+            try { File.Delete(temp); } catch { }
         }
     }
 

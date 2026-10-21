@@ -19,6 +19,13 @@
     const flush = () => { for (const e of observer.takeRecords()) resource(e); };
     function update() {
         const s = selection;
+        window.wfwasmRuntime?.send('metrics', {metrics: {
+            bootMs: boot ?? performance.now(),
+            loadMs: s ? (s.end ?? performance.now()) - s.start : 0,
+            bytes: s?.bytes ?? 0, wireBytes: totals.wire,
+            httpCacheHits: totals.cached, memoryReuse: s?.reused ?? 0, requests: totals.files
+        }});
+        if (s) window.wfwasmRuntime?.send('phase', {phase:s.phase});
         put("metric-boot", boot === null ? time(performance.now()) : time(boot));
         if (boot !== null) put("metric-boot-detail", mb(bootBytes) + " runtime & shell");
         if (!s) {
@@ -51,8 +58,8 @@
     p.phase = value => { if(selection) selection.phase = value; update(); };
     p.asset = (bytes, reused) => { if(selection) { selection.bytes += bytes; selection.files++; if(reused) selection.reused++; } update(); };
     p.demandAsset = bytes => { if(selection && selection.end !== null) selection.measured = null; p.asset(bytes, false); };
-    p.ready = () => { flush(); if(selection && selection.end === null) { selection.end = performance.now(); selection.measured = {...totals}; selection.phase = "First frame rendered"; } update(); clearInterval(timer); };
-    p.failed = () => { flush(); if(selection) { selection.end = performance.now(); selection.measured = {...totals}; selection.phase = "Load failed"; } update(); clearInterval(timer); };
+    p.ready = () => { flush(); if(selection && selection.end === null) { selection.end = performance.now(); selection.measured = {...totals}; selection.phase = "First frame rendered"; } update(); clearInterval(timer); window.wfwasmRuntime?.send('ready'); };
+    p.failed = message => { flush(); if(selection) { selection.end = performance.now(); selection.measured = {...totals}; selection.phase = "Load failed"; } update(); clearInterval(timer); window.wfwasmRuntime?.fail(message || 'App load failed'); };
     p.refresh = update;
     p.reload = () => location.reload();
     p.toggleReferenceSize = () => document.querySelector(".reference-frame")?.classList.toggle("actual");
@@ -86,4 +93,26 @@ window.wfwasmFetchAssembly = function (app, name) {
     for (let i = 0; i < text.length; i++) packet[32 + i] = text.charCodeAt(i) & 255;
     window.preview.demandAsset(text.length);
     return packet;
+};
+
+window.wfwasmPrefetch = function (app, names) {
+    // Parallel async warm of the exact appresolve URLs the sync demand
+    // hook (wfwasmFetchAssembly) will hit: same URL means the same
+    // browser-cache entry, so each fault becomes a cache hit instead of
+    // a transform + download stall. Failures are swallowed; the demand
+    // hook stays the fallback. Returns immediately (fire-and-forget).
+    try {
+        if (!Array.isArray(names) || !names.length) return;
+        let i = 0;
+        const lanes = Math.min(6, names.length);
+        const pump = () => {
+            if (i >= names.length) return;
+            const name = names[i++];
+            fetch("/api/appresolve?app=" + encodeURIComponent(app) + "&name=" + encodeURIComponent(name))
+                .then(r => { if (!r.ok) throw 0; return r.arrayBuffer(); })
+                .then(() => pump())
+                .catch(() => pump());
+        };
+        for (let k = 0; k < lanes; k++) pump();
+    } catch (e) { /* demand hook covers */ }
 };

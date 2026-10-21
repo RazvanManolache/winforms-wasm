@@ -10,6 +10,7 @@
 @inject HttpClient Http
 @inject NavigationManager Nav
 @implements IDisposable
+@implements IAsyncDisposable
 
 <PageTitle>@State.CurrentEntry.Label · App Studio</PageTitle>
 
@@ -23,13 +24,24 @@
         @onmouseup="OnMouseUp"
         @onmousemove="OnMouseMove"
         @onkeydown="OnKeyDown"
+        @onkeydown:preventDefault
+        @onkeyup="OnKeyUp"
         @oncontextmenu="OnContextMenu"
-        @oncontextmenu:preventDefault></canvas>
+        @oncontextmenu:preventDefault
+        @onwheel="OnWheel"
+        @onwheel:preventDefault></canvas>
 @if (_loading || _loadError is not null)
 {
     <div class="stage-overlay @(_loadError is null ? "" : "error")" role="status">
         @if (_loadError is null) { <div class="spinner"></div><h2>Opening @State.CurrentEntry.Label.Replace("Telerik: ", "")</h2><p id="load-stage-message">Preparing app resources…</p> }
         else { <h2>The app could not load</h2><p>@_loadError</p><button class="subtle-button" @onclick="LoadSelectionAsync">Try again</button> }
+    </div>
+}
+@if (_unknownSlug is not null)
+{
+    <div class="stage-overlay error" role="alert">
+        <h2>Unknown app</h2>
+        <p>No app is registered under &lsquo;@_unknownSlug&rsquo;. Pick one from your library instead.</p>
     </div>
 }
 </div>
@@ -43,8 +55,10 @@
     private bool _loading = true;
     private bool _disposed;
     private string? _loadError;
+    private string? _unknownSlug;
     private readonly SemaphoreSlim _selectionGate = new(1, 1);
     private bool _canvasReady;
+    private string? _reportApp, _reportLabel, _reportSession;
 
     [Parameter]
     public string? SceneSlug { get; set; }
@@ -72,6 +86,17 @@
         State.Changed += OnSceneChanged;
         EnsureRepaintSubscription();
         SelectFromSlug();
+        // A runtime belongs to one selection. Capture identity before loading
+        // or first-chance hooks can report, never consult the outer menu later.
+        _reportApp = SceneState.ToSlug(State.Current);
+        _reportLabel = State.CurrentEntry.Label;
+        string? session = new Uri(Nav.Uri).Query.TrimStart('?').Split('&')
+            .FirstOrDefault(part => part.StartsWith("session=", StringComparison.Ordinal));
+        _reportSession = session is null ? Guid.NewGuid().ToString() : Uri.UnescapeDataString(session[8..]);
+        BrowserErrorReporter.Initialize(Http);
+        BrowserErrorReporter.AppProvider = () => _reportApp;
+        BrowserErrorReporter.AppLabelProvider = () => _reportLabel;
+        BrowserErrorReporter.SessionProvider = () => _reportSession;
     }
 
     protected override void OnParametersSet()
@@ -82,7 +107,19 @@
 
     private void SelectFromSlug()
     {
-        if (SceneState.TryParseSlug(SceneSlug, out var scene) && scene != State.Current)
+        _unknownSlug = null;
+        if (string.IsNullOrWhiteSpace(SceneSlug))
+            return;
+        if (!SceneState.TryParseSlug(SceneSlug, out var scene))
+        {
+            // Explicit unknown-app state: never silently serve the
+            // default app under a wrong URL.
+            _unknownSlug = SceneSlug;
+            _loading = false;
+            _needsRender = true;
+            return;
+        }
+        if (scene != State.Current)
             State.Select(scene);
     }
 
@@ -129,6 +166,8 @@
             if (_disposed || scene != State.Current) return;
             await JS.InvokeVoidAsync("preview.phase", "Creating app window");
             RefreshHost();
+            if (SyncfusionDemos.Find(scene) is { } demo && !_winFormsHost.HasScene(scene))
+                throw new InvalidOperationException($"Syncfusion {demo.Label} could not create its window. See App errors for the compatibility failure.");
             await RepaintAsync();
             await JS.InvokeVoidAsync("preview.ready");
         }
@@ -136,7 +175,8 @@
         {
             _hostScene = null;
             _loadError = ex.GetBaseException().Message.Split('\n')[0];
-            await JS.InvokeVoidAsync("preview.failed");
+            BrowserErrorReporter.Report("app-load", ex);
+            await JS.InvokeVoidAsync("preview.failed", _loadError);
             Console.WriteLine($"[Home.razor] On-demand load failed: {ex.GetType().Name}: {ex.Message.Split('\n')[0]}");
         }
         finally
@@ -165,12 +205,21 @@
             Nav.NavigateTo(expected);
     }
 
+    public async ValueTask DisposeAsync()
+    {
+        // Release the canvas ResizeObserver BEFORE disposing _self: any
+        // resize after dispose would invoke the dead .NET ref (unhandled
+        // "no tracked object" rejection). Sync Dispose stays as backup.
+        try { await JS.InvokeVoidAsync("wfwasm.releaseCanvas", "wfcanvas"); } catch { }
+        Dispose();
+    }
+
     public void Dispose()
     {
         _disposed = true;
         State.Changed -= OnSceneChanged;
         System.Windows.Forms.WasmRepaintGate.RepaintRequested -= RequestPaint;
-        _self?.Dispose();
+        _self?.Dispose(); // backup: the async path releases JS first, then lands here
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -182,6 +231,13 @@
             BrowserErrorReporter.InputContextProvider = () => _winFormsHost.RecentInputContext();
             await JS.InvokeVoidAsync("wfwasm.fitCanvas", "wfcanvas", _self);
             await JS.InvokeVoidAsync("wfwasm.installErrorReporting");
+            if (AppContext.TryGetSwitch("WfWasm.PerfTimeline", out bool perfOn) && perfOn)
+                PerfTimeline.Enabled = true;
+                System.Windows.Forms.WasmFrameCounters.PerfEnabled = true;
+                global::System.Drawing.TextRasterCounters.PerfEnabled = true;
+        System.Windows.Forms.WasmFrameCounters.PerfEnabled = true;
+        WinFormsAppHost.HookFirstChance();
+        global::System.Drawing.TextRasterCounters.PerfEnabled = true;
             _canvasReady = true;
             await LoadSelectionAsync();
         }
@@ -189,8 +245,41 @@
     }
 
     [JSInvokable]
+    public Task PerfEnable()
+    {
+        // Probe-driven gate (the shell iframe does not forward outer
+        // query params, so ?perf=1 cannot reach the app).
+        PerfTimeline.Enabled = true;
+        System.Windows.Forms.WasmFrameCounters.PerfEnabled = true;
+        global::System.Drawing.TextRasterCounters.PerfEnabled = true;
+        WinFormsAppHost.HookFirstChance();
+        return Task.CompletedTask;
+    }
+
+    [JSInvokable]
+    public string PerfDumpJson() => PerfTimeline.DumpJson();
+
+    [JSInvokable]
+    public Task<string> GpuProbeScenario(string canvasId, string scenario)
+    {
+        // Hardware scenario asserts (alpha/compose/clip/move) for the
+        // regression agent's drivers. Production painting untouched.
+        return GpuProbeDriver.RunScenarioAsync(canvasId, scenario);
+    }
+
+    [JSInvokable]
+    public Task<string> GpuProbeRun(string canvasId)
+    {
+        // Explicit GPU probe (playwright driver creates the canvas, then
+        // calls _dotNet.invokeMethodAsync('GpuProbeRun', id)). Real device
+        // over the real WebGL2 binding; production painting untouched.
+        return GpuProbeDriver.RunAsync(canvasId);
+    }
+
+    [JSInvokable]
     public Task OnCanvasResized(int width, int height)
     {
+        if (_disposed) return Task.CompletedTask;
         _winFormsHost.ViewWidth = Math.Max(1, width);
         _winFormsHost.ViewHeight = Math.Max(1, height);
         if (_hostScene is not null) WinFormsExecution.Run(_winFormsHost.OnViewportChanged);
@@ -198,15 +287,219 @@
         return Task.CompletedTask;
     }
 
+    // Paint-failure attribution: disposal, scene switches and cancellations
+    // are stale work and stay silent. Strict-mode rejections are contract
+    // failures the caller or shell must observe (a failed first paint must
+    // never publish ready); transient CPU-path faults keep the
+    // sampled-and-continue behavior.
+    private bool IsStalePaint() => _disposed || _hostScene != State.Current;
+    private static bool IsStrictRendering() =>
+        System.AppContext.TryGetSwitch("WfWasm.RequireGpuRendering", out bool strict) && strict;
+    private static bool IsBenignPaintFailure(System.Exception ex) =>
+        ex is System.OperationCanceledException
+            or System.ObjectDisposedException
+            or Microsoft.JSInterop.JSDisconnectedException;
+    // Runs one paint, capturing (never throwing) its fault; the caller
+    // rethrows real strict-mode failures after the sampling catch below.
+    private System.Exception? RunPaintCapturingFaults(RecordingRenderer recorder)
+    {
+        try
+        {
+            WinFormsExecution.Run(() => _winFormsHost.Paint(recorder));
+            return null;
+        }
+        catch (System.Exception ex)
+        {
+            return ex;
+        }
+    }
+    // Fire-and-forget pump reporting: strict-mode frame failures reach the
+    // shell instead of vanishing; always handles so the pump never faults.
+    private bool NotePaintFailure(System.Exception ex)
+    {
+        if (!IsStalePaint() && !IsBenignPaintFailure(ex) && IsStrictRendering())
+        {
+            try { _ = JS.InvokeVoidAsync("preview.failed", ex.GetBaseException().Message.Split('\n')[0]); }
+            catch { }
+        }
+        return true;
+    }
+
     private async Task RepaintAsync()
     {
         if (_disposed || _hostScene != State.Current) return;
         var recorder = new RecordingRenderer();
-        WinFormsExecution.Run(() => _winFormsHost.Paint(recorder));
+        bool perf = PerfTimeline.Enabled;
+        long tPaint0 = perf ? PerfTimeline.Stamp() : 0;
+        System.Exception? paintFault = null;
+        try
+        {
+            paintFault = RunPaintCapturingFaults(recorder);
+        }
+        catch
+        {
+            // H-4: a faulted frame still writes its sample; without
+            // this, frames dying in the pump swallow vanish from stats.
+            if (perf)
+                PerfTimeline.RecordFrame(PerfFrameSample(1, recorder.Commands.Count,
+                    PerfTimeline.Stamp() - tPaint0, 0, 0, 0));
+            return;
+        }
+        if (paintFault is not null && IsStrictRendering() && !IsStalePaint() && !IsBenignPaintFailure(paintFault))
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(paintFault).Throw();
+        long recordTicks = perf ? PerfTimeline.Stamp() - tPaint0 : 0;
         // Idle frames emit nothing (dirty gate): skip the interop round trip.
         if (recorder.Commands.Count == 0)
+        {
+            if (perf)
+                PerfTimeline.RecordFrame(PerfFrameSample(0, 0, recordTicks, 0, 0, 0));
             return;
-        await CanvasBridge.PaintAsync(JS, "wfcanvas", recorder.Commands);
+        }
+        if (perf)
+        {
+            long tInv0 = PerfTimeline.Stamp();
+            var (result, upTicks, serTicks) = await CanvasBridge.PaintAsyncTimed(
+                JS, "wfcanvas", recorder.Commands,
+                System.Windows.Forms.WasmFrameCounters.FrameSeq);
+            _ = result;
+            PerfTimeline.RecordFrame(PerfFrameSample(0, recorder.Commands.Count,
+                recordTicks, upTicks, serTicks, PerfTimeline.Stamp() - tInv0));
+        }
+        else
+        {
+            await CanvasBridge.PaintAsync(JS, "wfcanvas", recorder.Commands);
+        }
+    }
+
+    // Perf item 4 frame-sample assembly (H-3): reads the fork counters
+    // the host filled during Paint plus the upload/serialize
+    // accumulators, and drains the latter for the next frame.
+    private PerfTimeline.FrameSample PerfFrameSample(
+        int fault, int nCmd, long recordTicks, long uploadTicks,
+        long serializeTicks, long invokeTicks)
+    {
+        PerfTimeline.TakeUploadSerialize(
+            out long upBytes, out int upCount, out long jsonChars,
+            out long op7, out long b64);
+        int cls = nCmd == 0 ? PerfTimeline.ClassEmpty
+            : System.Windows.Forms.WasmFrameCounters.FrameGlobal != 0 ? PerfTimeline.ClassGlobal
+            : System.Windows.Forms.WasmFrameCounters.NRasterRegion > 0 ? PerfTimeline.ClassRegion
+            : System.Windows.Forms.WasmFrameCounters.NRasterFull > 0 ? PerfTimeline.ClassFull
+            : PerfTimeline.ClassBlitOnly;
+        int flags = (System.Windows.Forms.WasmFrameCounters.CsFrom != 0 || System.Windows.Forms.WasmFrameCounters.CsTo != 0) ? PerfTimeline.FlagHasInput : 0;
+        // Drawing-side raster traffic drains here (Take resets): both
+        // drain-time and paint-time raster calls land in this frame.
+        var raster = global::System.Drawing.TextRasterCounters.Take();
+        global::System.Drawing.TextRasterCounters.TakeBigFills(out long bigN, out long bigPx, out string? bigCaller, out int bigArgb);
+        WinFormsAppHost.TakeSlow(out long slowTicks, out string? slowType, out long slowDraws, out long slowPx);
+        // Marker census drain (Take resets): top sampled marker + total.
+        var markCensus = System.Windows.Forms.WasmRepaintGate.TakeMarkCaller();
+        string? markTop = null;
+        long markTopN = 0, markN = 0;
+        foreach (var kv in markCensus)
+        {
+            markN += kv.Value;
+            if (markTop is null || kv.Value > markTopN) { markTop = kv.Key; markTopN = kv.Value; }
+        }
+        string? markCaller = markTop is null ? null : markTop + " x" + markTopN;
+        string? firstMarkCaller = System.Windows.Forms.WasmRepaintGate.TakeFirstMarkCaller();
+        return new PerfTimeline.FrameSample
+        {
+            Seq = System.Windows.Forms.WasmFrameCounters.FrameSeq,
+            SceneEpoch = System.Windows.Forms.WasmFrameCounters.SceneEpoch,
+            CsFrom = System.Windows.Forms.WasmFrameCounters.CsFrom,
+            CsTo = System.Windows.Forms.WasmFrameCounters.CsTo,
+            Class = cls,
+            Flags = flags,
+            NCmd = nCmd,
+            NUploads = upCount,
+            NRasterFull = System.Windows.Forms.WasmFrameCounters.NRasterFull,
+            NRasterRegion = System.Windows.Forms.WasmFrameCounters.NRasterRegion,
+            NBlit = System.Windows.Forms.WasmFrameCounters.NBlitClean,
+            RasterPx = System.Windows.Forms.WasmFrameCounters.RasterPx,
+            UploadBytes = upBytes,
+            JsonChars = jsonChars,
+            Op7 = op7,
+            Base64Chars = b64,
+            RecordTicks = recordTicks,
+            DrainTicks = System.Windows.Forms.WasmFrameCounters.DrainTicks,
+            OnPaintTicks = System.Windows.Forms.WasmFrameCounters.OnPaintTicks,
+            TextMeasureCalls = System.Windows.Forms.WasmFrameCounters.OpenTextMeasureCalls,
+            TextMeasureChars = System.Windows.Forms.WasmFrameCounters.OpenTextMeasureChars,
+            TextMeasureFallbacks = System.Windows.Forms.WasmFrameCounters.OpenTextMeasureFallbacks,
+            EnsureLayoutTicks = System.Windows.Forms.WasmFrameCounters.EnsureLayoutTicks,
+            DrawCalls = raster.DrawCalls,
+            DrawChars = raster.DrawChars,
+            RasterCalls = raster.RasterCalls,
+            RasterHits = raster.RasterHits,
+            RasterMisses = raster.RasterMisses,
+            MeasureWidthCalls = raster.MeasureWidthCalls,
+            PaintInvokeTicks = System.Windows.Forms.WasmFrameCounters.PaintInvokeTicks,
+            ExtractTicks = System.Windows.Forms.WasmFrameCounters.ExtractTicks,
+            HashTicks = System.Windows.Forms.WasmFrameCounters.HashTicks,
+            StoreTicks = System.Windows.Forms.WasmFrameCounters.StoreTicks,
+            DrawPx = raster.DrawPx,
+            BgInvokeTicks = System.Windows.Forms.WasmFrameCounters.BgInvokeTicks,
+            DrawTicks = raster.DrawTicks,
+            FirstChanceExceptions = WinFormsAppHost.TakeFirstChance(),
+            SlowLayerTicks = slowTicks,
+            SlowLayerType = slowType,
+            SlowLayerDraws = slowDraws,
+            SlowLayerPx = slowPx,
+            FillCalls = raster.FillCalls,
+            FillPx = raster.FillPx,
+            ImageCalls = raster.ImageCalls,
+            ImagePx = raster.ImagePx,
+            LineCalls = raster.LineCalls,
+            GcGen0 = System.GC.CollectionCount(0),
+            GcGen1 = System.GC.CollectionCount(1),
+            GcGen2 = System.GC.CollectionCount(2),
+            MemBytes = (long)System.GC.GetTotalMemory(false),
+            BigFillCount = bigN,
+            BigFillPx = bigPx,
+            BigFillCaller = bigCaller,
+            BigFillArgb = bigArgb,
+            LastClearArgb = global::System.Drawing.TextRasterCounters.LastClearArgb,
+            PostCaller = System.Windows.Forms.WasmLayoutQueue.TakePostCaller(),
+            MarkCaller = markCaller,
+            MarkSamples = markN,
+            FirstMarkCaller = firstMarkCaller,
+            LayerHashHit = System.Windows.Forms.WasmFrameCounters.NLayerHashHit,
+            LayerHashMiss = System.Windows.Forms.WasmFrameCounters.NLayerHashMiss,
+            BytesExtracted = System.Windows.Forms.WasmFrameCounters.BytesExtracted,
+            BytesHashed = System.Windows.Forms.WasmFrameCounters.BytesHashed,
+            BytesCloned = System.Windows.Forms.WasmFrameCounters.BytesCloned,
+            MarksGlobal = System.Windows.Forms.WasmFrameCounters.OpenMarksGlobal,
+            MarksControl = System.Windows.Forms.WasmFrameCounters.OpenMarksControl,
+            FirstMarkType = System.Windows.Forms.WasmFrameCounters.OpenFirstMarkType,
+            FirstMarkW = System.Windows.Forms.WasmFrameCounters.OpenFirstMarkW,
+            FirstMarkH = System.Windows.Forms.WasmFrameCounters.OpenFirstMarkH,
+            UploadTicks = uploadTicks,
+            SerializeTicks = serializeTicks,
+            InvokeTicks = invokeTicks,
+            Fault = fault,
+        };
+    }
+
+    // Perf item 4 input-sample writer (H-1/H-2): claims one fork input
+    // seq (shared with the host drain snapshot) and stores dispatch
+    // duration. Call sites guard Enabled before stamping.
+    private void PerfInput(int kind, int x, int y, int keyHash, double anchorIn, long sw0)
+    {
+        int seq = System.Windows.Forms.WasmFrameCounters.ClaimInput();
+        System.Windows.Forms.WasmFrameCounters.NotePending(seq);
+        PerfTimeline.RecordInput(new PerfTimeline.InputSample
+        {
+            Seq = seq,
+            Kind = kind,
+            JsSeq = 0,
+            TEvent = 0,
+            X = x,
+            Y = y,
+            KeyHash = keyHash,
+            AnchorIn = anchorIn,
+            DispatchTicks = PerfTimeline.Stamp() - sw0,
+        });
     }
 
     // Invalidation-driven repaint: headless Control.Invalidate is routed by
@@ -226,6 +519,9 @@
     private readonly object _moveGate = new();
     private int _pendingMoveX;
     private int _pendingMoveY;
+    private bool _pendingShift;
+    private bool _pendingCtrl;
+    private bool _pendingAlt;
     private bool _movePending;
 
     private void EnsureRepaintSubscription()
@@ -276,7 +572,7 @@
             {
                 await RepaintAsync().ConfigureAwait(false);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (NotePaintFailure(ex))
             {
             }
 
@@ -295,44 +591,41 @@
         }
     }
 
-    private static System.Windows.Forms.MouseButtons ToButtons(long button) => button switch
-    {
-        1 => System.Windows.Forms.MouseButtons.Middle,
-        2 => System.Windows.Forms.MouseButtons.Right,
-        _ => System.Windows.Forms.MouseButtons.Left,
-    };
-
     private Task OnMouseDown(Microsoft.AspNetCore.Components.Web.MouseEventArgs e)
     {
+        bool perfIn = PerfTimeline.Enabled;
+        double anchorIn = perfIn ? PerfTimeline.NowAnchor() : 0;
+        long swIn = PerfTimeline.Stamp();
         try
         {
             int x = (int)e.OffsetX;
             int y = (int)e.OffsetY;
-            var buttons = ToButtons(e.Button);
+            var buttons = WinFormsAppHost.MapDomButton(e.Button);
             FlushPendingMove();
-            WinFormsExecution.Run(() =>
-            {
-                _winFormsHost.OnMouseDown(x, y, buttons);
-                // Click activation is left-button only, matching WinForms.
-                if (buttons == System.Windows.Forms.MouseButtons.Left)
-                    _winFormsHost.OnClick(x, y);
-            });
+            // Press only: Click/DoubleClick pair on release inside the host.
+            WinFormsExecution.Run(() => _winFormsHost.OnMouseDown(x, y, buttons, e.ShiftKey, e.CtrlKey, e.AltKey));
+            if (perfIn) PerfInput(PerfTimeline.KindDown, x, y, 0, anchorIn, swIn);
             RequestPaint();
             return Task.CompletedTask;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Home.razor] OnMouseDown error: {ex}");
+            if (perfIn) PerfInput(PerfTimeline.KindDown, (int)e.OffsetX, (int)e.OffsetY, 0, anchorIn, swIn);
+            Console.WriteLine($"[Home.razor] OnMouseDown error: {ex.GetType().Name}: {ex.Message.Split('\n')[0]}");
             return Task.CompletedTask;
         }
     }
 
     private Task OnMouseUp(Microsoft.AspNetCore.Components.Web.MouseEventArgs e)
     {
+        bool perfIn = PerfTimeline.Enabled;
+        double anchorIn = perfIn ? PerfTimeline.NowAnchor() : 0;
+        long swIn = PerfTimeline.Stamp();
         int x = (int)e.OffsetX;
         int y = (int)e.OffsetY;
         FlushPendingMove();
-        WinFormsExecution.Run(() => _winFormsHost.OnMouseUp(x, y, ToButtons(e.Button)));
+        WinFormsExecution.Run(() => _winFormsHost.OnMouseUp(x, y, WinFormsAppHost.MapDomButton(e.Button), e.ShiftKey, e.CtrlKey, e.AltKey));
+        if (perfIn) PerfInput(PerfTimeline.KindUp, x, y, 0, anchorIn, swIn);
         RequestPaint();
         return Task.CompletedTask;
     }
@@ -345,6 +638,9 @@
         {
             _pendingMoveX = x;
             _pendingMoveY = y;
+            _pendingShift = e.ShiftKey;
+            _pendingCtrl = e.CtrlKey;
+            _pendingAlt = e.AltKey;
             _movePending = true;
         }
 
@@ -357,24 +653,106 @@
     private bool FlushPendingMove()
     {
         int x, y;
+        bool shift, ctrl, alt;
         lock (_moveGate)
         {
             if (!_movePending)
                 return false;
             x = _pendingMoveX;
             y = _pendingMoveY;
+            shift = _pendingShift;
+            ctrl = _pendingCtrl;
+            alt = _pendingAlt;
             _movePending = false;
         }
 
-        WinFormsExecution.Run(() => _winFormsHost.OnMouseMove(x, y));
+        long swMove = PerfTimeline.Enabled ? PerfTimeline.Stamp() : 0;
+        WinFormsExecution.Run(() => _winFormsHost.OnMouseMove(x, y, shift, ctrl, alt));
+        if (PerfTimeline.Enabled)
+        {
+            // Rule M: join the flushed dispatch to the latest raw
+            // move stamp captured by the native listener.
+            int jsSeq = 0;
+            double tEvent = 0;
+            try
+            {
+                double[]? slot = CanvasBridge.PerfMoveSlot();
+                if (slot != null && slot.Length >= 5) { jsSeq = (int)slot[0]; tEvent = slot[1]; }
+            }
+            catch { }
+            int seq = System.Windows.Forms.WasmFrameCounters.ClaimInput();
+            System.Windows.Forms.WasmFrameCounters.NotePending(seq);
+            PerfTimeline.RecordInput(new PerfTimeline.InputSample
+            {
+                Seq = seq,
+                Kind = PerfTimeline.KindMove,
+                JsSeq = jsSeq,
+                TEvent = tEvent,
+                X = x,
+                Y = y,
+                KeyHash = 0,
+                AnchorIn = 0,
+                DispatchTicks = PerfTimeline.Stamp() - swMove,
+            });
+        }
         return true;
+    }
+
+    private Task OnWheel(WheelEventArgs e)
+    {
+        bool perfIn = PerfTimeline.Enabled;
+        double anchorIn = perfIn ? PerfTimeline.NowAnchor() : 0;
+        long swIn = PerfTimeline.Stamp();
+        int x = (int)e.OffsetX;
+        int y = (int)e.OffsetY;
+        FlushPendingMove();
+        WinFormsExecution.Run(() => _winFormsHost.OnMouseWheelRaw(x, y, e.DeltaX, e.DeltaY, (int)e.DeltaMode, e.ShiftKey, e.CtrlKey, e.AltKey));
+        if (perfIn) PerfInput(PerfTimeline.KindWheel, x, y, 0, anchorIn, swIn);
+        RequestPaint();
+        return Task.CompletedTask;
     }
 
     private Task OnKeyDown(KeyboardEventArgs e)
     {
-        WinFormsExecution.Run(() => _winFormsHost.OnKeyDown(e.Key));
+        bool perfIn = PerfTimeline.Enabled;
+        double anchorIn = perfIn ? PerfTimeline.NowAnchor() : 0;
+        long swIn = PerfTimeline.Stamp();
+        try
+        {
+            WinFormsExecution.Run(() => _winFormsHost.OnKeyDown(e.Key, e.ShiftKey, e.CtrlKey, e.AltKey));
+        }
+        catch (Exception ex)
+        {
+            // A key-handler fault must never kill the Blazor session
+            // (Escape on an open dropdown did exactly that via
+            // CloseOpenDropdowns): report and keep the app alive.
+            System.Console.WriteLine("[Home] OnKeyDown error: " + ex.GetType().Name + ": " + ex.Message.Split('\n')[0]);
+            try { WfWasm.CanvasHost.BrowserErrorReporter.Report("key-down", ex); } catch { }
+        }
+        if (perfIn) PerfInput(PerfTimeline.KindKeyDown, 0, 0, PerfKeyHash(e), anchorIn, swIn);
         RequestPaint();
         return Task.CompletedTask;
+    }
+
+    private Task OnKeyUp(KeyboardEventArgs e)
+    {
+        bool perfIn = PerfTimeline.Enabled;
+        double anchorIn = perfIn ? PerfTimeline.NowAnchor() : 0;
+        long swIn = PerfTimeline.Stamp();
+        WinFormsExecution.Run(() => _winFormsHost.OnKeyUp(e.Key, e.ShiftKey, e.CtrlKey, e.AltKey));
+        if (perfIn) PerfInput(PerfTimeline.KindKeyUp, 0, 0, PerfKeyHash(e), anchorIn, swIn);
+        RequestPaint();
+        return Task.CompletedTask;
+    }
+
+    // Perf item 4 packed key identity (no strings in the ring).
+    private static int PerfKeyHash(KeyboardEventArgs e)
+    {
+        int h = (e.Key != null && e.Key.Length > 0 ? ((e.Key.Length << 16) | e.Key[0]) : 0);
+        if (e.ShiftKey) h |= 1 << 24;
+        if (e.CtrlKey) h |= 1 << 25;
+        if (e.AltKey) h |= 1 << 26;
+        return h;
     }
 
     private void OnContextMenu()

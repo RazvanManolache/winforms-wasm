@@ -17,6 +17,7 @@ public static class WasmRegistry
     public static RegistryKey? OpenSubKey(RegistryKey? key, string name) => null;
     public static RegistryKey? OpenSubKey(RegistryKey? key, string name, bool writable) => null;
     public static RegistryKey? OpenSubKey(RegistryKey? key, string name, RegistryKeyPermissionCheck permissionCheck) => null;
+    public static RegistryKey? OpenSubKey(RegistryKey? key, string name, RegistryKeyPermissionCheck permissionCheck, System.Security.AccessControl.RegistryRights rights) => null;
     public static object? GetValue(RegistryKey? key, string? name) => null;
     public static object? GetValue(RegistryKey? key, string? name, object? defaultValue) => defaultValue;
     public static object? GetValue(RegistryKey? key, string? name, object? defaultValue, RegistryValueOptions options) => defaultValue;
@@ -27,6 +28,8 @@ public static class WasmRegistry
     public static void SetValue(string keyName, string? valueName, object value, RegistryValueKind kind) { }
     public static RegistryKey? CreateSubKey(RegistryKey? key, string subkey) => null;
     public static RegistryKey? CreateSubKey(RegistryKey? key, string subkey, RegistryKeyPermissionCheck permissionCheck, RegistryOptions options) => null;
+    public static RegistryKey? CreateSubKey(RegistryKey? key, string subkey, bool writable, RegistryOptions options) => null;
+    public static RegistryKey? CreateSubKey(RegistryKey? key, string subkey, RegistryKeyPermissionCheck permissionCheck, System.Security.AccessControl.RegistrySecurity security) => null;
     public static void Close(RegistryKey? key) { }
     public static void Dispose(RegistryKey? key) { }
     public static void Flush(RegistryKey? key) { }

@@ -21,3 +21,14 @@ telerik/
 appsettings.*.json
 !appsettings.example.json
 *.zip
+
+# Source-only distribution: generated/runtime binaries and test artifacts
+*.dll
+*.exe
+*.pdb
+*.wasm
+*.nupkg
+*.trx
+__pycache__/
+*.pyc
+src/WfWasm.CanvasHost/wwwroot/eval/latest.json

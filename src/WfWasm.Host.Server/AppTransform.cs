@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Reflection;
 using WfWasm.Rewrite;
 
 namespace WfWasm.Host.Server;
@@ -11,6 +12,107 @@ namespace WfWasm.Host.Server;
 // bytes without re-running the rewriter.
 public static class AppTransform
 {
+    private static readonly string Root = FindRoot();
+    private static string FindRoot()
+    {
+        string? configured = Environment.GetEnvironmentVariable("WFWASM_ROOT");
+        if (!string.IsNullOrWhiteSpace(configured)) return Path.GetFullPath(configured);
+        for (var d = new DirectoryInfo(AppContext.BaseDirectory); d is not null; d = d.Parent)
+            if (File.Exists(Path.Combine(d.FullName, "WfWasm.sln"))) return d.FullName;
+        throw new InvalidOperationException("Set WFWASM_ROOT to the repository directory.");
+    }
+    private static string Repo(string relative) => Path.Combine(Root, relative.Replace('\\', Path.DirectorySeparatorChar));
+    private static string Setting(string variable, string fallback) =>
+        Environment.GetEnvironmentVariable(variable) ?? Repo(fallback);
+
+    // Syncfusion grids implement UI Automation providers: Grid.Windows
+    // references UIAutomationProvider v9 at load, and without it the Mono
+    // interpreter FailFasts in mint_type (transform.c:347) right after the
+    // form constructs (grid-cells/grouping/pivot/skin-manager). Served
+    // pristine from the v9 desktop pack like the Telerik UIA set: types
+    // resolve, and nothing headless ever invokes the native backend.
+    private static string UiaDesktopFile(string name)
+    {
+        try
+        {
+            string pack = @"C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App";
+            if (Directory.Exists(pack))
+            {
+                string? best = null;
+                foreach (string dir in Directory.EnumerateDirectories(pack, "9.*"))
+                    if (best is null || string.Compare(Path.GetFileName(dir), Path.GetFileName(best), StringComparison.OrdinalIgnoreCase) > 0)
+                        best = dir;
+                if (best is not null)
+                {
+                    string candidate = Path.Combine(best, name);
+                    if (File.Exists(candidate)) return candidate;
+                }
+            }
+        }
+        catch { }
+        return @"C:\Windows\Microsoft.NET\assembly\GAC_MSIL\" + name[..^4] + @"\v4.0_4.0.0.0__31bf3856ad364e35\" + name;
+    }
+    private static readonly string[] SyncfusionSystemAssemblies = new[]
+    {
+        "UIAutomationProvider.dll",
+        "UIAutomationTypes.dll",
+        "UIAutomationClient.dll",
+    };
+    private static readonly Dictionary<string, string> UiaOverrides = BuildUiaOverrides();
+    private static Dictionary<string, string> BuildUiaOverrides()
+    {
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string sysDll in SyncfusionSystemAssemblies)
+            map[sysDll] = UiaDesktopFile(sysDll);
+        return map;
+    }
+    static AppTransform()
+    {
+        string root = Environment.GetEnvironmentVariable("WF_SYNCFUSION_APPS_ROOT") ?? Repo(@"external-apps\syncfusion");
+        foreach (var demo in WfWasm.CanvasHost.SyncfusionDemos.Entries)
+        {
+            string folder = Path.Combine(root, demo.Slug);
+            Apps.Add(demo.Slug, new AppSpec(folder, [demo.Assembly + ".dll"], demo.Assembly)
+            {
+                ContentFiles = SyncfusionContent(folder),
+                SourceOverride = new Dictionary<string, string>(UiaOverrides, StringComparer.OrdinalIgnoreCase),
+                Pristine = SyncfusionSystemAssemblies,
+            });
+        }
+        // Files outside the build-output folder are invisible to
+        // SyncfusionContent: add them per slug, skipping sources absent
+        // from this checkout (a missing file must not 500 the manifest).
+        if (Apps.TryGetValue("syncfusion-diagram", out var diagram) && diagram is not null)
+            foreach (var kv in DiagramContent())
+                if (File.Exists(kv.Value))
+                    diagram.ContentFiles[kv.Key] = kv.Value;
+    }
+
+    // NodesDemo.Form1_Load builds a BitmapNode from image3.png via a
+    // dev-layout relative path (Form1.cs:129); the file ships upstream
+    // under common/images, not in the build output. Served as VFS content
+    // (lookups match by tail): without it BitmapNode..ctor throws
+    // FileNotFoundException inside OnLoad, which crosses the native Show
+    // boundary and OOB-traps the session with no managed frame.
+    private static Dictionary<string, string> DiagramContent() =>
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["image3.png"] = Repo(@"external-apps\syncfusion-sources\common\images\Diagram\OrgChart Layout\image3.png"),
+        };
+
+    private static Dictionary<string, string> SyncfusionContent(string folder)
+    {
+        var files = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (!Directory.Exists(folder)) return files;
+        // Only copied sample content. DLLs resolve by CLR request; configs/keys are never loose content.
+        var extensions = new HashSet<string>([".png", ".jpg", ".jpeg", ".bmp", ".gif", ".ico", ".csv", ".xml", ".xsd", ".shp", ".shx", ".dbf"], StringComparer.OrdinalIgnoreCase);
+        foreach (string file in Directory.EnumerateFiles(folder, "*", SearchOption.AllDirectories))
+        {
+            if (!extensions.Contains(Path.GetExtension(file)) || Path.GetFileName(file).Contains("license", StringComparison.OrdinalIgnoreCase)) continue;
+            files[Path.GetRelativePath(folder, file).Replace('\\', '/')] = file;
+        }
+        return files;
+    }
     // Assemblies: IL-rewritten files, served by relative path. Verbatim:
     // served without a full rewrite (third-party interop gets its
     // P/Invokes stubbed instead; the batch pipeline's stub pass).
@@ -33,35 +135,70 @@ public static class AppTransform
 
     // Telerik dependencies are looked up by the name requested by the CLR.
     // The shared folder is a search root; it is never enumerated for downloads.
-    private static readonly string Root = FindRoot();
-    private static string FindRoot()
-    {
-        string? configured = Environment.GetEnvironmentVariable("WFWASM_ROOT");
-        if (!string.IsNullOrWhiteSpace(configured)) return Path.GetFullPath(configured);
-        for (var d = new DirectoryInfo(AppContext.BaseDirectory); d is not null; d = d.Parent)
-            if (File.Exists(Path.Combine(d.FullName, "WfWasm.sln"))) return d.FullName;
-        throw new InvalidOperationException("Set WFWASM_ROOT to the repository directory.");
-    }
-    private static string Repo(string relative) => Path.Combine(Root, relative.Replace('\\', Path.DirectorySeparatorChar));
-    private static string Setting(string variable, string fallback) =>
-        Environment.GetEnvironmentVariable(variable) ?? Repo(fallback);
-    private static readonly string TelerikPool = Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release");
+    private static readonly string TelerikPool =
+        Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release");
     // net462 system assemblies Telerik touches as field/base types but never
     // calls headless (UIA provider slots on RadForm). Served pristine from
     // the GAC (real IL: Mono rejects both Cecil-processed and pristine
     // metadata-only reference assemblies at Assembly.Load).
+        // Most GAC system assemblies carry the framework key; the ECMA-key
+    // System.* assemblies (Composition) carry b77a5c561934e089 instead.
+    private static string GacPublicKey(string name) =>
+        name.Equals("System.ComponentModel.Composition", StringComparison.OrdinalIgnoreCase)
+            ? "b77a5c561934e089"
+            : "31bf3856ad364e35";
     private static string GacMsil(string name) =>
-        @"C:\Windows\Microsoft.NET\assembly\GAC_MSIL\" + name + @"\v4.0_4.0.0.0__31bf3856ad364e35\" + name + ".dll";
+        @"C:\Windows\Microsoft.NET\assembly\GAC_MSIL\" + name + @"\v4.0_4.0.0.0__" + GacPublicKey(name) + @"\" + name + ".dll";
     private static readonly string[] TelerikSystemAssemblies = new[]
     {
         "UIAutomationProvider.dll",
         "UIAutomationTypes.dll",
         "UIAutomationClient.dll",
         "WindowsBase.dll",
+        // MEF1: Telerik RichTextEditor/SpellCheck compose parts at startup
+        // and die with FileNotFoundException without it. Pure managed, so
+        // the pristine GAC copy loads under Mono-WASM.
+        "System.ComponentModel.Composition.dll",
     };
+    // WinRT contract stubs built from src/WfWasm.WinRtStubs.* (referenced
+    // by this project so the DLLs sit beside the server). Served to every
+    // app: desktop libraries (Telerik toast, UWP Toolkit) reference
+    // Windows.* types that only exist inside the Windows Runtime.
+    private static readonly Dictionary<string, string> WinRtStubs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Windows.Foundation.UniversalApiContract"] = "Windows.Foundation.UniversalApiContract.dll",
+        ["Windows.Foundation.FoundationContract"] = "Windows.Foundation.FoundationContract.dll",
+    };
+    // EventRegistrationToken rides in mscorlib on desktop .NET Framework
+    // but is missing from the browser CoreLib; the rewriter repoints its
+    // typeref at the FoundationContract stub, which defines it.
+    private const string EventRegistrationTokenFullName =
+        "System.Runtime.InteropServices.WindowsRuntime.EventRegistrationToken";
+    private const string WindowsRuntimeMarshalFullName =
+        "System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeMarshal";
     // PhotoAlbum reads background.jpg + Photos/*.jpg loose from disk
     // (Form1_Load). Manifest names use forward slashes; the VFS
     // normalizes every lookup, so backslash callers still hit.
+    // ERP.Repository.InitializeData fills its caches from Data/*.json via
+    // Path.Combine(BaseDirectory, "..", "Data") (dev-layout relative).
+    // The files live in SOURCES (never bin) and the browser BaseDirectory
+    // ("/") breaks the relative walk, so the panes load empty. Serve all
+    // 14 as VFS content: lookups match by tail, so "/Data/X.json" hits.
+    private static Dictionary<string, string> ErpContent()
+    {
+        string data = Repo(@"telerik\Telerik UI for WinForms demos\ExamplesProjects\ERP\ERP.Client\Data");
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string file in new[]
+        {
+            "Bill.json", "Customer.json", "IndividualCustomer.json", "Location.json",
+            "Order.json", "Product.json", "ProductInventory.json", "PurchaseOrder.json",
+            "ShipMethod.json", "StateProvince.json", "StoreCustomer.json", "UnitMeasure.json",
+            "Vendor.json", "WorkOrder.json",
+        })
+            map[$"Data/{file}"] = Path.Combine(data, file);
+        return map;
+    }
+
     private static Dictionary<string, string> PhotoAlbumContent()
     {
         string proj = Repo(@"telerik\Telerik UI for WinForms demos\ExamplesProjects\PhotoAlbum");
@@ -126,6 +263,34 @@ public static class AppTransform
     public static bool TryGetSpec(string app, out AppSpec? spec) =>
         Apps.TryGetValue(app, out spec);
 
+    // Desktop parity: modern runtimes default to Segoe UI 9pt, .NET
+    // Framework to Microsoft Sans Serif 8.25pt. The entry assembly's
+    // TargetFrameworkAttribute decides; anything unreadable is modern
+    // (the majority of the catalog). The browser applies it with
+    // Application.SetDefaultFont before the first window exists.
+    public static (string Name, float Size) DefaultFontFor(string app)
+    {
+        try
+        {
+            if (TryGetSpec(app, out var spec) && spec is not null
+                && TryResolveAssembly(app, spec.Entry, out string? entryFile) && entryFile is not null
+                && TryAssemblyPath(spec, entryFile, out string? path) && path is not null)
+            {
+                using var assembly = Mono.Cecil.AssemblyDefinition.ReadAssembly(path);
+                var tfm = assembly.CustomAttributes.FirstOrDefault(a =>
+                    a.AttributeType.FullName == "System.Runtime.Versioning.TargetFrameworkAttribute");
+                string frameworks = tfm?.ConstructorArguments.FirstOrDefault().Value as string ?? "";
+                if (frameworks.StartsWith(".NETFramework", StringComparison.OrdinalIgnoreCase))
+                    return ("Microsoft Sans Serif", 8.25f);
+            }
+        }
+        catch
+        {
+        }
+
+        return ("Segoe UI", 9f);
+    }
+
     private static string AssemblyStem(string file) =>
         file.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) || file.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
             ? file[..^4] : file;
@@ -158,6 +323,15 @@ public static class AppTransform
     private static bool TryAssemblyPath(AppSpec spec, string name, out string? path)
     {
         path = null;
+        // WinRT contract stubs live beside the server (project reference),
+        // not in any app folder; every app may resolve them.
+        if (WinRtStubs.TryGetValue(AssemblyStem(name), out string? stubFile))
+        {
+            string stubPath = Path.Combine(AppContext.BaseDirectory, stubFile);
+            if (!File.Exists(stubPath)) return false;
+            path = stubPath;
+            return true;
+        }
         if (spec.SourceOverride.TryGetValue(name, out string? overridden))
         {
             if (!File.Exists(overridden)) return false;
@@ -296,6 +470,9 @@ public static class AppTransform
                 "System.Windows.Extensions.dll",
                 "System.IO.Packaging.dll",
                 "System.Reflection.MetadataLoadContext.dll",
+                // Hand-built managed fake (mixed-mode pristine aborts WASM
+                // interp): no WinForms/Drawing/pinvoke surface, so stub-only.
+                "DirectWriteForwarder.dll",
                 "Bundled/AvifFileType/AvifFileType.dll",
                 "Bundled/DDSFileTypePlus/DdsFileTypePlus.dll",
                 "Bundled/JpegXLFileType/JpegXLFileType.dll",
@@ -333,7 +510,10 @@ public static class AppTransform
         ["telerik-erp"] = TelerikAppSpec(
             Repo(@"telerik\Telerik UI for WinForms demos\ExamplesProjects\ERP\ERP.Client\bin"),
             "ERP.Client.exe",
-            "ERP.Client"),
+            "ERP.Client") with
+        {
+            ContentFiles = ErpContent(),
+        },
         ["telerik-exportwithdpl"] = TelerikAppSpec(
             Repo(@"telerik\Telerik UI for WinForms demos\ExamplesProjects\ExportWithDpl\bin"),
             "ExportWithDpl.exe",
@@ -394,7 +574,7 @@ public static class AppTransform
     // changing (a new code path must not reuse bytes cached by the
     // old one, e.g. pristine fallbacks cached before sibling
     // hardlinks fixed third-party stubbing).
-    private const int TransformRevision = 37;
+    private const int TransformRevision = 89; // rev89: GetProxySourceImage fixpoint unwraps BitmapImage.image/proxy/InnerRef shells to the raw CpuDeviceBitmap (color-wheel DrawImage(ColorManagementEffect) blanked with zero errors; effect->image->proxy->PrecisionEffect->bitmap now blits) // rev88: DrawImage ColorManagementEffect falls through to the proxy-source blit (the identity no-op blanked primary blits: color wheel painted nothing with zero errors; GetProxySourceImage already allowlists it) // rev87: BitmapImage.CreateImpl reinterpret branch keeps ownsRef:false custody (identity shortcut answers the caller-owned bitmap: ownsRef:true dispose pool-returned live sources so tile locks read empty; wheel-sized uploads NSEd while small ones survived on spare refs) // rev86: CpuDrawingContext TryGetResourceCache<T> rebuilds its IObjectRef generic constraint via ImportReference (sharing the contract's foreign TypeReference re-scoped it to System.Numerics.Vectors at write time: live TypeLoad 010002E7 killed paint brush strokes + GPU-effect dialogs) // rev85: CpuDrawingContext device union (IDeviceContext/ICompatibleDeviceContext/IResourceCacheHolder slots, RefTrackedObject base, FromBitmap/BeginDraw CPU bodies with copy-in/write-back, CreateCompatible/EndDraw/Dispose(bool) cores) // rev84: paintdotnet ChunkedReadStream prefetch continuations take the ExecuteSynchronously overload (headless single thread has no pump: queued chunk reads never ran, so TryGetNextChunkWhileLocked .Result blocked forever; chained reads always have a complete antecedent, so every prefetch now runs inline) // rev83: paintdotnet ChunkedReadStream.Dispose prefetch drain drops its blocking Task.Wait (headless prefetches never complete: every history-undo died with PNSE ObjWait; pop swaps the void call in place, same stack effect) // rev82: DrawText bridge reports CALCRECT extents through the out pair (tree labels are measured with CALCRECT and painted into the measured rect; stub-zero extents squeezed every label to slivers) // rev81: app-private gdi32 DrawText P/Invokes retarget to fork WasmGdiText.DrawText (generic stub zero dropped all TreeViewAdv node text; vendor RECT& decomposes through the signature's own struct, field casing varies) // rev80: GetScrollBarInfo stub materializes SCROLLBARINFO.rgstate (native marshaller parity: virgin structs NREd vendor ScrollersFrame.UpdateScrollerSettings during TreeViewAdv parenting) // rev79: rev78 Draw trampoline fixed to reuse the module's own type references (hand-built struct refs default IsValueType=false and misbound at runtime: MissingMethod on desktop, TypeLoad in wasm) // rev78: diagram RichText paint headless (ForceDiagramBitmapText defaults m_bUseBitmap in RichTextNode ctors; RichTextBoxDrawing.Draw(Graphics, Rectangle) trampolines to managed WasmRtfDraw; native EM_FORMATRANGE/metafile shells unreached) // rev77: RichTextBox.StreamIn/StreamOut(Stream) bodies replaced with trampolines to managed WasmRtf (GetFunctionPointerForDelegate EDITSTREAM thunks OOB-trapped the wasm interp with no managed frame: diagram RichTextNode boot) // rev75: kernel32 LoadLibraryEx/GetModuleHandle retarget to WasmNativeLibrary null-handle stubs (MsftEdit absent headless: RichTextBox.CreateParams OOB-trapped the session with no managed frame; null keeps the Win32Exception path) // rev74: guard in-try returns rewritten to Leave done (raw Ret inside a guard try is unverifiable: desktop InvalidProgramException, wasm unwind-frame trap; killed syncfusion-calendar/diagram ctors) // rev73: ctor-guard also wraps parameterless instance .ctors (base-ctor/field-init/post-Init throws died identically outside InitializeComponent) // rev72: // rev72: InitializeComponent ctor-guard (uncaught designer throws crossed the reflection-invoke LMF and OOB-trapped the session with zero managed frames: stash + host fallback) // rev71: // rev71: GetResourceSet retarget to fork-shim SafeGetResourceSet (Syncfusion SR SetResources/GetLocalizedResourceManager called BCL direct: same NSE death) // rev70: // rev70: ResourceManager/ComponentResourceManager.GetString+GetStream retarget to fork-shim SafeGetString/SafeGetStream (raw BCL reads of v1-header/DeserializingResourceReader vendor .resources threw NSE with no managed catch: silent OOB trap killed calendar+diagram ctors) + Drawing ResourceHelper opens .resources with the header-named reader (verbatim values from modern streams) // rev69: // rev69: fork RichTextBox.UpdateOleCallback keeps only its DragAcceptFiles(false) tail (COM OLE callback absent headless: GetComPointer PNS killed every RichTextBox handle creation, worker instance OOB-trapped the session) // rev68: Syncfusion.Shared.Base SfForm.CheckIsWindows11 -> false (registry build number missing headless: int.Parse(null) killed every Syncfusion demo form) // rev67: PaintDotNet.Framework PdnCheckBox.GetPreferredSize -> CPU measure (null DWrite text layout threw inside layout/show and aborted dialog presentation) // rev66: PaintDotNet.SystemLayer ShellUtil.GetVirtualPath -> /vfs layout (SHGetFolderPath answers "" headless: Save-As died on empty path, app-data/cache/crash dirs vanished) // rev65: PaintDotNet.Data FileType.GetLastSaveConfigToken -> CreateDefaultSaveConfigToken (persisted per-filetype tokens need the user settings store unavailable headless: Save-As died in set_FileType before the dialog) // rev64: paintdotnet WicHelpers.GetLoad/SaveExtensions -> desktop extension table for Microsoft built-ins (empty WIC headless nulled every built-in DefaultSaveExtension: Save-As died before any dialog) // rev63: // rev63: paintdotnet DiagnosticsGenerator.GetFormattedText -> WfWasm.Drawing.PdnDiagnostics browser-safe fallback (headless inventory probes fault + wrap the original save error in AggregateException: Save-As failure invisibly fatal) // rev62: // rev62: TextBlock.DrawGdi -> DrawGdiPlus managed retarget (GDI DrawTransparentText DIB pipeline has no headless backend: no span glyph ever painted) // rev61: app-private GDI text extents (GetTextExtentPoint32/ExPoint + NativeTextRenderer SelectObject) retarget to fork WasmGdiText (zeroed extents measured every RTE span 0x0: typed glyphs invisible + perpetual relayout) // rev60: InvokeLayoutCallback's BeginInvoke retargets to fork WasmLayoutQueue (handle-less BeginInvoke throws; rev59 guard alone wedged form creation) // rev59: RadControl.InvokeLayoutCallback IsHandleCreated guard neutralized (TPF layout queue starvation: RTE glyph-paint staleness) // rev58: WindowsBase verbatim-plus micro-pass neutralizes Assembly.ReflectionOnly guard (paint MONO cascade: NIE escaping resolve handler kills runtime) // rev57: app resolution closure (spec.Folder + AssemblySearchFolders) threads into RewriteToBytes extraDirs (DiagramFirstLook RadDiagram 500: pool UI.dll invisible to Cecil) // rev56: Telerik ThemeResolutionService.AllowAnimations -> false (Thread.Start neutering deadlocks the popup AnimationEngine handshake: grid right-click wedge) // rev55: System.IO.IsolatedStorage.* retarget to headless stub (spellchecker dictionary PNSE) // rev54: System.Media.* retarget to headless System.Windows.Extensions stub (hub RadMessageBox SystemSounds TypeLoad) // rev53: Environment.GetFolderPath -> fork WasmEnvironment virtual /vfs layout (RTE FontsManager cctor empty-path death) // rev52: coherent FrameworkResolver (real-binds-local, facades-unify-to-fx; pool-facade forwarder cycle SO at write) + dead-ref trim last with reachability (F-bounded visited set) // rev51: assemblyref trim keeps used scopes (DWF self-ref CoreLib corruption) + DWF Verbatim (stub-only fake) // rev50: namespaceless nested typeref remap (Interop+/WMExtensions SWF 500) + fnptr/exotic-sig gap identity (Analyze NRE) // rev49: GetDpiForMonitor stub reports S_OK + 96/96 outs, GetDpiForWindow/System answer 96 (Telerik RadForm boot COMException) // rev48: CpuDrawingContext SystemColor-case stray Ldloc removed (stack-merge InvalidProgram) + FileSystem.CreateTempFile managed redirect (stub null-handle cctor death) // rev47: module cctor preserves same-module ModuleInitializer calls (hook wiring) // rev46: GetObject redirect retargets to fork WasmResourceShim (imagelist hydration) // rev45: generic GetTextMetrics stub fills coherent TEXTMETRIC (NaN-layout fix) // rev44: Telerik RTE Uniscribe.ContainsComplexScript -> false (no usp10 headless) // rev43: PDN Direct2DControl.OnHandleCreatedInternal neutralized (device impl bypassed) // rev42: GetWindowThreadProcessId stub returns UI thread 1 (thread-affinity coherence) // rev41: System.Data.OleDb.* -> headless stub assembly // rev40: UWP Toolkit headless-init stubs // rev39: WindowsRuntimeMarshal -> WinRT stub remap // rev38: EventRegistrationToken -> WinRT stub remap
 
     // Cache key covers every transform input: pristine bytes, the
     // fork and drawing assemblies a rewrite remaps onto, the handmap
@@ -483,7 +663,11 @@ public static class AppTransform
                 Console.WriteLine($"[AppTransform] Disk cache unreadable for {app}/{name}, re-transforming: {ex.GetType().Name}");
             }
 
-            if (spec.Pristine.Contains(name, StringComparer.OrdinalIgnoreCase))
+            // WinRT stubs ship byte-identical like Pristine: they carry no
+            // WinForms/PInvoke surface for the rewriter, and their contract
+            // identity (name/version) must survive untouched.
+            if (spec.Pristine.Contains(name, StringComparer.OrdinalIgnoreCase)
+                || WinRtStubs.ContainsKey(AssemblyStem(name)))
             {
                 // Byte-identical serving for assemblies the rewriter must
                 // not touch (Mono rejects Cecil-processed metadata-only
@@ -528,6 +712,9 @@ public static class AppTransform
                     typeMap[sides[0]] = (target[0], target[1]);
                 }
             }
+            // WinRT interop token missing from the browser CoreLib (see map).
+            typeMap[EventRegistrationTokenFullName] = ("Windows.Foundation.FoundationContract", EventRegistrationTokenFullName);
+            typeMap[WindowsRuntimeMarshalFullName] = ("Windows.Foundation.FoundationContract", WindowsRuntimeMarshalFullName);
 
             byte[] bytes;
             if (spec.Verbatim.Contains(name, StringComparer.OrdinalIgnoreCase))
@@ -546,7 +733,11 @@ public static class AppTransform
                 // content-sensitive file filters cannot deny re-opening
                 // them (observed with grp2Calendar.dll). The disk write
                 // below is only the cross-restart cache.
-                bytes = AssemblyRewriter.RewriteToBytes(pristinePath, assemblyMap, typeMap, spec.PdnCpu);
+                bytes = AssemblyRewriter.RewriteToBytes(pristinePath, assemblyMap, typeMap, spec.PdnCpu, null,
+                    // Rewrites introduce references to host compatibility assemblies (for example
+                    // WfWasm.IsolatedStorage). Cecil must resolve those while importing signatures.
+                    // This is transform-time lookup only; it adds no browser downloads.
+                    new[] { spec.Folder, AppContext.BaseDirectory }.Concat(spec.AssemblySearchFolders));
             }
 
             MemCache[key] = bytes;
@@ -621,6 +812,27 @@ public static class AppTransform
                     return pristine;
                 }
 
+                // Verbatim-plus (rev58): WPF's AssemblyHelper.OnLoaded reads
+                // Assembly.ReflectionOnly, whose Mono-WASM builder override
+                // throws NIE; escaping an AssemblyResolve handler that kills
+                // the runtime (paint MONO cascade). Neutralize the guard to
+                // false (exact .NET Core behavior: no reflection-only
+                // context exists). Fail-open: the resolve hook (Fix 1)
+                // converts any residual death into a catchable miss.
+                if (string.Equals(name, "WindowsBase.dll", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        int sites = AssemblyRewriter.NeutralizeReflectionOnlyGuards(tmp, tmp);
+                        Console.WriteLine($"[AppTransform] ReflectionOnly guards neutralized for {app}/{name}: {sites} site(s).");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[AppTransform] ReflectionOnly neutralize failed for {app}/{name}, keeping stubbed bytes: {ex.GetType().Name}: {ex.Message.Split('\n')[0]}");
+                    }
+                }
+
+                // Rev59 layout handle guard runs inside RewriteToBytes (Telerik.WinControls is not Verbatim).
                 return File.ReadAllBytes(tmp);
             }
             finally
@@ -633,6 +845,24 @@ public static class AppTransform
             Console.WriteLine($"[AppTransform] Transient stub copy failed for {app}/{name}, serving pristine: {ex.GetType().Name}: {ex.Message.Split('\n')[0]}");
             return pristine;
         }
+    }
+
+    // Manifest prefetch closure: every managed assembly the demand hook
+    // could serve, so the client warms them in parallel instead of
+    // faulting them one round trip at a time. Native images can never
+    // bind (BadImageFormat) and missing files are skipped; the demand
+    // hook stays the fallback for everything else (optional assemblies,
+    // version drift). Integrity comes from the response header at fetch.
+    public static bool TryPrefetchPath(string app, string name, out string? path)
+    {
+        path = null;
+        if (!Apps.TryGetValue(app, out var spec)) return false;
+        if (!TryAssemblyPath(spec, name, out path) || path is null) return false;
+        if (!File.Exists(path)) return false;
+        try { _ = AssemblyName.GetAssemblyName(path); }
+        catch (BadImageFormatException) { return false; }
+        catch (FileNotFoundException) { return false; }
+        return true;
     }
 
     public static string ContentHash(string app, string name, string? dependencyHash = null) =>

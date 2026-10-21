@@ -186,10 +186,13 @@ public static class AppFileSystem
     }
 
     // File.Exists shape (the rewriter redirects BCL calls here): served
-    // content answers true (StartupPath-rooted absolutes match by tail);
+    // content answers true (StartupPath-rooted absolutes match by tail),
+    // including browser-decoded pixels (PNG/JPEG register decoded-only and
+    // load fine through new Bitmap(path), but never touch s_files: without
+    // this they read as missing, e.g. diagram BitmapNode image3.png);
     // anything else falls through to the real disk (MEMFS user cache).
     public static bool Exists(string? path) =>
-        TryGetBytes(path, out _) || (!string.IsNullOrWhiteSpace(path) && System.IO.File.Exists(path));
+        TryGetBytes(path, out _) || TryGetDecoded(path, out _) || (!string.IsNullOrWhiteSpace(path) && System.IO.File.Exists(path));
 
     // FileStream(path, FileMode) shape (rewriter redirect): VFS bytes are
     // spooled to a MEMFS temp so callers get a REAL FileStream (Seek,
@@ -240,6 +243,20 @@ public static class AppFileSystem
     // reports fetch time; misses query for real (1601 default kept).
     public static System.DateTime GetCreationTime(string? path) =>
         TryGetBytes(path, out _) ? System.DateTime.Now : System.IO.File.GetCreationTime(path ?? string.Empty);
+
+    // File.ReadAllText shapes (rewriter redirect): served content
+    // decodes from the registry (backslash spellings normalize, so a
+    // desktop Concat dir + "\X.json" hits); misses read for real
+    // (FileNotFound semantics preserved).
+    public static string ReadAllText(string? path) =>
+        ReadAllText(path, System.Text.Encoding.UTF8);
+
+    public static string ReadAllText(string? path, System.Text.Encoding? encoding)
+    {
+        if (TryGetBytes(path, out byte[]? bytes) && bytes is not null)
+            return (encoding ?? System.Text.Encoding.UTF8).GetString(bytes);
+        return System.IO.File.ReadAllText(path!, encoding ?? System.Text.Encoding.UTF8);
+    }
 
     // Drops every entry a path would resolve to (exact + tail matches):
     // lookups are tail-based, so exact-key removal would leave stale hits.

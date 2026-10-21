@@ -290,11 +290,33 @@ namespace System.Drawing
             return PngCodec.DecodeStream(stream);
         }
 
-        public static Bitmap FromHbitmap(IntPtr hbitmap) =>
+        // Trackable fakes minted by GetHbitmap/BitmapHandleMap resolve to a
+        // pixel copy (callers such as ImageList.GetBitmap dispose the result,
+        // so aliasing the registered bitmap would corrupt the owner).
+        // Foreign handles keep the honest NotSupportedException.
+        public static Bitmap FromHbitmap(IntPtr hbitmap)
+        {
+            if (BitmapHandleMap.TryResolve(hbitmap, out Bitmap? src) && src is not null)
+            {
+                Bitmap copy = new Bitmap(src.Width, src.Height, src.PixelFormat);
+                using (Graphics g = Graphics.FromImage(copy))
+                    g.DrawImage(src, 0, 0);
+                return copy;
+            }
             throw new NotSupportedException("GDI handles are not available on web.");
+        }
 
-        public static Bitmap FromHbitmap(IntPtr hbitmap, IntPtr hpalette) =>
+        public static Bitmap FromHbitmap(IntPtr hbitmap, IntPtr hpalette)
+        {
+            if (BitmapHandleMap.TryResolve(hbitmap, out Bitmap? src) && src is not null)
+            {
+                Bitmap copy = new Bitmap(src.Width, src.Height, src.PixelFormat);
+                using (Graphics g = Graphics.FromImage(copy))
+                    g.DrawImage(src, 0, 0);
+                return copy;
+            }
             throw new NotSupportedException("GDI handles are not available on web.");
+        }
 
         public virtual void Save(string filename) =>
             throw new NotSupportedException("Image codecs arrive with the codec milestone.");
@@ -452,6 +474,43 @@ namespace System.Drawing
         private static bool IsPng(byte[] bytes) =>
             bytes.Length > 8 && bytes[0] == 137 && bytes[1] == 80 && bytes[2] == 78 && bytes[3] == 71 &&
             bytes[4] == 13 && bytes[5] == 10 && bytes[6] == 26 && bytes[7] == 10;
+        // PNG encode outlets: bitmap pixels serialize through PngCodec, so
+        // vendor snapshot paths (diagram BitmapNode.ImageToBase64) work
+        // headless. Every other format keeps the milestone throw.
+        public override void Save(Stream stream, Imaging.ImageFormat format)
+        {
+            ArgumentNullException.ThrowIfNull(stream);
+            ArgumentNullException.ThrowIfNull(format);
+            if (format.Equals(Imaging.ImageFormat.Png))
+            {
+                PngCodec.Encode(stream, this);
+                return;
+            }
+
+            throw new NotSupportedException("Image codecs arrive with the codec milestone.");
+        }
+
+        public override void Save(string filename)
+        {
+            using var ms = new MemoryStream();
+            PngCodec.Encode(ms, this);
+            System.IO.File.WriteAllBytes(filename, ms.ToArray());
+        }
+
+        public override void Save(string filename, Imaging.ImageFormat format)
+        {
+            ArgumentNullException.ThrowIfNull(format);
+            if (format.Equals(Imaging.ImageFormat.Png))
+            {
+                using var ms = new MemoryStream();
+                PngCodec.Encode(ms, this);
+                System.IO.File.WriteAllBytes(filename, ms.ToArray());
+                return;
+            }
+
+            throw new NotSupportedException("Image codecs arrive with the codec milestone.");
+        }
+
 
         public Bitmap(Stream stream)
             : this()
@@ -488,7 +547,9 @@ namespace System.Drawing
             _pixels = (int[])source._pixels.Clone();
             _dpiX = source._dpiX;
             _dpiY = source._dpiY;
-            PixelFormatStorage = Imaging.PixelFormat.Format32bppArgb;
+            // Keep the decoded storage tag (32bppRgb BMPs report Rgb like
+            // GDI+; GetPixel masks those reads opaque on the way out).
+            PixelFormatStorage = source.PixelFormatStorage;
         }
 
         public Bitmap(Image? original)
@@ -577,7 +638,12 @@ namespace System.Drawing
         {
             if ((uint)x >= (uint)_width || (uint)y >= (uint)_height)
                 throw new ArgumentOutOfRangeException("Coordinates are outside the bitmap.");
-            return Color.FromArgb(_pixels[y * _width + x]);
+            int argb = _pixels[y * _width + x];
+            // GDI+ reports 32bppRgb reads as opaque while keeping the X
+            // byte in memory (LockBits exposes it raw). Mask on read.
+            if (PixelFormatStorage == Imaging.PixelFormat.Format32bppRgb)
+                argb |= unchecked((int)0xFF000000);
+            return Color.FromArgb(argb);
         }
 
         public void SetPixel(int x, int y, Color color)
@@ -649,12 +715,20 @@ namespace System.Drawing
             PaintVersion++;
         }
 
-        public IntPtr GetHbitmap() => IntPtr.Zero;
-        public IntPtr GetHbitmap(Color background) => IntPtr.Zero;
+        // Mint a trackable fake (see BitmapHandleMap): ImageList insertion
+        // resolves the source pixels from it. Pair with DeleteObject, as
+        // with real GDI handles; unreleased entries die with the bitmap.
+        public IntPtr GetHbitmap() => BitmapHandleMap.Register(this);
+        public IntPtr GetHbitmap(Color background) => BitmapHandleMap.Register(this);
         public IntPtr GetHicon() => IntPtr.Zero;
 
+        // Headless there are no GDI handles, but third-party grids, diagram
+        // tools, and settings panes call FromHicon during input handling
+        // (Telerik RadDiagram aborts the whole MouseDown when this throws, so
+        // shapes never select); same policy as Icon.FromHandle: answer a
+        // blank 16x16 placeholder instead of throwing.
         public static Bitmap FromHicon(IntPtr hicon) =>
-            throw new NotSupportedException("GDI handles are not available on web.");
+            new Bitmap(16, 16);
 
         public static Bitmap FromResource(IntPtr hinstance, string bitmapName) =>
             throw new NotSupportedException("GDI handles are not available on web.");
@@ -731,6 +805,24 @@ namespace System.Drawing
                 bitmapdata.HasPin = false;
                 bitmapdata.Scan0 = IntPtr.Zero;
                 _locks.Remove(bitmapdata);
+            }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            // Theme loaders (Telerik ImageFromString) LockBits and never
+            // Unlock; free any abandoned pins so repeated loads do not pin
+            // garbage forever. Entries stay valid: a later UnlockBits
+            // still runs and removes its entry.
+            if (disposing)
+            {
+                foreach (var data in _locks.Keys)
+                {
+                    if (data.HasPin)
+                        data.Pin.Free();
+                    data.HasPin = false;
+                    data.Scan0 = IntPtr.Zero;
+                }
             }
         }
 
@@ -1134,12 +1226,18 @@ namespace System.Drawing
             }
 
             int at = pick.Offset;
-            bool png = pick.Size >= 8 &&
+            // The directory size field is advisory: real-world icons
+            // understate it (WinForms down.ico declares 104 bytes for a
+            // 16x16x32 entry whose geometry needs 1128) and Windows reads
+            // by geometry. Clamp to the buffer instead; every read stays
+            // bounds-checked against bytes.Length.
+            int entrySize = Math.Max(pick.Size, bytes.Length - at);
+            bool png = entrySize >= 8 &&
                 bytes[at] == 0x89 && bytes[at + 1] == 0x50 && bytes[at + 2] == 0x4E && bytes[at + 3] == 0x47 &&
                 bytes[at + 4] == 0x0D && bytes[at + 5] == 0x0A && bytes[at + 6] == 0x1A && bytes[at + 7] == 0x0A;
             Bitmap native = png
-                ? PngCodec.DecodeStream(new MemoryStream(bytes, at, pick.Size, false))
-                : RasterizeBmpEntry(bytes, at, pick.Size);
+                ? PngCodec.DecodeStream(new MemoryStream(bytes, at, entrySize, false))
+                : RasterizeBmpEntry(bytes, at, entrySize);
             int tw = want?.Width ?? native.Width;
             int th = want?.Height ?? native.Height;
             Bitmap raster = (tw == native.Width && th == native.Height) ? native : ScaleNearest(native, tw, th);
@@ -1186,7 +1284,13 @@ namespace System.Drawing
             int andStride = ((w + 31) / 32) * 4;
             int andOff = xorOff + xorStride * h;
             Need(xorOff, xorStride * h);
-            Need(andOff, andStride * h);
+            // The AND mask is advisory: 32bpp icons with an alpha channel
+            // routinely omit it (WinForms up.ico ships header+XOR only) and
+            // Windows treats the missing mask as all-opaque. Only read it
+            // when the bytes are actually there.
+            bool hasAndMask = andOff >= 0 && andStride >= 0 && h >= 0
+                && (long)andOff + (long)andStride * h <= size
+                && (long)at + andOff + (long)andStride * h <= bytes.Length;
 
             var bitmap = new Bitmap(w, h);
             int[] dest = bitmap.Pixels;
@@ -1227,8 +1331,16 @@ namespace System.Drawing
                         r = bytes[p + 2];
                         aSrc = bytes[p + 3];
                     }
-                    int andByte = bytes[at + andOff + y * andStride + x / 8];
-                    int alpha = ((andByte >> (7 - x % 8)) & 1) == 1 ? 0 : (bpp == 32 ? aSrc : 255);
+                    int alpha;
+                    if (hasAndMask)
+                    {
+                        int andByte = bytes[at + andOff + y * andStride + x / 8];
+                        alpha = ((andByte >> (7 - x % 8)) & 1) == 1 ? 0 : (bpp == 32 ? aSrc : 255);
+                    }
+                    else
+                    {
+                        alpha = bpp == 32 ? aSrc : 255;
+                    }
                     dest[y * w + x] = (alpha << 24) | (r << 16) | (g << 8) | b;
                 }
             }

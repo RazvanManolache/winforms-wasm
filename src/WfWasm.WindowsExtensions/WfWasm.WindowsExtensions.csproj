@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <AssemblyName>System.Windows.Extensions</AssemblyName>
+    <AssemblyVersion>4.0.0.0</AssemblyVersion>
+    <Version>4.0.0.0</Version>
+    <RootNamespace>System.Media</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <SignAssembly>false</SignAssembly>
+    <Description>Headless System.Windows.Extensions shape stub for the browser: SystemSounds/SystemSound/SoundPlayer load and their play verbs are silent no-ops (no audio device exists on WASM; a WebAudio bridge can light these up later). The rewriter retargets System-scoped System.Media typerefs here.</Description>
+  </PropertyGroup>
+
+</Project>

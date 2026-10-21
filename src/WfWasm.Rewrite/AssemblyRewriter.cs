@@ -54,23 +54,146 @@ public static class AssemblyRewriter
             Path.GetExtension(outputPath)));
     }
 
+    // CustomAttribute blobs encode Type values inline, not as TypeRef
+    // rows (see call site): walk every attribute in the module and
+    // remap blob-embedded TypeReferences with the same map.
+    private static void RemapCustomAttributeTypeReferences(
+        ModuleDefinition module,
+        IReadOnlyDictionary<string, (string Assembly, string Type)> typeMap)
+    {
+        RemapAttributeList(module, module.Assembly.CustomAttributes, typeMap);
+        RemapAttributeList(module, module.CustomAttributes, typeMap);
+        RemapTypes(module, module.Types, typeMap);
+    }
+
+    private static void RemapTypes(
+        ModuleDefinition module,
+        Mono.Collections.Generic.Collection<Mono.Cecil.TypeDefinition> types,
+        IReadOnlyDictionary<string, (string Assembly, string Type)> typeMap)
+    {
+        foreach (Mono.Cecil.TypeDefinition type in types)
+        {
+            RemapAttributeList(module, type.CustomAttributes, typeMap);
+            foreach (Mono.Cecil.GenericParameter gp in type.GenericParameters)
+                RemapAttributeList(module, gp.CustomAttributes, typeMap);
+            foreach (Mono.Cecil.MethodDefinition method in type.Methods)
+            {
+                RemapAttributeList(module, method.CustomAttributes, typeMap);
+                RemapAttributeList(module, method.MethodReturnType.CustomAttributes, typeMap);
+                foreach (Mono.Cecil.ParameterDefinition p in method.Parameters)
+                    RemapAttributeList(module, p.CustomAttributes, typeMap);
+                foreach (Mono.Cecil.GenericParameter gp in method.GenericParameters)
+                    RemapAttributeList(module, gp.CustomAttributes, typeMap);
+            }
+            foreach (Mono.Cecil.FieldDefinition field in type.Fields)
+                RemapAttributeList(module, field.CustomAttributes, typeMap);
+            foreach (Mono.Cecil.PropertyDefinition prop in type.Properties)
+                RemapAttributeList(module, prop.CustomAttributes, typeMap);
+            foreach (Mono.Cecil.EventDefinition ev in type.Events)
+                RemapAttributeList(module, ev.CustomAttributes, typeMap);
+            RemapTypes(module, type.NestedTypes, typeMap);
+        }
+    }
+
+    private static void RemapAttributeList(
+        ModuleDefinition module,
+        Mono.Collections.Generic.Collection<Mono.Cecil.CustomAttribute> list,
+        IReadOnlyDictionary<string, (string Assembly, string Type)> typeMap)
+    {
+        foreach (Mono.Cecil.CustomAttribute ca in list)
+        {
+            foreach (Mono.Cecil.CustomAttributeArgument arg in ca.ConstructorArguments)
+                RemapAttributeValue(module, arg.Value, typeMap);
+            foreach (Mono.Cecil.CustomAttributeNamedArgument named in ca.Properties)
+                RemapAttributeValue(module, named.Argument.Value, typeMap);
+            foreach (Mono.Cecil.CustomAttributeNamedArgument named in ca.Fields)
+                RemapAttributeValue(module, named.Argument.Value, typeMap);
+        }
+    }
+
+    private static void RemapAttributeValue(
+        ModuleDefinition module,
+        object? value,
+        IReadOnlyDictionary<string, (string Assembly, string Type)> typeMap)
+    {
+        if (value is TypeReference tr)
+        {
+            if (tr is TypeSpecification || tr.Scope == module)
+                return;
+            RemapTypeReference(module, tr, typeMap);
+        }
+        else if (value is Mono.Cecil.CustomAttributeArgument[] elements)
+        {
+            foreach (Mono.Cecil.CustomAttributeArgument element in elements)
+                RemapAttributeValue(module, element.Value, typeMap);
+        }
+    }
+
+    // Shared TypeRef remap: point the reference at the mapped fork
+    // assembly/type (namespace + nested path split). Used by the TypeRef
+    // table loop and the attribute-blob pass below.
+    private static void RemapTypeReference(
+        ModuleDefinition module,
+        TypeReference typeRef,
+        IReadOnlyDictionary<string, (string Assembly, string Type)> typeMap)
+    {
+            string full = typeRef.FullName.Replace('/', '+');
+            if (!typeMap.TryGetValue(full, out (string Assembly, string Type) mapped))
+                return;
+            AssemblyNameReference? scope =
+                module.AssemblyReferences.FirstOrDefault(r => r.Name == mapped.Assembly);
+            if (scope is null)
+            {
+                scope = new AssemblyNameReference(mapped.Assembly, new Version(1, 0, 0, 0));
+                module.AssemblyReferences.Add(scope);
+            }
+            typeRef.Scope = scope;
+            // Split "Ns.Outer+Inner": the namespace ends at the last '.'
+            // before the first '+' (nested TypeRefs carry their parent via
+            // DeclaringType, with an empty namespace of their own).
+            int plus = mapped.Type.IndexOf('+');
+            int dot = plus < 0
+                ? mapped.Type.LastIndexOf('.')
+                : mapped.Type.LastIndexOf('.', plus);
+            // Namespace-less targets (global Interop/WMExtensions nests):
+            // the whole name is the nested path, no namespace split.
+            string ns = dot < 0 ? "" : mapped.Type[..dot];
+            string[] nested = (dot < 0 ? mapped.Type : mapped.Type[(dot + 1)..]).Split('+');
+            if (nested.Length == 1)
+            {
+                typeRef.Namespace = ns;
+                typeRef.Name = nested[0];
+                typeRef.DeclaringType = null;
+            }
+            else
+            {
+                TypeReference parent = new TypeReference(ns, nested[0], module, scope);
+                for (int i = 1; i < nested.Length - 1; i++)
+                    parent = new TypeReference("", nested[i], module, scope)
+                    {
+                        DeclaringType = parent,
+                    };
+                typeRef.Namespace = "";
+                typeRef.Name = nested[^1];
+                typeRef.DeclaringType = parent;
+            }
+    }
+
     public static byte[] RewriteToBytes(
         string inputPath,
         IReadOnlyDictionary<string, string> assemblyMap,
         IReadOnlyDictionary<string, (string Assembly, string Type)> typeMap,
         string? cpuPaintPath = null,
-        string? outputExtension = null)
+        string? outputExtension = null,
+        IEnumerable<string>? extraDirs = null)
     {
-        var resolver = new DefaultAssemblyResolver();
         string? inputDir = Path.GetDirectoryName(Path.GetFullPath(inputPath));
-        if (inputDir is not null)
-            resolver.AddSearchDirectory(inputDir);
-        foreach (string target in assemblyMap.Values.Distinct(StringComparer.Ordinal))
-        {
-            string? dir = Path.GetDirectoryName(Path.GetFullPath(target));
-            if (dir is not null)
-                resolver.AddSearchDirectory(dir);
-        }
+        var mapDirs = assemblyMap.Values.Distinct(StringComparer.Ordinal).Select(Path.GetDirectoryName).OfType<string>();
+        // extraDirs carries the app's resolution closure (lookup dir +
+        // search folders): app-local DLLs whose siblings live only in the
+        // shared pool (DiagramFirstLook's RadDiagram.dll -> pool UI.dll)
+        // otherwise 500 in Cecil with AssemblyResolutionException.
+        using var resolver = new FrameworkResolver(inputDir, mapDirs.Concat(extraDirs ?? []));
         using var assembly = AssemblyDefinition.ReadAssembly(inputPath,
             new ReaderParameters { AssemblyResolver = resolver });
         ModuleDefinition module = assembly.MainModule;
@@ -105,6 +228,25 @@ public static class AssemblyRewriter
                 module.TypeSystem.String, "WfWasm.PdnCpu"));
             assembly.CustomAttributes.Add(ivt);
         }
+        if (assembly.Name.Name == "WfWasm.WinForms")
+        {
+            // RichEdit OLE callback needs COM (absent headless): every
+            // RichTextBox handle creation dies in ComHelpers.GetComPointer
+            // with a runtime PNS (Syncfusion calendar/diagram boot), and the
+            // worker-thread instance escapes to the runtime and OOB-traps the
+            // session. Keep only the DragAcceptFiles(false) tail (see rule).
+            try { NeutralizeRichEditOleCallback(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // rev77: native EDITSTREAM function-pointer thunks trap
+            // the wasm interpreter (diagram RichTextNode boot); both
+            // Stream bodies become trampolines to managed WasmRtf.
+            try { ReplaceRichTextStreamMethods(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+        }
         if (assembly.Name.Name == "Telerik.WinControls")
         {
             // Embedded icon fonts register through gdi32's
@@ -115,7 +257,56 @@ public static class AssemblyRewriter
             catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
             {
             }
-        }        if (assembly.Name.Name == "PaintDotNet.Windows")
+            // Popup animations spawn a worker thread and block the caller
+            // in a start-handshake WaitOne; Thread.Start is neutered
+            // headless, so grid right-click wedges forever. Animations off:
+            // popups show instantly.
+            try { EnsureTelerikNoAnimations(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // Layout posts drop headless: RadControl.InvokeLayoutCallback
+            // is IsHandleCreated-gated (always false), so TPF measure/
+            // arrange queues starve after boot and edited content paints
+            // stale layout. Neutralize the handle check; the same-thread
+            // BeginInvoke then runs the layout callback inline (rev59).
+            try { NeutralizeModuleLayoutHandleGuard(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+        }
+        if (assembly.Name.Name == "Telerik.WinControls.RichTextEditor")
+        {
+            // The text measure/draw dispatchers ask Uniscribe whether a
+            // run needs complex-script shaping; usp10 cannot exist
+            // headless and the stubbed table pointer NREs the probe,
+            // killing form creation. Answer false (simple text).
+            try { EnsureUniscribeHeadlessFalse(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // GDI span painting has no headless DIB backend
+            // (DrawTransparentText draws nothing); the sibling
+            // DrawGdiPlus path paints through managed GDI+.
+            try { RetargetTextBlockGdiPaint(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+        }
+        if (assembly.Name.Name == "paintdotnet")
+        {
+            // Session-prefetch Wait kills history undo headless (see method).
+            try { NeutralizeSessionPrefetchWait(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // Prefetch continuations never run headless: run them inline.
+            try { NeutralizeSessionPrefetchInline(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+        }
+        if (assembly.Name.Name == "PaintDotNet.Windows")
         {
             // The Win7 taskbar COM object cannot exist headless: its
             // factory NREs (caught -> DummyImpl first-chance noise on
@@ -130,6 +321,22 @@ public static class AssemblyRewriter
         }
         if (assembly.Name.Name == "PaintDotNet.Framework")
         {
+            // DWrite text layout is null headless, so every
+            // PdnCheckBox measure throws inside layout/show and aborts
+            // dialog presentation: measure on the CPU instead (see method).
+            try { RedirectPdnCheckBoxMeasure(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+        }
+        if (assembly.Name.Name == "PaintDotNet.Framework")
+        {
+            // Null-DWrite heading measurement kills dialog layout headless:
+            // answer the font line height (see method).
+            try { RedirectHeadingLabelPreferredHeight(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
             // The CPU resource cache (Windows.Core) unwraps AutoColorSpace
             // through the inner sRGB provider field from another class:
             // cross-class ldfld needs the field visible, so it ships public.
@@ -163,17 +370,6 @@ public static class AssemblyRewriter
         }
         if (assembly.Name.Name == "PaintDotNet.Windows.Framework")
         {
-            // BitmapImage.CreateReinterpretedBitmap wraps the source in
-            // a COM-flavored ref whose inner comes back null headless,
-            // so every later Size/Lock on the wrapper faults (color
-            // wheel resources). Its only caller (CreateImpl tiling)
-            // passes a same-bits-per-pixel format by construction (the
-            // original ctor throws otherwise), so answering the source
-            // is exact for every real call.
-            try { EnsureCpuReinterpretIdentity(module); }
-            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
-            {
-            }
             try { EnsureCpuPostProcessIdentity(module); }
             catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
             {
@@ -226,8 +422,96 @@ public static class AssemblyRewriter
             catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
             {
             } }
+        if (assembly.Name.Name == "Microsoft.Toolkit.Uwp.Notifications")
+        {
+            // OS toast-identity bootstrap cannot run headless (COM
+            // activation, CLSID registry, AppUserModelId shortcuts):
+            // seed the AUMID constant and skip registration; the
+            // WinRT stubs answer the notification calls instead.
+            try { EnsureToolkitHeadlessInit(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+        }
+        if (assembly.Name.Name == "Syncfusion.Shared.Base")
+        {
+            // SfForm probes the Win11 build number from the registry at
+            // construction; headless the key is missing and int.Parse(null)
+            // kills every Syncfusion demo before its form exists.
+            try { RedirectSyncfusionWin11Check(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+        }
+        if (assembly.Name.Name == "Syncfusion.Diagram.Base")
+        {
+            // Headless RichText paint (rev78): the metafile shell cannot
+            // exist headless, so RichText nodes default to the managed
+            // bitmap path and the native EM_FORMATRANGE Draw becomes a
+            // trampoline to WasmRtfDraw (see rules).
+            try { ForceDiagramBitmapText(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            try { ReplaceRtfDrawMethod(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+        }
+        if (assembly.Name.Name == "Syncfusion.SfInput.WinForms")
+        {
+            // TextBoxBase.SelectAll OOB-traps headless once the RichEdit
+            // handle exists (calendar date-edit boot, numeric focus and
+            // click paths); selection is affordance-only, so drop the
+            // void call at every call site (see rule).
+            try { NeutralizeTextBoxSelectAllCalls(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // TextBoxBase.get_TextLength traps headless through its generic
+            // P/Invoke wrapper (same boot path); answer get_Text().Length
+            // instead (see rule).
+            try { RedirectTextBoxTextLengthToManaged(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+        }
+        if (assembly.Name.Name == "PaintDotNet.SystemLayer")
+        {
+            // Shell known folders answer "" headless (no SHGetFolderPath):
+            // Save-As, app-data/cache/crash dirs and browse buttons all
+            // degrade to the empty path. Answer the /vfs layout (see method).
+            try { RedirectShellVirtualPaths(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+        }
+        if (assembly.Name.Name == "PaintDotNet.Data")
+        {
+            // Persisted per-filetype save tokens need the user settings
+            // store (BinaryFormatter), unavailable headless: answer the
+            // default token so Save-As reaches its dialog (see method).
+            try { RedirectLastSaveConfigToken(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+        }
         if (assembly.Name.Name == "paintdotnet")
         {
+            // Error-dialog environment inventory faults headless and wraps
+            // the original failure: degrade it explicitly (see method).
+            // Error-dialog environment inventory faults headless and wraps
+            // the original failure: degrade it explicitly (see method).
+            try { RedirectPdnDiagnosticsFallback(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // WIC codec enumeration is empty headless: answer the desktop
+            // extension table for the Microsoft built-ins (see method).
+            try { RedirectFileTypeCctorTables(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
             // Bundled codec natives cannot load in the browser: their
             // registry factories answer null (skipped, no throw) instead
             // of faulting discovery per dialog.
@@ -241,6 +525,16 @@ public static class AssemblyRewriter
         // defaults as the file pass (targeted Ensure* stubs above already
         // cleared PInvokeImpl, so this only touches the remainder).
         StubModulePInvokes(module);
+
+        // Designer InitializeComponent runs inside the reflection-invoked
+        // ctor; WASM interp cannot unwind across that boundary, so any
+        // uncaught throw aborts the session silently. Guard the body:
+        // stash the throw for the host (deferred report + fallback form).
+        try { GuardInitializeComponents(module); }
+        catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+        {
+        }
+
 
         foreach (AssemblyNameReference reference in module.AssemblyReferences)
         {
@@ -258,46 +552,22 @@ public static class AssemblyRewriter
             // and self-references (the app's own types stay put).
             if (typeRef is TypeSpecification || typeRef.Scope == module)
                 continue;
-            string full = typeRef.FullName.Replace('/', '+');
-            if (!typeMap.TryGetValue(full, out (string Assembly, string Type) mapped))
-                continue;
-            AssemblyNameReference? scope =
-                module.AssemblyReferences.FirstOrDefault(r => r.Name == mapped.Assembly);
-            if (scope is null)
-            {
-                scope = new AssemblyNameReference(mapped.Assembly, new Version(1, 0, 0, 0));
-                module.AssemblyReferences.Add(scope);
-            }
-            typeRef.Scope = scope;
-            // Split "Ns.Outer+Inner": the namespace ends at the last '.'
-            // before the first '+' (nested TypeRefs carry their parent via
-            // DeclaringType, with an empty namespace of their own).
-            int plus = mapped.Type.IndexOf('+');
-            int dot = plus < 0
-                ? mapped.Type.LastIndexOf('.')
-                : mapped.Type.LastIndexOf('.', plus);
-            string ns = mapped.Type[..dot];
-            string[] nested = mapped.Type[(dot + 1)..].Split('+');
-            if (nested.Length == 1)
-            {
-                typeRef.Namespace = ns;
-                typeRef.Name = nested[0];
-                typeRef.DeclaringType = null;
-            }
-            else
-            {
-                TypeReference parent = new TypeReference(ns, nested[0], module, scope);
-                for (int i = 1; i < nested.Length - 1; i++)
-                    parent = new TypeReference("", nested[i], module, scope)
-                    {
-                        DeclaringType = parent,
-                    };
-                typeRef.Namespace = "";
-                typeRef.Name = nested[^1];
-                typeRef.DeclaringType = parent;
-            }
+            RemapTypeReference(module, typeRef, typeMap);
         }
 
+
+        // CustomAttribute blobs encode Type values inline
+        // (ELEMENT_TYPE_CLASS + name), not as TypeRef rows, so
+        // GetTypeReferences() never sees them: Editor/TypeConverter args
+        // kept pointing at the pre-rewrite framework scopes (dangling --
+        // the AssemblyRef itself was already renamed). The runtime then
+        // fails the attribute bind and Telerik theme deserializer
+        // swallows the TypeLoad, dropping the value (RadImageShape
+        // .BackgroundShape -> null -> white selected tabs). Remap the
+        // blob-embedded TypeReferences with the same map.
+        // Regression: RadImageShape EditorAttribute typeof(UITypeEditor)
+        // scope System.Drawing 4.0.0.0 <- Telerik theme BackgroundShape.
+        RemapCustomAttributeTypeReferences(module, typeMap);
         // CAS permission types are missing from the browser runtime and
         // fatal at load; retarget to the fork stubs (same name, new scope).
         RedirectCasTypeReferences(module);
@@ -306,10 +576,42 @@ public static class AssemblyRewriter
         // scopes); retarget to the shipped ConfigurationManager package.
         RedirectConfigurationTypeReferences(module);
 
+        // System.Data.OleDb.* lives in the netfx System.Data scope, but
+        // the browser System.Data has no OleDb types; retarget to the
+        // shipped headless stub assembly (Fill/Open degrade to empty).
+        RedirectOleDbTypeReferences(module);
+
+        // System.Media.* lives in the netfx System scope, but the
+        // browser System facade forwards to System.Windows.Extensions,
+        // which is not bundled; retarget to the shipped headless stub
+        // assembly (play verbs are silent no-ops).
+        RedirectMediaTypeReferences(module);
+
+        // DISABLED rev76: the pass retargets LoadLibraryEx/GetModuleHandle to
+        // WasmNativeLibrary null-handle stubs, but that type was never shipped
+        // in the fork, so every retargeted site TypeLoads (diagram
+        // ScrollableControl.get_CreateParams, rev76 probe). The kernel32-OOB
+        // theory was never isolated from the UpdateOleCallback invalid-IL
+        // (now fixed); unwire until the loader path proves itself a managed
+        // failure. The pass method stays for its hermetic tests.
+        // RetargetNativeLoaderCalls(module);
+
+        // System.IO.IsolatedStorage.* throws PlatformNotSupported in the
+        // browser runtime; retarget to the shipped headless stub
+        // assembly (per-assembly in-memory stores, honest FileModes).
+        RedirectIsolatedStorageTypeReferences(module);
+
         // Safely redirect ResourceManager.GetObject to ResourceHelper.SafeGetObject
         // to prevent BinaryFormatter-removed crashes in legacy resx resources on .NET 9+
         MethodReference? safeGetObject1 = null;
         MethodReference? safeGetObject2 = null;
+        MethodReference? safeGetString1 = null;
+        MethodReference? safeGetString2 = null;
+        MethodReference? safeGetStream1 = null;
+        MethodReference? safeGetStream2 = null;
+        MethodReference? safeGetResourceSet = null;
+        MethodReference? envGetFolderPath1 = null;
+        MethodReference? envGetFolderPath2 = null;
         MethodReference? safeApplyResources1 = null;
         MethodReference? safeApplyResources2 = null;
         MethodReference? vfsGetFiles1 = null;
@@ -320,33 +622,31 @@ public static class AssemblyRewriter
         MethodReference? vfsCopy2 = null;
         MethodReference? vfsCopy3 = null;
         MethodReference? vfsCreationTime = null;
+        MethodReference? vfsReadText1 = null;
+        MethodReference? vfsReadText2 = null;
+        MethodReference? baseDirStatic = null;
+        MethodReference? baseDirInstance = null;
         Mono.Cecil.TypeReference? formsGateType = null;
         Mono.Cecil.TypeReference? formsControlType = null;
         Mono.Cecil.TypeReference? wasmRegistryType = null;
 
         AssemblyNameReference? drawingScope = module.AssemblyReferences.FirstOrDefault(r => r.Name == "WfWasm.Drawing");
+        // Loose-file reads live in data-only class libraries (ERP.Repository
+        // reads Data/*.json via AppDomain.BaseDirectory + File.Exists +
+        // File.ReadAllText) that never reference the Drawing fork, so a
+        // scope-gated VFS leaves their Exists on the real disk and the
+        // panes load empty. Reference the fork like formsScope below:
+        // the runtime always carries it (the entry closure loads it).
+        if (drawingScope is null)
+        {
+            drawingScope = new AssemblyNameReference("WfWasm.Drawing", new Version(1, 0, 0, 0));
+            module.AssemblyReferences.Add(drawingScope);
+        }
         if (drawingScope is not null)
         {
             var rhType = new TypeReference("WfWasm.Drawing", "ResourceHelper", module, drawingScope);
-            safeGetObject1 = new MethodReference("SafeGetObject", module.TypeSystem.Object, rhType)
-            {
-                HasThis = false,
-                Parameters =
-                {
-                    new ParameterDefinition(module.ImportReference(typeof(System.Resources.ResourceManager))),
-                    new ParameterDefinition(module.TypeSystem.String)
-                }
-            };
-            safeGetObject2 = new MethodReference("SafeGetObject", module.TypeSystem.Object, rhType)
-            {
-                HasThis = false,
-                Parameters =
-                {
-                    new ParameterDefinition(module.ImportReference(typeof(System.Resources.ResourceManager))),
-                    new ParameterDefinition(module.TypeSystem.String),
-                    new ParameterDefinition(module.ImportReference(typeof(System.Globalization.CultureInfo)))
-                }
-            };
+            // NOTE: GetObject retargets to the fork WasmResourceShim (built
+            // below once formsScope exists), not to ResourceHelper directly.
             safeApplyResources1 = new MethodReference("SafeApplyResources", module.TypeSystem.Void, rhType)
             {
                 HasThis = false,
@@ -444,6 +744,24 @@ public static class AssemblyRewriter
                 HasThis = false,
                 Parameters = { new ParameterDefinition(module.TypeSystem.String) }
             };
+            // JSON seed reads (ERP.Repository.LoadData: File.Exists, then
+            // File.ReadAllText, then JsonConvert): Exists alone would flip
+            // a silent skip into a FileNotFound on the backslash path, so
+            // the text read follows Exists into the registry.
+            vfsReadText1 = new MethodReference("ReadAllText", module.TypeSystem.String, vfsType)
+            {
+                HasThis = false,
+                Parameters = { new ParameterDefinition(module.TypeSystem.String) }
+            };
+            vfsReadText2 = new MethodReference("ReadAllText", module.TypeSystem.String, vfsType)
+            {
+                HasThis = false,
+                Parameters =
+                {
+                    new ParameterDefinition(module.TypeSystem.String),
+                    new ParameterDefinition(module.ImportReference(typeof(System.Text.Encoding)))
+                }
+            };
         }
 
         // Headless Invalidate() is a silent no-op (IsHandleCreated is never
@@ -459,9 +777,136 @@ public static class AssemblyRewriter
             module.AssemblyReferences.Add(formsScope);
         }
 
+        // Browser BaseDirectory is null/empty (assemblies load from bytes):
+        // AppDomain + AppContext getters funnel to WasmAppIdentity, which
+        // passes the real value through and falls back to "/app" (the
+        // VFS tail-match makes the fallback hit served content). The
+        // instance getter keeps its `this` as the shim's object arg (same
+        // stack shape as the Invalidate hook below, no Pop needed).
+        var identityType = new TypeReference("System.Windows.Forms", "WasmAppIdentity", module, formsScope);
+        baseDirStatic = new MethodReference("BaseDirectory", module.TypeSystem.String, identityType)
+        {
+            HasThis = false,
+        };
+        baseDirInstance = new MethodReference("BaseDirectory", module.TypeSystem.String, identityType)
+        {
+            HasThis = false,
+            Parameters = { new ParameterDefinition(module.TypeSystem.Object) },
+        };
         formsGateType = new TypeReference("System.Windows.Forms", "WasmRepaintGate", module, formsScope);
         formsControlType = new TypeReference("System.Windows.Forms", "Control", module, formsScope);
         wasmRegistryType = new TypeReference("System.Windows.Forms", "WasmRegistry", module, formsScope);
+
+        // ResourceManager.GetObject retargets to the fork shim (not the
+        // Drawing helper directly): designer ".ImageStream" entries hydrate
+        // into real ImageListStreamers there, everything else flows through.
+        var shimType = new TypeReference("System.Windows.Forms", "WasmResourceShim", module, formsScope);
+        safeGetObject1 = new MethodReference("SafeGetObject", module.TypeSystem.Object, shimType)
+        {
+            HasThis = false,
+            Parameters =
+            {
+                new ParameterDefinition(module.ImportReference(typeof(System.Resources.ResourceManager))),
+                new ParameterDefinition(module.TypeSystem.String)
+            }
+        };
+        safeGetObject2 = new MethodReference("SafeGetObject", module.TypeSystem.Object, shimType)
+        {
+            HasThis = false,
+            Parameters =
+            {
+                new ParameterDefinition(module.ImportReference(typeof(System.Resources.ResourceManager))),
+                new ParameterDefinition(module.TypeSystem.String),
+                new ParameterDefinition(module.ImportReference(typeof(System.Globalization.CultureInfo)))
+            }
+        };
+
+        // ResourceManager/ComponentResourceManager.GetString funnels into
+        // GetObject/GetResourceSet, which instantiates the legacy
+        // ResourceReader for v1-header streams; vendor .resources that
+        // name DeserializingResourceReader then throw NSE out of BCL with
+        // no managed catch on the path (native OOB trap via the ctor).
+        // Retarget to the fork shim's throw-free SafeGetString. Same for
+        // GetStream (BCL would hand back an UnmanagedMemoryStream over a
+        // set it cannot even open on those streams).
+        safeGetString1 = new MethodReference("SafeGetString", module.TypeSystem.String, shimType)
+        {
+            HasThis = false,
+            Parameters =
+            {
+                new ParameterDefinition(module.ImportReference(typeof(System.Resources.ResourceManager))),
+                new ParameterDefinition(module.TypeSystem.String)
+            }
+        };
+        safeGetString2 = new MethodReference("SafeGetString", module.TypeSystem.String, shimType)
+        {
+            HasThis = false,
+            Parameters =
+            {
+                new ParameterDefinition(module.ImportReference(typeof(System.Resources.ResourceManager))),
+                new ParameterDefinition(module.TypeSystem.String),
+                new ParameterDefinition(module.ImportReference(typeof(System.Globalization.CultureInfo)))
+            }
+        };
+        safeGetStream1 = new MethodReference("SafeGetStream", module.ImportReference(typeof(System.IO.Stream)), shimType)
+        {
+            HasThis = false,
+            Parameters =
+            {
+                new ParameterDefinition(module.ImportReference(typeof(System.Resources.ResourceManager))),
+                new ParameterDefinition(module.TypeSystem.String)
+            }
+        };
+        safeGetStream2 = new MethodReference("SafeGetStream", module.ImportReference(typeof(System.IO.Stream)), shimType)
+        {
+            HasThis = false,
+            Parameters =
+            {
+                new ParameterDefinition(module.ImportReference(typeof(System.Resources.ResourceManager))),
+                new ParameterDefinition(module.TypeSystem.String),
+                new ParameterDefinition(module.ImportReference(typeof(System.Globalization.CultureInfo)))
+            }
+        };
+
+        // ResourceManager/ComponentResourceManager.GetResourceSet is the
+        // remaining raw BCL read entry (Syncfusion SR wrappers call it in
+        // SetResources/GetLocalizedResourceManager): same legacy-reader
+        // NSE death on the vendor streams. Retarget to the fork shim's
+        // derived-set answer.
+        safeGetResourceSet = new MethodReference("SafeGetResourceSet", module.ImportReference(typeof(System.Resources.ResourceSet)), shimType)
+        {
+            HasThis = false,
+            Parameters =
+            {
+                new ParameterDefinition(module.ImportReference(typeof(System.Resources.ResourceManager))),
+                new ParameterDefinition(module.ImportReference(typeof(System.Globalization.CultureInfo))),
+                new ParameterDefinition(module.TypeSystem.Boolean),
+                new ParameterDefinition(module.TypeSystem.Boolean)
+            }
+        };
+
+        // Environment.GetFolderPath answers "" for every folder on WASM,
+        // which kills Framework-era path builders (Telerik PDF
+        // FontsManager..cctor GetParents the System folder and throws on
+        // the empty path). Retarget to the fork's virtual layout.
+        var envType = new TypeReference("System.Windows.Forms", "WasmEnvironment", module, formsScope);
+        envGetFolderPath1 = new MethodReference("GetFolderPath", module.TypeSystem.String, envType)
+        {
+            HasThis = false,
+            Parameters =
+            {
+                new ParameterDefinition(module.ImportReference(typeof(System.Environment.SpecialFolder)))
+            }
+        };
+        envGetFolderPath2 = new MethodReference("GetFolderPath", module.TypeSystem.String, envType)
+        {
+            HasThis = false,
+            Parameters =
+            {
+                new ParameterDefinition(module.ImportReference(typeof(System.Environment.SpecialFolder))),
+                new ParameterDefinition(module.ImportReference(typeof(System.Environment.SpecialFolderOption)))
+            }
+        };
 
         // UIAutomationCore.dll is absent headless: the DllImport behind
         // AutomationInteropProvider.ClientsAreListening throws DllNotFound
@@ -474,17 +919,6 @@ public static class AssemblyRewriter
             HasThis = false,
         };
 
-        var dwfRef = module.AssemblyReferences.FirstOrDefault(r => r.Name == "DirectWriteForwarder");
-        if (dwfRef != null)
-        {
-            module.AssemblyReferences.Remove(dwfRef);
-        }
-
-        var codeDomRef = module.AssemblyReferences.FirstOrDefault(r => r.Name == "System.CodeDom");
-        if (codeDomRef != null)
-        {
-            module.AssemblyReferences.Remove(codeDomRef);
-        }
 
             var modType = module.Types.FirstOrDefault(t => t.Name == "<Module>");
             if (modType != null)
@@ -492,10 +926,22 @@ public static class AssemblyRewriter
                 var modCctor = modType.Methods.FirstOrDefault(m => m.Name == ".cctor");
                 if (modCctor != null && modCctor.HasBody)
                 {
+                    // Keep same-module initializer calls (compiler-generated ModuleInitializer dispatch:
+                    // managed hook wiring like WfWasmInit.Init). Drop calls into external assemblies
+                    // (native CRT init etc. crash under WASM). Module cctors are call+ret only.
+                    var keep = new List<Instruction>();
+                    foreach (var ins in modCctor.Body.Instructions)
+                        if ((ins.OpCode == OpCodes.Call || ins.OpCode == OpCodes.Callvirt) &&
+                            ins.Operand is MethodReference mr &&
+                            mr.DeclaringType.Scope == module)
+                            keep.Add(ins);
                     modCctor.Body.ExceptionHandlers.Clear();
                     modCctor.Body.Variables.Clear();
                     modCctor.Body.Instructions.Clear();
-                    modCctor.Body.Instructions.Add(modCctor.Body.GetILProcessor().Create(OpCodes.Ret));
+                    var cil = modCctor.Body.GetILProcessor();
+                    foreach (var ins in keep)
+                        modCctor.Body.Instructions.Add(cil.Create(ins.OpCode, (MethodReference)ins.Operand));
+                    modCctor.Body.Instructions.Add(cil.Create(OpCodes.Ret));
                 }
             }
 
@@ -1873,7 +2319,7 @@ public static class AssemblyRewriter
                         // commits in TaskProgressDialog measurement. With no
                         // device there are no rendering parameters, and the
                         // method's own null-params fallback is DirectWrite
-                        // (0) — which is also what the body computes against
+                        // (0) â€” which is also what the body computes against
                         // our inert stub context (null params), so answering
                         // 0 outright preserves stub behavior and fixes null.
                         method.Body.ExceptionHandlers.Clear();
@@ -2007,7 +2453,7 @@ public static class AssemblyRewriter
                         && method.ReturnType.FullName == "System.Void")
                     {
                         // Progress sync drives the Windows taskbar
-                        // (TaskbarList COM activation → NRE in WASM) and the
+                        // (TaskbarList COM activation â†’ NRE in WASM) and the
                         // dialog progress bar. Pure UI feedback for an
                         // already-running task: skipping it cannot affect
                         // the commit itself. This unblocks the task
@@ -2029,8 +2475,8 @@ public static class AssemblyRewriter
                         // The canvas is a single fixed surface: there are no
                         // monitors to track, so refreshing is a no-op. This
                         // unblocks TaskProgressDialog construction during
-                        // brush commits (OnLayout → ClientSize →
-                        // OnMonitorChanged → here).
+                        // brush commits (OnLayout â†’ ClientSize â†’
+                        // OnMonitorChanged â†’ here).
                         method.Body.ExceptionHandlers.Clear();
                         method.Body.Variables.Clear();
                         method.Body.Instructions.Clear();
@@ -2219,6 +2665,39 @@ public static class AssemblyRewriter
                         method.Body.Instructions.Add(il.Create(Mono.Cecil.Cil.OpCodes.Ret));
                         continue;
                     }
+                    if (type.FullName == "PaintDotNet.SystemLayer.FileSystem" && method.Name == "CreateTempFile")
+                    {
+                        // The original body pinvokes CreateFileW for a
+                        // handle, but every pinvoke is stubbed in WASM and
+                        // the stub answers a null handle: CreateTempFile
+                        // only rejects INVALID_HANDLE_VALUE (-1), so the
+                        // null slips through and the FileStream dies in
+                        // ValidateHandle ("The handle is invalid"). That
+                        // poisons FileSystem..cctor (which holds the
+                        // session.lock probe stream in sessionToken) and
+                        // with it every history/scratch path (no ink). Only
+                        // two callers exist (..cctor probe, clipboard
+                        // AddNativeData); both pass full paths from managed
+                        // helpers, so open the managed way with the original
+                        // flags: Create + ReadWrite + Read-share (lock-file
+                        // semantics) + DeleteOnClose (temp semantics). Mirror
+                        // of the OpenStreamingFile rule above.
+                        var streamCtor = module.ImportReference(typeof(System.IO.FileStream).GetConstructor(
+                            [typeof(string), typeof(System.IO.FileMode), typeof(System.IO.FileAccess),
+                                typeof(System.IO.FileShare), typeof(int), typeof(System.IO.FileOptions)])!);
+                        method.Body.ExceptionHandlers.Clear();
+                        method.Body.Variables.Clear();
+                        method.Body.Instructions.Clear();
+                        method.Body.Instructions.Add(il.Create(Mono.Cecil.Cil.OpCodes.Ldarg_0));
+                        method.Body.Instructions.Add(il.Create(Mono.Cecil.Cil.OpCodes.Ldc_I4_2));
+                        method.Body.Instructions.Add(il.Create(Mono.Cecil.Cil.OpCodes.Ldc_I4_3));
+                        method.Body.Instructions.Add(il.Create(Mono.Cecil.Cil.OpCodes.Ldc_I4_1));
+                        method.Body.Instructions.Add(il.Create(Mono.Cecil.Cil.OpCodes.Ldarg_1));
+                        method.Body.Instructions.Add(il.Create(Mono.Cecil.Cil.OpCodes.Ldc_I4, 0x04000000));
+                        method.Body.Instructions.Add(il.Create(Mono.Cecil.Cil.OpCodes.Newobj, streamCtor));
+                        method.Body.Instructions.Add(il.Create(Mono.Cecil.Cil.OpCodes.Ret));
+                        continue;
+                    }
                     if (type.FullName == "PaintDotNet.DirectWrite.DirectWriteFactoryExtensions" && method.Name == "GetGdiFontMap")
                     {
                         // The DWrite factory is neutered headless, so this
@@ -2304,7 +2783,11 @@ public static class AssemblyRewriter
                         // container extensions dies (NRE) and kills every
                         // built-in FileType .cctor (Gif/Bmp/Tiff, seen when
                         // the File > Open dialog enumerates file types).
-                        // Answer an empty list; codec IO itself is later work.
+                        // Answer an empty list; the built-in FileType .cctors
+                        // themselves are rewritten with literal tables by
+                        // RedirectFileTypeCctorTables (a member-call switch
+                        // over cross-assembly structs fails runtime member
+                        // resolution headless: TypeLoadException kind 17).
                         method.Body.ExceptionHandlers.Clear();
                         method.Body.Variables.Clear();
                         method.Body.Instructions.Clear();
@@ -4073,6 +4556,7 @@ public static class AssemblyRewriter
                             || type.FullName == "PaintDotNet.Controls.Direct2DPictureBox")
                         && (method.Name == ".ctor"
                             || method.Name == "get_DirectWriteFactory"
+                            || method.Name == "OnHandleCreatedInternal"
                             || method.Name == "get_Direct2DFactory"
                             || method.Name == "get_ImagingFactory"
                             || method.Name == "get_DeviceContext"
@@ -4150,6 +4634,21 @@ public static class AssemblyRewriter
                             continue;
                         }
                         // The device-backed impl is gone (see above), so the
+                        if (method.Name == "OnHandleCreatedInternal"
+                            && method.Parameters.Count == 0
+                            && method.ReturnType.FullName == "System.Void")
+                        {
+                            // The device impl these controls would drive
+                            // from here is gone (ctor rule above), so the
+                            // relay would null-ref and take GdiControl's
+                            // input relay down with it. The software path
+                            // never needed this hook.
+                            method.Body.ExceptionHandlers.Clear();
+                            method.Body.Variables.Clear();
+                            method.Body.Instructions.Clear();
+                            method.Body.Instructions.Add(il.Create(OpCodes.Ret));
+                            continue;
+                        }
                         // Hwnd/device forwarding accessors would null-ref.
                         // Setters are dropped; getters report defaults (all
                         // bool/string/enum: false, null, or the 0 member,
@@ -4221,6 +4720,23 @@ public static class AssemblyRewriter
                         if ((instruction.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt || instruction.OpCode == Mono.Cecil.Cil.OpCodes.Call || instruction.OpCode == Mono.Cecil.Cil.OpCodes.Newobj)
                             && instruction.Operand is MethodReference mr)
                         {
+                            // Self-exclusion: the shim's headless passthrough calls
+                            // the same BCL method; retargeting it would recurse.
+                            if (envGetFolderPath1 != null && mr.Name == "GetFolderPath"
+                                && mr.DeclaringType.FullName == "System.Environment"
+                                && !(type.FullName == "System.Windows.Forms.WasmEnvironment" && method.Name == "GetFolderPath"))
+                            {
+                                if (mr.Parameters.Count == 1)
+                                {
+                                    instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                                    instruction.Operand = envGetFolderPath1;
+                                }
+                                else if (mr.Parameters.Count == 2 && envGetFolderPath2 != null)
+                                {
+                                    instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                                    instruction.Operand = envGetFolderPath2;
+                                }
+                            }
                             if (safeGetObject1 != null && mr.Name == "GetObject"
                                 && (mr.DeclaringType.FullName == "System.Resources.ResourceManager" || mr.DeclaringType.FullName == "System.ComponentModel.ComponentResourceManager"))
                             {
@@ -4248,6 +4764,55 @@ public static class AssemblyRewriter
                                     instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
                                     instruction.Operand = safeApplyResources2;
                                 }
+                            }
+                            else if (safeGetResourceSet != null && mr.Name == "GetResourceSet"
+                                && (mr.DeclaringType.FullName == "System.Resources.ResourceManager" || mr.DeclaringType.FullName == "System.ComponentModel.ComponentResourceManager")
+                                && mr.Parameters.Count == 3)
+                            {
+                                instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                                instruction.Operand = safeGetResourceSet;
+                            }
+                            else if (safeGetString1 != null && mr.Name == "GetString"
+                                && (mr.DeclaringType.FullName == "System.Resources.ResourceManager" || mr.DeclaringType.FullName == "System.ComponentModel.ComponentResourceManager"))
+                            {
+                                if (mr.Parameters.Count == 1)
+                                {
+                                    instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                                    instruction.Operand = safeGetString1;
+                                }
+                                else if (mr.Parameters.Count == 2)
+                                {
+                                    instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                                    instruction.Operand = safeGetString2;
+                                }
+                            }
+                            else if (safeGetStream1 != null && mr.Name == "GetStream"
+                                && (mr.DeclaringType.FullName == "System.Resources.ResourceManager" || mr.DeclaringType.FullName == "System.ComponentModel.ComponentResourceManager"))
+                            {
+                                if (mr.Parameters.Count == 1)
+                                {
+                                    instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                                    instruction.Operand = safeGetStream1;
+                                }
+                                else if (mr.Parameters.Count == 2)
+                                {
+                                    instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                                    instruction.Operand = safeGetStream2;
+                                }
+                            }
+                            else if (baseDirStatic != null && mr.Name == "get_BaseDirectory"
+                                && mr.DeclaringType.FullName == "System.AppContext"
+                                && !mr.HasThis && mr.Parameters.Count == 0)
+                            {
+                                instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                                instruction.Operand = baseDirStatic;
+                            }
+                            else if (baseDirInstance != null && mr.Name == "get_BaseDirectory"
+                                && mr.DeclaringType.FullName == "System.AppDomain"
+                                && mr.HasThis && mr.Parameters.Count == 0)
+                            {
+                                instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                                instruction.Operand = baseDirInstance;
                             }
                             else if (formsGateType != null && formsControlType != null && mr.Name == "Invalidate"
                                 && mr.DeclaringType.FullName == "System.Windows.Forms.Control" && mr.HasThis)
@@ -4324,6 +4889,20 @@ public static class AssemblyRewriter
                                 instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
                                 instruction.Operand = vfsCreationTime;
                             }
+                            else if (mr.Name == "ReadAllText"
+                                && mr.DeclaringType.FullName == "System.IO.File")
+                            {
+                                if (mr.Parameters.Count == 1 && vfsReadText1 != null)
+                                {
+                                    instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                                    instruction.Operand = vfsReadText1;
+                                }
+                                else if (mr.Parameters.Count == 2 && vfsReadText2 != null)
+                                {
+                                    instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                                    instruction.Operand = vfsReadText2;
+                                }
+                            }
                             else if (mr.Name == "get_ClientsAreListening"
                                 && mr.DeclaringType.FullName == "System.Windows.Automation.Provider.AutomationInteropProvider"
                                 && mr.Parameters.Count == 0)
@@ -4350,7 +4929,7 @@ public static class AssemblyRewriter
                                 {
                                     regOk = mr.Name switch
                                     {
-                                        "OpenSubKey" => mr.Parameters.Count is 1 or 2,
+                                        "OpenSubKey" => mr.Parameters.Count is 1 or 2 or 3,
                                         "GetValue" => mr.Parameters.Count is 1 or 2 or 3,
                                         "SetValue" => mr.Parameters.Count is 2 or 3,
                                         "CreateSubKey" => mr.Parameters.Count is 1 or 3,
@@ -4466,6 +5045,26 @@ public static class AssemblyRewriter
         // return E_NOTIMPL through the callers' own error channels.
         EnsureHeadlessAnimation(module);
 
+        // Dead-ref sweep, last so strip passes settle first: dropping a
+        // scope the writer still emits typerefs against orphans them
+        // (Cecil re-emits dangling scopes against the wrong table -
+        // observed: the DWF fake self-named refs re-emitted as
+        // System.Private.CoreLib, fatal TypeLoad at bind time). Liveness
+        // is reachability from live metadata, not table presence: strip
+        // passes leave dead TypeRef rows the writer prunes.
+        var liveScopes = LiveScopes(module);
+        var dwfRef = module.AssemblyReferences.FirstOrDefault(r => r.Name == "DirectWriteForwarder");
+        if (dwfRef != null && !liveScopes.Contains(dwfRef))
+        {
+            module.AssemblyReferences.Remove(dwfRef);
+        }
+
+        var codeDomRef = module.AssemblyReferences.FirstOrDefault(r => r.Name == "System.CodeDom");
+        if (codeDomRef != null && !liveScopes.Contains(codeDomRef))
+        {
+            module.AssemblyReferences.Remove(codeDomRef);
+        }
+
         using var ms = new MemoryStream();
         assembly.Write(ms);
         return ms.ToArray();
@@ -4494,8 +5093,8 @@ public static class AssemblyRewriter
     // stloc dpi, ldloca dpi, call get_X, conv.r8, ldc.r8 96, div,
     // stloc scale. Returns the scale local's index and the instruction
     // index just past the scale store (a point where the evaluation stack
-    // is provably empty, hence a legal splice join). Anything else —
-    // different shape, unknown locals — returns false and the method is
+    // is provably empty, hence a legal splice join). Anything else â€”
+    // different shape, unknown locals â€” returns false and the method is
     // left untouched: guessing a local slot or joining mid-expression
     // produces unverifiable IL (InvalidProgram under the interpreter).
     private static bool TryMatchDpiScalePrologue(MethodDefinition method, out int scaleSlot, out int prologueEnd)
@@ -5269,7 +5868,7 @@ public static class AssemblyRewriter
     }
     // CpuCommandList: deferred recordings are meaningless headless
     // (draws execute immediately), so the list is an inert token that
-    // survives Close/Stream and lets DrawImage skip it — the pixels
+    // survives Close/Stream and lets DrawImage skip it â€” the pixels
     // are already in the target. Anything returning a value fails
     // loudly: a real recording would be needed there.
     private static TypeDefinition SynthesizeCpuCommandList(ModuleDefinition module)
@@ -6565,11 +7164,74 @@ public static class AssemblyRewriter
         ext.Body.InitLocals = true;
         ext.Body.MaxStackSize = 8;
     }
+    // Browser WASM is single-threaded and Thread.Start is neutered, so
+    // Telerik's AnimationEngine.Start handshake (worker signals first,
+    // caller WaitOnes) deadlocks: grid right-click wedges in ShowPopup.
+    // AllowAnimations=false skips every animation branch (the only
+    // AnimationEngine.Start call site is gated by it), so popups show
+    // instantly with no threads and no stuck animating input gate. The
+    // getter is hardcoded false; the static-ctor init is flipped too in
+    // case of direct field reads (all known consumers use the property).
+    private static void EnsureTelerikNoAnimations(Mono.Cecil.ModuleDefinition module)
+    {
+        Mono.Cecil.TypeDefinition svc = module.GetType("Telerik.WinControls.ThemeResolutionService")
+            ?? throw new InvalidOperationException("Telerik: ThemeResolutionService missing.");
+        Mono.Cecil.MethodDefinition? getter = svc.Methods.FirstOrDefault(m => m.Name == "get_AllowAnimations" && m.IsStatic && m.Parameters.Count == 0);
+        if (getter is not null && getter.HasBody)
+        {
+            getter.Body.Instructions.Clear();
+            Mono.Cecil.Cil.ILProcessor gil = getter.Body.GetILProcessor();
+            gil.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_0);
+            gil.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+            getter.Body.InitLocals = true;
+            getter.Body.MaxStackSize = 8;
+        }
+        Mono.Cecil.MethodDefinition? cctor = svc.Methods.FirstOrDefault(m => m.Name == ".cctor" && m.HasBody);
+        if (cctor is null)
+        {
+            return;
+        }
+        var insns = cctor.Body.Instructions;
+        for (int i = 0; i + 1 < insns.Count; i++)
+        {
+            if (insns[i].OpCode == Mono.Cecil.Cil.OpCodes.Ldc_I4_1
+                && insns[i + 1].OpCode == Mono.Cecil.Cil.OpCodes.Stsfld
+                && insns[i + 1].Operand is Mono.Cecil.FieldReference fr
+                && fr.Name == "allowAnimations")
+            {
+                insns[i].OpCode = Mono.Cecil.Cil.OpCodes.Ldc_I4_0;
+            }
+        }
+    }
+    // Uniscribe (usp10) cannot exist headless: the generic P/Invoke
+    // stub no-ops ScriptGetProperties, leaving its table pointer null,
+    // and ContainsComplexScript then NREs dereferencing it for every
+    // non-empty string. Its only callers are the text measure/draw
+    // dispatchers (TextBlock.MeasureRun/DrawRunGDI(Plus),
+    // RadTextMeasurer.MeasureText) choosing simple vs shaped text;
+    // headless has no shaper, so answer false (simple text).
+    private static void EnsureUniscribeHeadlessFalse(ModuleDefinition module)
+    {
+        TypeDefinition uni = module.GetType("Telerik.WinForms.RichTextEditor.Uniscribe")
+            ?? throw new InvalidOperationException("Telerik RTE: Uniscribe missing.");
+        MethodDefinition probe = uni.Methods.FirstOrDefault(m => m.Name == "ContainsComplexScript"
+            && m.Parameters.Count == 1
+            && m.ReturnType.FullName == "System.Boolean"
+            && m.HasBody)
+            ?? throw new InvalidOperationException("Telerik RTE: ContainsComplexScript missing.");
+        probe.Body.ExceptionHandlers.Clear();
+        probe.Body.Variables.Clear();
+        probe.Body.Instructions.Clear();
+        probe.Body.Instructions.Add(probe.Body.GetILProcessor().Create(OpCodes.Ldc_I4_0));
+        probe.Body.Instructions.Add(probe.Body.GetILProcessor().Create(OpCodes.Ret));
+        probe.Body.InitLocals = true;
+        probe.Body.MaxStackSize = 1;
+    }
     // GPU effects choose a rendering device through a settings lookup
     // that is null headless (no settings service): every GPU effect
     // dies in get_RenderingGpuChoice. The synthesized setting answers
     // the software choice (Type==3), routing effects down the CPU
-    // branch — the same path a device-less desktop takes.
+    // branch â€” the same path a device-less desktop takes.
     private static void EnsureCpuGpuChoiceSetting(ModuleDefinition module)
     {
         TypeDefinition choiceDef = ResolveExternalDef(module, "PaintDotNet.Framework", "PaintDotNet.Gpu.GpuChoice");
@@ -6711,6 +7373,1312 @@ public static class AssemblyRewriter
                 Identity(m, 1, true);
         }
     }
+    // PaintDotNet's environment-inventory diagnostics (DiagnosticsGenerator.
+    // GetFormattedText) probes GPU/package/service state that faults headless;
+    // the blocking .Result then wraps the ORIGINAL error in an
+    // AggregateException, killing the error dialog the text was meant to
+    // fill (Save-As failure invisibly fatal). Route every caller (error
+    // dialog, diagnostics page, clipboard copy, effect errors) to the
+    // browser-safe fallback: the original error text is preserved, only
+    // the environment section degrades explicitly. Public so the rewrite
+    // tests pin it directly, like the Redirect* rules.
+    public static void RedirectPdnDiagnosticsFallback(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        Mono.Cecil.AssemblyNameReference? drawingScope = module.AssemblyReferences
+            .FirstOrDefault(r => r.Name == "WfWasm.Drawing");
+        if (drawingScope is null)
+        {
+            drawingScope = new Mono.Cecil.AssemblyNameReference("WfWasm.Drawing", new Version(1, 0, 0, 0));
+            module.AssemblyReferences.Add(drawingScope);
+        }
+        var diagType = new Mono.Cecil.TypeReference(
+            "WfWasm.Drawing", "PdnDiagnostics", module, drawingScope);
+        var fallback = new Mono.Cecil.MethodReference("GetErrorDetailsFallback",
+            module.TypeSystem.String, diagType)
+        {
+            HasThis = false,
+            Parameters =
+            {
+                new Mono.Cecil.ParameterDefinition(module.TypeSystem.Object),
+                new Mono.Cecil.ParameterDefinition(module.TypeSystem.Boolean),
+            }
+        };
+        Mono.Cecil.TypeDefinition diag = module.GetType("PaintDotNet.Diagnostics.DiagnosticsGenerator")
+            ?? throw new InvalidOperationException("PdnDiag: DiagnosticsGenerator missing");
+        bool any = false;
+        foreach (Mono.Cecil.MethodDefinition m in diag.Methods)
+        {
+            if (m.Name != "GetFormattedText" || !m.HasBody)
+                continue;
+            if (m.Parameters.Count != 2
+                || m.Parameters[1].ParameterType.FullName != "System.Boolean"
+                || m.ReturnType.FullName != "System.String")
+                continue;
+            m.Body.ExceptionHandlers.Clear();
+            m.Body.Variables.Clear();
+            m.Body.Instructions.Clear();
+            var il = m.Body.GetILProcessor();
+            // AppSettings derives to object verifiably; the bool passes through.
+            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_1);
+            il.Emit(Mono.Cecil.Cil.OpCodes.Call, fallback);
+            il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+            if (m.Body.MaxStackSize < 8)
+                m.Body.MaxStackSize = 8;
+            any = true;
+        }
+        if (!any)
+            throw new InvalidOperationException("PdnDiag: GetFormattedText(AppSettings, bool) missing");
+    }
+    // Built-in FileType .cctors (Bmp/Gif/Jpeg/Png/Tiff) query WIC for their
+    // extension lists; headless the query dies and every cctor with it
+    // (Save-As dies in DoSaveAsDialog via a null DefaultSaveExtension).
+    // Answer desktop-exact literal tables at the two WicHelpers call sites
+    // of each cctor, keeping everything else byte-identical (ToFrozen,
+    // the JPEG .jpg-to-front tweak, field stores). Extension strings read
+    // off desktop encoders 2026-10-19; JPEG lists keep WIC order so the
+    // cctor's own Remove+Insert(0) still fronts .jpg exactly like desktop.
+    // Only in-module callees remain (FileTypeOptions setters); the argument
+    // chains (ContainerFormats/VendorIDs) are removed with the calls.
+    // Public so the rewrite tests pin it directly, like the Redirect* rules.
+    public static void RedirectFileTypeCctorTables(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        (string Type, string[] Load, string[] Save)[] rows = new (string, string[], string[])[]
+        {
+            ("PaintDotNet.Data.BmpFileType",
+                new[] { ".bmp", ".dib", ".rle" }, new[] { ".bmp", ".dib", ".rle" }),
+            ("PaintDotNet.Data.GifFileType",
+                new[] { ".gif" }, new[] { ".gif" }),
+            ("PaintDotNet.Data.JpegFileType",
+                new[] { ".jpeg", ".jpe", ".jpg", ".jfif", ".exif" },
+                new[] { ".jpeg", ".jpe", ".jpg", ".jfif", ".exif" }),
+            ("PaintDotNet.Data.PngFileType",
+                new[] { ".png" }, new[] { ".png" }),
+            ("PaintDotNet.Data.TiffFileType",
+                new[] { ".tiff", ".tif" }, new[] { ".tiff", ".tif" }),
+        };
+        bool any = false;
+        foreach (var row in rows)
+        {
+            // Skip absent types (PDN version skew): the zero-match throw
+            // below still fails loudly when the rule fires nowhere.
+            Mono.Cecil.TypeDefinition? t = module.GetType(row.Type);
+            if (t is null)
+                continue;
+            Mono.Cecil.MethodDefinition? cctor = null;
+            foreach (var m in t.Methods)
+                if (m.Name == ".cctor" && m.HasBody) { cctor = m; break; }
+            if (cctor is null)
+                throw new InvalidOperationException("CpuPaint: " + row.Type + ".cctor missing");
+            // Save site first so the earlier load index stays valid.
+            EmitCctorTable(cctor, row.Type, "GetSaveExtensions", row.Save);
+            EmitCctorTable(cctor, row.Type, "GetLoadExtensions", row.Load);
+            any = true;
+        }
+        if (!any)
+            throw new InvalidOperationException("CpuPaint: no FileType cctor matched");
+    }
+
+    // FileType.GetLastSaveConfigToken reads the persisted per-filetype
+    // token (BinaryFormatter over the user settings store) and throws
+    // InvalidOperationException headless when the settings store is
+    // unavailable -- Save-As dies in set_FileType before the dialog shows.
+    // Answer the default token instead: CreateDefaultSaveConfigToken is a
+    // non-virtual helper that dispatches to each type's virtual
+    // OnCreateDefaultSaveConfigToken, so per-type defaults are preserved
+    // exactly (verified: no overrides/shadows of the helper in PDN).
+    // Only the "remember my last save settings" persistence degrades.
+    // Public so the rewrite tests pin it directly, like the Redirect* rules.
+    public static void RedirectLastSaveConfigToken(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        Mono.Cecil.TypeDefinition ft = module.GetType("PaintDotNet.FileType")
+            ?? throw new InvalidOperationException("SaveToken: PaintDotNet.FileType missing");
+        Mono.Cecil.MethodDefinition? target = null;
+        Mono.Cecil.MethodDefinition? factory = null;
+        foreach (Mono.Cecil.MethodDefinition m in ft.Methods)
+        {
+            if (m.Name == "GetLastSaveConfigToken" && m.HasBody && m.Parameters.Count == 0
+                && m.ReturnType.FullName == "PaintDotNet.SaveConfigToken")
+                target = m;
+            if (m.Name == "CreateDefaultSaveConfigToken" && m.Parameters.Count == 0
+                && !m.IsStatic && m.ReturnType.FullName == "PaintDotNet.SaveConfigToken")
+                factory = m;
+        }
+        if (target is null)
+            throw new InvalidOperationException("SaveToken: GetLastSaveConfigToken() missing");
+        if (factory is null)
+            throw new InvalidOperationException("SaveToken: CreateDefaultSaveConfigToken() missing");
+        target.Body.ExceptionHandlers.Clear();
+        target.Body.Variables.Clear();
+        target.Body.Instructions.Clear();
+        var il = target.Body.GetILProcessor();
+        // Mirrors the blocked-plugin branch of the original body.
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Call, factory);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+        if (target.Body.MaxStackSize < 8)
+            target.Body.MaxStackSize = 8;
+    }
+
+    // PaintDotNet.SystemLayer.ShellUtil.GetVirtualPath answers shell
+    // known folders via SHGetFolderPath: headless it answers "" (no
+    // throw), so every consumer degrades to the empty path -- Save-As
+    // dies in GetDefaultSavePath, app-data/cache/crash dirs vanish.
+    // Answer the fork's /vfs layout instead (cf. WasmEnvironment), honoring
+    // the create flag with an idempotent guarded CreateDirectory.
+    // Only mscorlib callees remain, so no headless member resolution.
+    // Public so the rewrite tests pin it directly, like the Redirect* rules.
+    public static void RedirectShellVirtualPaths(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        Mono.Cecil.TypeDefinition util = module.GetType("PaintDotNet.SystemLayer.ShellUtil")
+            ?? throw new InvalidOperationException("ShellVfs: ShellUtil missing");
+        Mono.Cecil.MethodDefinition? target = null;
+        foreach (Mono.Cecil.MethodDefinition m in util.Methods)
+        {
+            if (m.Name == "GetVirtualPath" && m.HasBody && m.Parameters.Count == 2
+                && m.Parameters[1].ParameterType.FullName == "System.Boolean"
+                && m.ReturnType.FullName == "System.String")
+                target = m;
+        }
+        if (target is null)
+            throw new InvalidOperationException("ShellVfs: GetVirtualPath(VirtualFolderName, bool) missing");
+        var createDir = module.ImportReference(typeof(System.IO.Directory).GetMethod(
+            "CreateDirectory", new[] { typeof(string) })!);
+        var argEx = module.ImportReference(typeof(ArgumentOutOfRangeException).GetConstructor(
+            new[] { typeof(string) })!);
+        var exType = module.ImportReference(typeof(Exception));
+        target.Body.ExceptionHandlers.Clear();
+        target.Body.Variables.Clear();
+        target.Body.Instructions.Clear();
+        target.Body.Variables.Add(new Mono.Cecil.Cil.VariableDefinition(module.TypeSystem.String));
+        target.Body.InitLocals = true;
+        var il = target.Body.GetILProcessor();
+        // Index mirrors PaintDotNet.SystemLayer.VirtualFolderName.
+        string[] paths = new[]
+        {
+            "/vfs/desktop", "/vfs/documents", "/vfs/pictures",
+            "/vfs/local-app-data", "/vfs/app-data", "/vfs/program-files",
+            "/vfs/windows/Fonts",
+        };
+        var doCreate = il.Create(Mono.Cecil.Cil.OpCodes.Nop);
+        var ret = il.Create(Mono.Cecil.Cil.OpCodes.Nop);
+        for (int i = 0; i < paths.Length; i++)
+        {
+            var next = il.Create(Mono.Cecil.Cil.OpCodes.Nop);
+            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+            il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4, i);
+            il.Emit(Mono.Cecil.Cil.OpCodes.Bne_Un, next);
+            il.Emit(Mono.Cecil.Cil.OpCodes.Ldstr, paths[i]);
+            il.Emit(Mono.Cecil.Cil.OpCodes.Stloc_0);
+            il.Emit(Mono.Cecil.Cil.OpCodes.Br, doCreate);
+            il.Append(next);
+        }
+        // Unknown folder (unreachable from PDN: 0..6 only).
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldstr, "folderName");
+        il.Emit(Mono.Cecil.Cil.OpCodes.Newobj, argEx);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Throw);
+        il.Append(doCreate);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_1);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Brfalse, ret);
+        var tryStart = il.Create(Mono.Cecil.Cil.OpCodes.Nop);
+        il.Append(tryStart);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldloc_0);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Call, createDir);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Pop);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Leave, ret);
+        var handlerStart = il.Create(Mono.Cecil.Cil.OpCodes.Nop);
+        il.Append(handlerStart);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Pop);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Leave, ret);
+        il.Append(ret);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldloc_0);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+        target.Body.ExceptionHandlers.Add(new Mono.Cecil.Cil.ExceptionHandler(
+            Mono.Cecil.Cil.ExceptionHandlerType.Catch)
+        {
+            TryStart = tryStart,
+            TryEnd = handlerStart,
+            HandlerStart = handlerStart,
+            HandlerEnd = ret,
+            CatchType = exType,
+        });
+        if (target.Body.MaxStackSize < 8)
+            target.Body.MaxStackSize = 8;
+    }
+
+    // PdnCheckBox measure/layout/show all run through DWrite text layout,
+    // which is null headless: every checkbox measure throws, the throw is
+    // caught for layout but aborts WM_SHOWWINDOW delivery, so config
+    // dialogs never finish showing. Measure on the CPU instead: the box
+    // width comes from the pure-for-measure in-module classic path and the
+    // text from TextRenderer.MeasureText (the fork CPU-measures headless;
+    // PdnNumericSpin already measures this way with no faults), with the
+    // original 3-DIP gap and padding math. Member refs are reused from the
+    // module (no new scopes); anything missing fails loudly. Draw paths
+    // are untouched (still fault-and-blank) -- this unblocks measure only.
+    // Public so the rewrite tests pin it directly, like the Redirect* rules.
+    // Headless prefetches can never overlap (single thread, no pump), so
+    // queueing a chunk-read continuation only defers it to a .Result that
+    // blocks forever (PNSE ObjWait in TryGetNextChunkWhileLocked). With
+    // ExecuteSynchronously an already-complete antecedent runs the
+    // continuation inline: chained sequential reads always have a complete
+    // antecedent (the chain starts from a pre-completed TCS task), so by
+    // induction every prefetch executes synchronously at Prefetch time and
+    // the queued task is already complete when .Result takes it. Same code,
+    // same order, same locks (re-entrant on this thread); desktop keeps
+    // the one-arg overload and its pool overlap. Idempotent like the Wait
+    // rule above: reruns find two-arg sites and patch nothing.
+    public static int NeutralizeSessionPrefetchInline(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        Mono.Cecil.TypeDefinition? read = null;
+        foreach (Mono.Cecil.TypeDefinition t in module.GetTypes())
+        {
+            if (t.FullName == "PaintDotNet.AppModel.WriteOnceSessionFile/ChunkedReadStream")
+            {
+                read = t;
+                break;
+            }
+        }
+        if (read is null)
+            throw new InvalidOperationException("PDNUndoInline: ChunkedReadStream missing");
+        Mono.Cecil.MethodDefinition? prefetch = null;
+        foreach (Mono.Cecil.MethodDefinition m in read.Methods)
+        {
+            if (m.Name == "PrefetchNextChunkImpl" && m.HasBody && m.Parameters.Count == 0
+                && m.ReturnType.FullName == "System.Void")
+            {
+                prefetch = m;
+                break;
+            }
+        }
+        if (prefetch is null)
+            throw new InvalidOperationException("PDNUndoInline: PrefetchNextChunkImpl missing");
+        int patched = 0;
+        foreach (var ins in prefetch.Body.Instructions.ToList())
+        {
+            if ((ins.OpCode != Mono.Cecil.Cil.OpCodes.Call && ins.OpCode != Mono.Cecil.Cil.OpCodes.Callvirt)
+                || ins.Operand is not Mono.Cecil.GenericInstanceMethod gim
+                || gim.Name != "ContinueWith" || gim.Parameters.Count != 1
+                || !gim.DeclaringType.FullName.StartsWith("System.Threading.Tasks.Task`1", StringComparison.Ordinal))
+            {
+                continue;
+            }
+            Mono.Cecil.TypeDefinition? taskDef;
+            try { taskDef = gim.DeclaringType.Resolve(); }
+            catch { taskDef = null; }
+            Mono.Cecil.MethodDefinition? two = null;
+            if (taskDef is not null)
+            {
+                foreach (Mono.Cecil.MethodDefinition m in taskDef.Methods)
+                {
+                    if (m.Name == "ContinueWith" && m.Parameters.Count == 2
+                        && m.GenericParameters.Count == gim.GenericArguments.Count
+                        && m.Parameters[1].ParameterType.FullName == "System.Threading.Tasks.TaskContinuationOptions")
+                    {
+                        two = m;
+                        break;
+                    }
+                }
+            }
+            if (two is null)
+                throw new InvalidOperationException("PDNUndoInline: two-arg ContinueWith overload missing");
+            // The replacement must keep BOTH instantiations: the method's
+            // own generic args AND the declaring Task<T> instantiation.
+            // An open Task<T> declarer dies in the interpreter ("containing
+            // type is not fully instantiated") when the menu shortcut
+            // reaches the read path. Derived from the existing coherent
+            // reference (name/return/declarer/args copied; generic slots
+            // bind positionally, so only the non-generic options parameter
+            // is fresh): never by mutating an ImportReference (same-module
+            // imports alias the definition and corrupt the fixture, and the
+            // writer may drop a patched-in declarer).
+            if (gim.DeclaringType is not Mono.Cecil.GenericInstanceType)
+                throw new InvalidOperationException("PDNUndoInline: ContinueWith declarer is not instantiated");
+            var elem = new Mono.Cecil.MethodReference(gim.Name, gim.ReturnType, gim.DeclaringType);
+            elem.HasThis = true;
+            elem.ExplicitThis = gim.ExplicitThis;
+            elem.GenericParameters.Add(new Mono.Cecil.GenericParameter("TNew", elem));
+            foreach (var p in gim.Parameters)
+                elem.Parameters.Add(p);
+            elem.Parameters.Add(new Mono.Cecil.ParameterDefinition(
+                module.ImportReference(two.Parameters[1].ParameterType)));
+            var ngim = new Mono.Cecil.GenericInstanceMethod(elem);
+            foreach (var ga in gim.GenericArguments)
+                ngim.GenericArguments.Add(ga);
+            var il = prefetch.Body.GetILProcessor();
+            il.InsertBefore(ins, il.Create(Mono.Cecil.Cil.OpCodes.Ldc_I4, 524288));
+            ins.Operand = ngim;
+            patched++;
+        }
+        if (patched > 2)
+            throw new InvalidOperationException("PDNUndoInline: expected at most 2 ContinueWith sites, found " + patched);
+        if (patched > 0)
+        {
+            prefetch.Body.MaxStackSize++;
+            Console.WriteLine("PDNUndoInline: " + patched + " prefetch continuation(s) run inline");
+        }
+        return patched;
+    }
+    // Paint.NET undo waits on session prefetch tasks that can never
+    // complete headless (single thread, no pump): ChunkedReadStream.Dispose
+    // drains nextChunkTaskQueue with a blocking Task.Wait per task, so
+    // every history-undo died with PNSE ObjWait ("Cannot wait on monitors
+    // on this runtime"). The queued prefetches are abandoned read-aheads
+    // (nobody consumes them after Dispose); dropping them without waiting
+    // keeps the drain shape with the identical stack effect (pop swaps the
+    // void Wait call in place, no branch or handler moves) and frees every
+    // resource exactly as before. Abandoned tasks never run headless, so
+    // nothing races the freed buffers. Desktop bytes are untouched.
+    // Idempotent: a rerun over already-patched bytes finds no Wait site
+    // and returns 0 (pipeline reruns are routine); a missing type/method
+    // still throws, as do multiple sites.
+    public static int NeutralizeSessionPrefetchWait(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        Mono.Cecil.TypeDefinition? read = null;
+        foreach (Mono.Cecil.TypeDefinition t in module.GetTypes())
+        {
+            if (t.FullName == "PaintDotNet.AppModel.WriteOnceSessionFile/ChunkedReadStream")
+            {
+                read = t;
+                break;
+            }
+        }
+        if (read is null)
+            throw new InvalidOperationException("PDNUndo: ChunkedReadStream missing");
+        Mono.Cecil.MethodDefinition? dispose = null;
+        foreach (Mono.Cecil.MethodDefinition m in read.Methods)
+        {
+            if (m.Name == "Dispose" && m.HasBody && m.Parameters.Count == 1
+                && m.Parameters[0].ParameterType.FullName == "System.Boolean")
+            {
+                dispose = m;
+                break;
+            }
+        }
+        if (dispose is null)
+            throw new InvalidOperationException("PDNUndo: ChunkedReadStream.Dispose(Boolean) missing");
+        int patched = 0;
+        foreach (var ins in dispose.Body.Instructions)
+        {
+            if ((ins.OpCode == Mono.Cecil.Cil.OpCodes.Call || ins.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt)
+                && ins.Operand is Mono.Cecil.MethodReference mr
+                && mr.DeclaringType.FullName == "System.Threading.Tasks.Task"
+                && mr.Name == "Wait" && mr.Parameters.Count == 0)
+            {
+                ins.OpCode = Mono.Cecil.Cil.OpCodes.Pop;
+                ins.Operand = null;
+                patched++;
+            }
+        }
+        if (patched > 1)
+            throw new InvalidOperationException("PDNUndo: expected 1 Task.Wait site, found " + patched);
+        if (patched == 1)
+            Console.WriteLine("PDNUndo: dropped 1 prefetch Wait in ChunkedReadStream.Dispose");
+        return patched;
+    }
+    public static void RedirectPdnCheckBoxMeasure(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        Mono.Cecil.TypeDefinition box = module.GetType("PaintDotNet.Controls.PdnCheckBox")
+            ?? throw new InvalidOperationException("PdnBox: PdnCheckBox missing");
+        Mono.Cecil.MethodDefinition? target = null;
+        Mono.Cecil.MethodDefinition? classic = null;
+        foreach (Mono.Cecil.MethodDefinition m in box.Methods)
+        {
+            if (m.Name == "GetPreferredSize" && m.HasBody && m.Parameters.Count == 1
+                && m.Parameters[0].ParameterType.FullName == "System.Drawing.Size"
+                && m.ReturnType.FullName == "System.Drawing.Size")
+                target = m;
+            if (m.Name == "MeasureAndDrawClassicBox" && m.Parameters.Count == 3)
+                classic = m;
+        }
+        if (target is null)
+            throw new InvalidOperationException("PdnBox: GetPreferredSize(Size) missing");
+        if (classic is null)
+            throw new InvalidOperationException("PdnBox: MeasureAndDrawClassicBox missing");
+        Mono.Cecil.MethodReference Req(string type, string name, params string[] ps)
+        {
+            foreach (Mono.Cecil.TypeDefinition t in AllTypes(module))
+            {
+                foreach (Mono.Cecil.MethodDefinition m in t.Methods)
+                {
+                    if (!m.HasBody) continue;
+                    foreach (var i in m.Body.Instructions)
+                    {
+                        if (i.Operand is Mono.Cecil.MethodReference r
+                            && r.DeclaringType.FullName == type && r.Name == name
+                            && r.Parameters.Count == ps.Length)
+                        {
+                            bool ok = true;
+                            for (int k = 0; k < ps.Length; k++)
+                                if (r.Parameters[k].ParameterType.FullName != ps[k]) { ok = false; break; }
+                            if (ok) return r;
+                        }
+                    }
+                }
+            }
+            throw new InvalidOperationException("PdnBox: " + type + "::" + name + " missing");
+        }
+        var createGraphics = Req("System.Windows.Forms.Control", "CreateGraphics");
+        var getText = Req("System.Windows.Forms.Control", "get_Text");
+        var getFont = Req("System.Windows.Forms.Control", "get_Font");
+        var measureText = Req("System.Windows.Forms.TextRenderer", "MeasureText", "System.String", "System.Drawing.Font");
+        var convertDips = Req("PaintDotNet.UIScaleFactor", "ConvertDipsToPixelsInt", "System.Int32");
+        var getCurrentScale = Req("PaintDotNet.UIScaleFactor", "get_Current");
+        var sizeGetWidth = Req("System.Drawing.Size", "get_Width");
+        var sizeGetHeight = Req("System.Drawing.Size", "get_Height");
+        var sizeCtor = Req("System.Drawing.Size", ".ctor", "System.Int32", "System.Int32");
+        var getPadding = Req("System.Windows.Forms.Control", "get_Padding");
+        var padH = Req("System.Windows.Forms.Padding", "get_Horizontal");
+        var padV = Req("System.Windows.Forms.Padding", "get_Vertical");
+        var dispose = Req("System.IDisposable", "Dispose");
+        target.Body.ExceptionHandlers.Clear();
+        target.Body.Variables.Clear();
+        target.Body.Instructions.Clear();
+        var gfxType = createGraphics.ReturnType;
+        var sizeType = sizeCtor.DeclaringType;
+        var padType = getPadding.ReturnType;
+        target.Body.Variables.Add(new Mono.Cecil.Cil.VariableDefinition(gfxType));
+        target.Body.Variables.Add(new Mono.Cecil.Cil.VariableDefinition(module.TypeSystem.Int32));
+        target.Body.Variables.Add(new Mono.Cecil.Cil.VariableDefinition(module.TypeSystem.Int32));
+        target.Body.Variables.Add(new Mono.Cecil.Cil.VariableDefinition(sizeType));
+        target.Body.Variables.Add(new Mono.Cecil.Cil.VariableDefinition(padType));
+        target.Body.Variables.Add(new Mono.Cecil.Cil.VariableDefinition(sizeType));
+        target.Body.InitLocals = true;
+        var il = target.Body.GetILProcessor();
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Call, createGraphics);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Stloc_0);
+        var tryStart = il.Create(Mono.Cecil.Cil.OpCodes.Nop);
+        il.Append(tryStart);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldloc_0);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_0);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Call, classic);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Stloc_1);
+        // ConvertDipsToPixelsInt is an instance method (like the original
+        // classic-box body): the instance comes from the static Current.
+        il.Emit(Mono.Cecil.Cil.OpCodes.Call, getCurrentScale);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_3);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Call, convertDips);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Stloc_2);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Callvirt, getText);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Callvirt, getFont);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Call, measureText);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Stloc_3);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldloc_1);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldloc_2);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Add);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldloca_S, target.Body.Variables[3]);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Call, sizeGetWidth);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Add);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Call, getPadding);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Stloc_S, target.Body.Variables[4]);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldloca_S, target.Body.Variables[4]);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Call, padH);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Add);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldloca_S, target.Body.Variables[3]);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Call, sizeGetHeight);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Call, getPadding);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Stloc_S, target.Body.Variables[4]);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldloca_S, target.Body.Variables[4]);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Call, padV);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Add);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Newobj, sizeCtor);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Stloc_S, target.Body.Variables[5]);
+        var ok = il.Create(Mono.Cecil.Cil.OpCodes.Nop);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Leave, ok);
+        var handlerStart = il.Create(Mono.Cecil.Cil.OpCodes.Nop);
+        il.Append(handlerStart);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldloc_0);
+        var noDispose = il.Create(Mono.Cecil.Cil.OpCodes.Nop);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Brfalse_S, noDispose);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldloc_0);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Callvirt, dispose);
+        il.Append(noDispose);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Endfinally);
+        il.Append(ok);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldloc_S, target.Body.Variables[5]);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+        target.Body.ExceptionHandlers.Add(new Mono.Cecil.Cil.ExceptionHandler(
+            Mono.Cecil.Cil.ExceptionHandlerType.Finally)
+        {
+            TryStart = tryStart,
+            TryEnd = handlerStart,
+            HandlerStart = handlerStart,
+            HandlerEnd = ok,
+        });
+        if (target.Body.MaxStackSize < 8)
+            target.Body.MaxStackSize = 8;
+    }
+
+    // Syncfusion SfForm checks the Win11 build number from
+    // HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\CurrentBuild in
+    // its constructor; headless the value is missing and int.Parse(null)
+    // throws before any Syncfusion demo form exists. Answer false: no
+    // DWM/Mica exists headless, so classic chrome is the honest path
+    // (and the only one our CPU paint supports). 46-byte body replaced
+    // with ldc.i4.0 + ret; no callees remain.
+    // Public so the rewrite tests pin it directly, like the Redirect* rules.
+    // RichEdit OLE callback needs COM (absent headless): UpdateOleCallback
+    // dies in ComHelpers.GetComPointer with a runtime PNS during every
+    // RichTextBox handle creation (Syncfusion calendar/diagram boot), and the
+    // worker-thread instance escapes to the runtime and OOB-traps the whole
+    // session. Keep only the DragAcceptFiles(false) tail: no OLE callback is
+    // the graceful headless state (MsftEdit default), plain editing works.
+    // Public so the rewrite tests pin it directly, like the Redirect* rules.
+    // File wrapper for the rev69 neutralization: applies it to bytes
+    // that ship without passing through the rewriter (raw build output
+    // embedded in the browser bundle). Idempotent: an already-neutral
+    // body still contains its DragAcceptFiles call and rewrites cleanly.
+    public static void NeutralizeFileRichEditOleCallback(string assemblyPath)
+    {
+        // Buffer fully first: Cecil keeps the read stream open for
+        // lazy metadata, which self-locks a same-path write.
+        var bytes = File.ReadAllBytes(assemblyPath);
+        using var stream = new MemoryStream(bytes);
+        string? dir = Path.GetDirectoryName(assemblyPath);
+        using var resolver = new FrameworkResolver(dir, [AppContext.BaseDirectory]);
+        var readerParams = new ReaderParameters { AssemblyResolver = resolver };
+        using var assembly = Mono.Cecil.AssemblyDefinition.ReadAssembly(stream, readerParams);
+        NeutralizeRichEditOleCallback(assembly.MainModule);
+        assembly.Write(assemblyPath);
+    }
+    public static void NeutralizeRichEditOleCallback(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        Mono.Cecil.TypeDefinition box = module.GetType("System.Windows.Forms.RichTextBox")
+            ?? throw new InvalidOperationException("OleCb: RichTextBox missing");
+        Mono.Cecil.MethodDefinition? target = null;
+        foreach (Mono.Cecil.MethodDefinition m in box.Methods)
+        {
+            if (m.Name == "UpdateOleCallback" && m.HasBody && m.Parameters.Count == 0
+                && m.ReturnType.FullName == "System.Void")
+                target = m;
+        }
+        if (target is null)
+            throw new InvalidOperationException("OleCb: UpdateOleCallback() missing");
+        Mono.Cecil.MethodReference? callSite = null;
+        foreach (var i in target.Body.Instructions)
+        {
+            if (i.Operand is Mono.Cecil.MethodReference r && r.Name == "DragAcceptFiles"
+                && r.Parameters.Count == 2)
+            {
+                callSite = r;
+                break;
+            }
+        }
+        if (callSite is null)
+            throw new InvalidOperationException("OleCb: DragAcceptFiles call missing");
+        // Pin the raw (HWND, BOOL) overload on the callee's own type: a
+        // generic DragAcceptFiles<T> wrapper takes the control directly, and
+        // the original body calls it, but emitting constructed HWND/BOOL
+        // against !!T is unverifiable (OOB-89A follow-up).
+        Mono.Cecil.TypeDefinition? pinvoke = module.GetType(callSite.DeclaringType.FullName)
+            ?? throw new InvalidOperationException("OleCb: PInvokeCore missing");
+        Mono.Cecil.MethodDefinition? dragAccept = pinvoke.Methods.FirstOrDefault(m => m.Name == "DragAcceptFiles"
+                && m.Parameters.Count == 2
+                && m.Parameters[0].ParameterType.FullName == "Windows.Win32.Foundation.HWND"
+                && m.Parameters[1].ParameterType.FullName == "Windows.Win32.Foundation.BOOL")
+            ?? throw new InvalidOperationException("OleCb: DragAcceptFiles(HWND, BOOL) missing");
+        Mono.Cecil.TypeDefinition controlType = module.GetType("System.Windows.Forms.Control")
+            ?? throw new InvalidOperationException("OleCb: Control missing");
+        Mono.Cecil.MethodDefinition getHandle = controlType.Methods.FirstOrDefault(m => m.Name == "get_Handle" && !m.HasParameters && m.ReturnType.FullName == "System.IntPtr")
+            ?? throw new InvalidOperationException("OleCb: Control.get_Handle missing");
+        Mono.Cecil.TypeDefinition hwndType = module.GetType("Windows.Win32.Foundation.HWND")
+            ?? throw new InvalidOperationException("OleCb: HWND missing");
+        Mono.Cecil.MethodDefinition hwndCtor = hwndType.Methods.FirstOrDefault(m => m.IsConstructor && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.FullName == "System.IntPtr")
+            ?? throw new InvalidOperationException("OleCb: HWND(nint) missing");
+        Mono.Cecil.TypeDefinition boolType = module.GetType("Windows.Win32.Foundation.BOOL")
+            ?? throw new InvalidOperationException("OleCb: BOOL missing");
+        Mono.Cecil.MethodDefinition boolCtor = boolType.Methods.FirstOrDefault(m => m.IsConstructor && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.FullName == "System.Int32")
+            ?? throw new InvalidOperationException("OleCb: BOOL(int) missing");
+        target.Body.ExceptionHandlers.Clear();
+        target.Body.Variables.Clear();
+        target.Body.Instructions.Clear();
+        var il = target.Body.GetILProcessor();
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Call, getHandle);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Newobj, hwndCtor);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_0);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Newobj, boolCtor);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Call, dragAccept);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+        if (target.Body.MaxStackSize < 8)
+            target.Body.MaxStackSize = 8;
+    }
+
+    // Headless EDITSTREAM replacement (rev77): RichTextBox.StreamIn(Stream,
+    // uint), StreamOut(Stream, uint, bool) and the private GetTextEx
+    // reader drive native RichEdit through
+    // Marshal.GetFunctionPointerForDelegate, whose thunk traps the wasm
+    // interpreter with "memory access out of bounds" and no managed frame
+    // (Syncfusion diagram RichTextNode boot: set_RichText -> set_Rtf ->
+    // StreamIn). The stubbed SendMessage could never deliver the bytes
+    // anyway. Both bodies become 4-instruction trampolines to the managed
+    // equivalents on the nested WasmRtf helper (same module, fork-owned
+    // C#): same ArgumentException on a missing RTF tag, same MaxLength
+    // truncation, text in the same WindowText storage (the GetTextEx
+    // reader too: the stubbed EM_GETTEXTEX would report every box
+    // blank). Public so the rewrite tests pin it directly, like the
+    // Neutralize* rules.
+    public static void ReplaceRichTextStreamMethods(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        Mono.Cecil.TypeDefinition box = module.GetType("System.Windows.Forms.RichTextBox")
+            ?? throw new InvalidOperationException("Rtf: RichTextBox missing");
+        Mono.Cecil.TypeDefinition? wasm = null;
+        foreach (Mono.Cecil.TypeDefinition nested in box.NestedTypes)
+        {
+            if (nested.Name == "WasmRtf")
+            {
+                wasm = nested;
+                break;
+            }
+        }
+
+        if (wasm is null)
+        {
+            throw new InvalidOperationException("Rtf: RichTextBox/WasmRtf missing");
+        }
+
+        Mono.Cecil.MethodDefinition? streamInHelper = null;
+        Mono.Cecil.MethodDefinition? streamOutHelper = null;
+        Mono.Cecil.MethodDefinition? getTextHelper = null;
+        foreach (Mono.Cecil.MethodDefinition m in wasm.Methods)
+        {
+            if (m.Name == "StreamInManaged" && m.IsStatic && m.Parameters.Count == 3)
+            {
+                streamInHelper = m;
+            }
+
+            if (m.Name == "StreamOutManaged" && m.IsStatic && m.Parameters.Count == 4)
+            {
+                streamOutHelper = m;
+            }
+
+            if (m.Name == "GetTextManaged" && m.IsStatic && m.Parameters.Count == 2)
+            {
+                getTextHelper = m;
+            }
+        }
+
+        if (streamInHelper is null)
+        {
+            throw new InvalidOperationException("Rtf: WasmRtf.StreamInManaged missing");
+        }
+
+        if (streamOutHelper is null)
+        {
+            throw new InvalidOperationException("Rtf: WasmRtf.StreamOutManaged missing");
+        }
+
+        if (getTextHelper is null)
+        {
+            throw new InvalidOperationException("Rtf: WasmRtf.GetTextManaged missing");
+        }
+
+        Mono.Cecil.MethodDefinition? streamIn = null;
+        Mono.Cecil.MethodDefinition? streamOut = null;
+        Mono.Cecil.MethodDefinition? getTextEx = null;
+        foreach (Mono.Cecil.MethodDefinition m in box.Methods)
+        {
+            if (!m.HasBody)
+            {
+                continue;
+            }
+
+            if (m.Name == "StreamIn" && m.Parameters.Count == 2
+                && m.Parameters[0].ParameterType.FullName == "System.IO.Stream"
+                && m.Parameters[1].ParameterType.FullName == "System.UInt32"
+                && m.ReturnType.FullName == "System.Void")
+            {
+                streamIn = m;
+            }
+
+            if (m.Name == "StreamOut" && m.Parameters.Count == 3
+                && m.Parameters[0].ParameterType.FullName == "System.IO.Stream"
+                && m.Parameters[1].ParameterType.FullName == "System.UInt32"
+                && m.Parameters[2].ParameterType.FullName == "System.Boolean"
+                && m.ReturnType.FullName == "System.Void")
+            {
+                streamOut = m;
+            }
+
+            if (m.Name == "GetTextEx" && m.Parameters.Count == 1
+                && m.ReturnType.FullName == "System.String")
+            {
+                getTextEx = m;
+            }
+        }
+
+        if (streamIn is null)
+        {
+            throw new InvalidOperationException("Rtf: StreamIn(Stream, uint) missing");
+        }
+
+        if (streamOut is null)
+        {
+            throw new InvalidOperationException("Rtf: StreamOut(Stream, uint, bool) missing");
+        }
+
+        if (getTextEx is null)
+        {
+            throw new InvalidOperationException("Rtf: GetTextEx missing");
+        }
+
+        ReplaceWithTrampoline(streamIn, streamInHelper, 3);
+        ReplaceWithTrampoline(streamOut, streamOutHelper, 4);
+        ReplaceWithTrampoline(getTextEx, getTextHelper, 2);
+    }
+
+    private static void ReplaceWithTrampoline(
+        Mono.Cecil.MethodDefinition target,
+        Mono.Cecil.MethodDefinition helper,
+        int argCount)
+    {
+        target.Body.ExceptionHandlers.Clear();
+        target.Body.Variables.Clear();
+        target.Body.Instructions.Clear();
+        var il = target.Body.GetILProcessor();
+        var loads = new[]
+        {
+            Mono.Cecil.Cil.OpCodes.Ldarg_0, Mono.Cecil.Cil.OpCodes.Ldarg_1,
+            Mono.Cecil.Cil.OpCodes.Ldarg_2, Mono.Cecil.Cil.OpCodes.Ldarg_3,
+        };
+        for (int i = 0; i < argCount; i++)
+        {
+            il.Emit(loads[i]);
+        }
+
+        il.Emit(Mono.Cecil.Cil.OpCodes.Call, helper);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+        if (target.Body.MaxStackSize < argCount)
+        {
+            target.Body.MaxStackSize = argCount;
+        }
+    }
+
+
+    // Headless RichText paint (rev78): diagram RichTextNode renders its RTF
+    // through RichTextBoxDrawing.Draw, which drives native RichEdit via
+    // EM_FORMATRANGE (its own user32 SendMessage); both node paths
+    // (RenderRTFToMetafile, RenderRTFToBitmap) funnel through it, and the
+    // metafile shell itself cannot exist headless (record-mode ctor throws
+    // in the Drawing fork). The Draw(Graphics, Rectangle) body becomes a
+    // trampoline to the managed WasmRtfDraw equivalent (box font/color/
+    // word-wrap via the Drawing fork); the 8-argument EM_FORMATRANGE
+    // overload stays native and unreached. Scoped to the diagram assembly
+    // (see hook); throws when the shape is absent so tests pin it.
+    public static void ReplaceRtfDrawMethod(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        Mono.Cecil.TypeDefinition drawing = module.GetType("Syncfusion.Windows.Forms.Diagram.RichTextBoxDrawing")
+            ?? throw new InvalidOperationException("RtfDraw: RichTextBoxDrawing missing");
+        Mono.Cecil.MethodDefinition? draw = null;
+        foreach (Mono.Cecil.MethodDefinition m in drawing.Methods)
+        {
+            if (!m.HasBody)
+            {
+                continue;
+            }
+
+            if (m.Name == "Draw" && m.Parameters.Count == 2
+                && m.Parameters[0].ParameterType.FullName == "System.Drawing.Graphics"
+                && m.Parameters[1].ParameterType.FullName == "System.Drawing.Rectangle"
+                && m.ReturnType.FullName == "System.Void")
+            {
+                draw = m;
+            }
+        }
+
+        if (draw is null)
+        {
+            throw new InvalidOperationException("RtfDraw: Draw(Graphics, Rectangle) missing");
+        }
+
+        // Cross-assembly trampoline into the fork: the rewriter remaps the
+        // System.Windows.Forms/System.Drawing namespaces onto the
+        // WfWasm.WinForms/WfWasm.Drawing assemblies, so the references below
+        // use those scopes with the desktop namespaces. Requires a fork
+        // migration carrying WasmRtfDraw to run before app transforms.
+        Mono.Cecil.AssemblyNameReference? formsRef = null;
+        foreach (Mono.Cecil.AssemblyNameReference r in module.AssemblyReferences)
+        {
+            if (r.Name == "WfWasm.WinForms")
+            {
+                formsRef = r;
+            }
+        }
+
+        if (formsRef is null)
+        {
+            throw new InvalidOperationException("RtfDraw: WfWasm.WinForms reference missing");
+        }
+
+        // Reuse the module's own type references (correct scopes AND
+        // IsValueType flags: hand-built struct references default to
+        // CLASS and misbind at runtime) instead of constructing new
+        // ones. RichTextBoxDrawing derives from RichTextBox, so its
+        // base type is the exact parameter type the helper wants.
+        var boxType = drawing.BaseType;
+        var gfxType = draw.Parameters[0].ParameterType;
+        var rectType = draw.Parameters[1].ParameterType;
+        var helperType = new Mono.Cecil.TypeReference("System.Windows.Forms", "WasmRtfDraw", module, formsRef);
+        var helper = new Mono.Cecil.MethodReference("DrawRtfManaged", module.TypeSystem.Void, helperType)
+        {
+            HasThis = false,
+        };
+        helper.Parameters.Add(new Mono.Cecil.ParameterDefinition(boxType));
+        helper.Parameters.Add(new Mono.Cecil.ParameterDefinition(gfxType));
+        helper.Parameters.Add(new Mono.Cecil.ParameterDefinition(rectType));
+        Mono.Cecil.MethodReference helperRef = module.ImportReference(helper);
+
+        draw.Body.ExceptionHandlers.Clear();
+        draw.Body.Variables.Clear();
+        draw.Body.Instructions.Clear();
+        var il = draw.Body.GetILProcessor();
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_1);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_2);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Call, helperRef);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+        if (draw.Body.MaxStackSize < 3)
+        {
+            draw.Body.MaxStackSize = 3;
+        }
+    }
+
+    // Bitmap-mode default for diagram RichText (rev78): DrawInterior renders
+    // via RenderRTFToMetafile unless m_bUseBitmap, and the metafile shell
+    // cannot exist headless. The rewriter serves wasm only (pristine vendor
+    // bytes stay on disk), so defaulting the flag in every RichTextNode
+    // constructor degrades vector recording to the managed bitmap path
+    // instead of dying; the public UseBitmap setter still overrides.
+    public static void ForceDiagramBitmapText(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        Mono.Cecil.TypeDefinition node = module.GetType("Syncfusion.Windows.Forms.Diagram.RichTextNode")
+            ?? throw new InvalidOperationException("RtfDraw: RichTextNode missing");
+        Mono.Cecil.FieldDefinition? flag = null;
+        foreach (Mono.Cecil.FieldDefinition f in node.Fields)
+        {
+            if (f.Name == "m_bUseBitmap")
+            {
+                flag = f;
+            }
+        }
+
+        if (flag is null)
+        {
+            throw new InvalidOperationException("RtfDraw: m_bUseBitmap missing");
+        }
+
+        foreach (Mono.Cecil.MethodDefinition ctor in node.Methods)
+        {
+            if (ctor.Name != ".ctor" || !ctor.HasBody)
+            {
+                continue;
+            }
+
+            var il = ctor.Body.GetILProcessor();
+            var rets = new System.Collections.Generic.List<Mono.Cecil.Cil.Instruction>();
+            foreach (Mono.Cecil.Cil.Instruction instr in ctor.Body.Instructions)
+            {
+                if (instr.OpCode.Code == Mono.Cecil.Cil.Code.Ret)
+                {
+                    rets.Add(instr);
+                }
+            }
+
+            foreach (Mono.Cecil.Cil.Instruction ret in rets)
+            {
+                il.InsertBefore(ret, il.Create(Mono.Cecil.Cil.OpCodes.Ldarg_0));
+                il.InsertBefore(ret, il.Create(Mono.Cecil.Cil.OpCodes.Ldc_I4_1));
+                il.InsertBefore(ret, il.Create(Mono.Cecil.Cil.OpCodes.Stfld, flag));
+            }
+
+            if (ctor.Body.MaxStackSize < 2)
+            {
+                ctor.Body.MaxStackSize = 2;
+            }
+        }
+    }
+    // File wrapper for the rev77 replacement: applies it to bytes that ship
+    // without passing through the rewriter. Idempotent: an already-replaced
+    // body is still a StreamIn(Stream, uint) shape and rewrites cleanly.
+    public static void ManagedRtfFile(string assemblyPath)
+    {
+        var bytes = File.ReadAllBytes(assemblyPath);
+        using var stream = new MemoryStream(bytes);
+        string? dir = Path.GetDirectoryName(assemblyPath);
+        using var resolver = new FrameworkResolver(dir, [AppContext.BaseDirectory]);
+        var readerParams = new ReaderParameters { AssemblyResolver = resolver };
+        using var assembly = Mono.Cecil.AssemblyDefinition.ReadAssembly(stream, readerParams);
+        ReplaceRichTextStreamMethods(assembly.MainModule);
+        assembly.Write(assemblyPath);
+    }
+
+    // Wraps every parameterless void InitializeComponent method body and
+    // every parameterless instance .ctor in an outer catch-all that
+    // stashes the throw in WasmCtorGuard and returns degraded (see call
+    // site for why). Existing instructions
+    // are never moved or rewritten (a bare ret inside try is legal IL),
+    // so existing handlers keep their ranges; the appended handler block
+    // is unreachable by fallthrough (every valid body ends in a transfer).
+    public static void GuardInitializeComponents(Mono.Cecil.ModuleDefinition module)
+    {
+        Mono.Cecil.AssemblyNameReference? formsScope =
+            module.AssemblyReferences.FirstOrDefault(r => r.Name == "WfWasm.WinForms");
+        if (formsScope is null)
+        {
+            formsScope = new Mono.Cecil.AssemblyNameReference("WfWasm.WinForms", new Version(1, 0, 0, 0));
+            module.AssemblyReferences.Add(formsScope);
+        }
+        var guardType = new Mono.Cecil.TypeReference("System.Windows.Forms", "WasmCtorGuard", module, formsScope);
+        var stash = new Mono.Cecil.MethodReference("Stash", module.TypeSystem.Void, guardType)
+        {
+            HasThis = false,
+        };
+        stash.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.ImportReference(typeof(Exception))));
+        GuardModuleTypes(module, module.Types, stash);
+    }
+
+    private static void GuardModuleTypes(
+        Mono.Cecil.ModuleDefinition module,
+        Mono.Collections.Generic.Collection<Mono.Cecil.TypeDefinition> types,
+        Mono.Cecil.MethodReference stash)
+    {
+        foreach (Mono.Cecil.TypeDefinition type in types)
+        {
+            // Ctor scope: designer types only (a parameterless void
+            // InitializeComponent declared on the type). Guarding every
+            // parameterless .ctor broke services that depend on
+            // propagation (PDN provider/color/plugin defaults); the
+            // derived .ctor body still hosts the base-ctor call, so one
+            // designer type's guard covers its whole base chain.
+            bool designer = false;
+            foreach (Mono.Cecil.MethodDefinition probe in type.Methods)
+            {
+                if (probe.Name == "InitializeComponent" && probe.Parameters.Count == 0
+                    && probe.ReturnType.FullName == "System.Void")
+                {
+                    designer = true;
+                    break;
+                }
+            }
+            foreach (Mono.Cecil.MethodDefinition method in type.Methods)
+            {
+                // Designer InitializeComponent plus the parameterless
+                // instance ctor of designer types (its body hosts the
+                // base-ctor call, field initializers and post-Init custom
+                // code). Parameterized ctors are only reached from those
+                // two guarded contexts.
+                bool initializes = method.Name == "InitializeComponent" && !method.IsStatic;
+                bool constructs = designer && method.Name == ".ctor" && !method.IsStatic;
+                if (!(initializes || constructs) || method.Parameters.Count != 0
+                    || method.ReturnType.FullName != "System.Void" || !method.HasBody)
+                    continue;
+                Mono.Cecil.Cil.Instruction first = method.Body.Instructions[0];
+                if (constructs)
+                {
+                    // A .ctor handler verified with `this` unassigned must
+                    // not return normally (InvalidProgram on desktop,
+                    // native unwind trap in WASM): the base-.ctor call and
+                    // any inlined field initializers before it stay outside
+                    // the guarded region, so the try starts only once
+                    // `this` is definitely assigned. A throw from the base
+                    // chain itself propagates exactly as unguarded.
+                    foreach (Mono.Cecil.Cil.Instruction probe in method.Body.Instructions)
+                    {
+                        if ((probe.OpCode == Mono.Cecil.Cil.OpCodes.Call
+                                || probe.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt)
+                            && probe.Operand is Mono.Cecil.MethodReference mr
+                            && mr.Name == ".ctor")
+                        {
+                            if (probe.Next is not null)
+                                first = probe.Next;
+                            break;
+                        }
+                    }
+                }
+                var il = method.Body.GetILProcessor();
+                Mono.Cecil.Cil.Instruction handlerStart = il.Create(Mono.Cecil.Cil.OpCodes.Call, stash);
+                Mono.Cecil.Cil.Instruction done = il.Create(Mono.Cecil.Cil.OpCodes.Ret);
+                il.Append(il.Create(Mono.Cecil.Cil.OpCodes.Leave, done));
+                il.Append(handlerStart);
+                il.Append(il.Create(Mono.Cecil.Cil.OpCodes.Leave, done));
+                il.Append(done);
+                // A raw ret covered by the new try region is unverifiable
+                // (desktop InvalidProgramException, native unwind trap in
+                // WASM even though the bytes look consistent): route every
+                // in-try return through the shared tail. The terminal done
+                // ret itself stays.
+                Mono.Cecil.Cil.Instruction? cursor = first;
+                while (cursor is not null && cursor != handlerStart)
+                {
+                    Mono.Cecil.Cil.Instruction? next = cursor.Next;
+                    if (cursor.OpCode == Mono.Cecil.Cil.OpCodes.Ret && cursor != done)
+                        il.Replace(cursor, il.Create(Mono.Cecil.Cil.OpCodes.Leave, done));
+                    cursor = next;
+                }
+                method.Body.ExceptionHandlers.Add(new Mono.Cecil.Cil.ExceptionHandler(Mono.Cecil.Cil.ExceptionHandlerType.Catch)
+                {
+                    TryStart = first,
+                    TryEnd = handlerStart,
+                    HandlerStart = handlerStart,
+                    HandlerEnd = done,
+                    CatchType = module.ImportReference(typeof(Exception)),
+                });
+                if (method.Body.MaxStackSize < 2)
+                    method.Body.MaxStackSize = 2;
+            }
+            GuardModuleTypes(module, type.NestedTypes, stash);
+        }
+    }
+
+    public static void RedirectSyncfusionWin11Check(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        Mono.Cecil.TypeDefinition form = module.GetType("Syncfusion.WinForms.Controls.SfForm")
+            ?? throw new InvalidOperationException("SfWin11: SfForm missing");
+        Mono.Cecil.MethodDefinition? target = null;
+        foreach (Mono.Cecil.MethodDefinition m in form.Methods)
+        {
+            if (m.Name == "CheckIsWindows11" && m.HasBody && m.Parameters.Count == 0
+                && m.ReturnType.FullName == "System.Boolean")
+                target = m;
+        }
+        if (target is null)
+            throw new InvalidOperationException("SfWin11: CheckIsWindows11() missing");
+        target.Body.ExceptionHandlers.Clear();
+        target.Body.Variables.Clear();
+        target.Body.Instructions.Clear();
+        var il = target.Body.GetILProcessor();
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_0);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+        if (target.Body.MaxStackSize < 8)
+            target.Body.MaxStackSize = 8;
+    }
+
+    // TextBoxBase.SelectAll routes through the live RichEdit selection
+    // (EM_SETSEL against the created handle plus UIA automation events);
+    // headless the selection path OOB-traps the session. Proven at
+    // SfDateTimeEdit.SetFocusInEditingMode during Syncfusion calendar
+    // boot (clean runs + click proof with the call dropped), same family
+    // in SfNumericTextBox focus/click/shortcut paths. Drop the void call,
+    // keeping the instance evaluation: selection is affordance-only, no
+    // content or layout effect. Shrinking the body cannot overflow short
+    // branches. Returns neutralized call sites.
+    public static int NeutralizeTextBoxSelectAllCalls(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        int count = 0;
+        foreach (Mono.Cecil.TypeDefinition type in AllTypes(module))
+        {
+            foreach (Mono.Cecil.MethodDefinition method in type.Methods)
+            {
+                if (!method.HasBody)
+                    continue;
+                var il = method.Body.GetILProcessor();
+                foreach (Mono.Cecil.Cil.Instruction instr in method.Body.Instructions.ToArray())
+                {
+                    if (instr.OpCode != Mono.Cecil.Cil.OpCodes.Call
+                        && instr.OpCode != Mono.Cecil.Cil.OpCodes.Callvirt)
+                        continue;
+                    if (instr.Operand is not Mono.Cecil.MethodReference target
+                        || target.Name != "SelectAll"
+                        || target.Parameters.Count != 0
+                        || target.ReturnType.FullName != "System.Void"
+                        || target.DeclaringType.Name != "TextBoxBase")
+                        continue;
+                    il.Replace(instr, il.Create(Mono.Cecil.Cil.OpCodes.Pop));
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
+    // TextBoxBase.get_TextLength routes through a generic P/Invoke
+    // wrapper (GetWindowTextLength<T>) that the WASM interpreter cannot
+    // transform (open-generic mint-type trap); headless it OOB-kills the
+    // session. Proven at SfDateTimeEdit.RepositionFields during Syncfusion
+    // calendar boot (bypassing the call loads, paints and clicks clean).
+    // Rewrite it as get_Text().Length: on this fork both read the same
+    // underlying text in every handle state (window-text storage when
+    // created, the text field otherwise), so the value is identical and
+    // the trap is gone. Growing the body can overflow short branches, so
+    // the synthetic test pins desktop-JIT proof of the splice and the real-file
+    // test pins shapes plus branch/handler/maxstack integrity. Returns rewritten
+    // call sites.
+    public static int RedirectTextBoxTextLengthToManaged(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        Mono.Cecil.MethodReference? getLength = null;
+        int count = 0;
+        foreach (Mono.Cecil.TypeDefinition type in AllTypes(module))
+        {
+            foreach (Mono.Cecil.MethodDefinition method in type.Methods)
+            {
+                if (!method.HasBody)
+                    continue;
+                var il = method.Body.GetILProcessor();
+                foreach (Mono.Cecil.Cil.Instruction instr in method.Body.Instructions.ToArray())
+                {
+                    if (instr.OpCode != Mono.Cecil.Cil.OpCodes.Call
+                        && instr.OpCode != Mono.Cecil.Cil.OpCodes.Callvirt)
+                        continue;
+                    if (instr.Operand is not Mono.Cecil.MethodReference target
+                        || target.Name != "get_TextLength"
+                        || target.Parameters.Count != 0
+                        || target.ReturnType.FullName != "System.Int32"
+                        || target.DeclaringType.Name != "TextBoxBase")
+                        continue;
+                    getLength ??= module.ImportReference(
+                        typeof(string).GetMethod("get_Length")!);
+                    var getText = new Mono.Cecil.MethodReference(
+                        "get_Text", module.TypeSystem.String, target.DeclaringType)
+                    {
+                        HasThis = true,
+                    };
+                    var call = il.Create(Mono.Cecil.Cil.OpCodes.Callvirt, getText);
+                    il.Replace(instr, call);
+                    il.InsertAfter(call, il.Create(Mono.Cecil.Cil.OpCodes.Callvirt, getLength));
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
+    private static System.Collections.Generic.IEnumerable<Mono.Cecil.TypeDefinition> AllTypes(
+        Mono.Cecil.ModuleDefinition module)
+    {
+        var stack = new System.Collections.Generic.Stack<Mono.Cecil.TypeDefinition>();
+        foreach (Mono.Cecil.TypeDefinition t in module.Types)
+            stack.Push(t);
+        while (stack.Count > 0)
+        {
+            Mono.Cecil.TypeDefinition t = stack.Pop();
+            yield return t;
+            foreach (Mono.Cecil.TypeDefinition n in t.NestedTypes)
+                stack.Push(n);
+        }
+    }
+
+    private static void EmitCctorTable(
+        Mono.Cecil.MethodDefinition cctor, string owner, string siteName, string[] exts)
+    {
+        int site = -1;
+        var instrs = cctor.Body.Instructions;
+        for (int i = 0; i < instrs.Count; i++)
+        {
+            var op = instrs[i].Operand as Mono.Cecil.MethodReference;
+            if (op is not null && op.DeclaringType.Name == "WicHelpers" && op.Name == siteName)
+            { site = i; break; }
+        }
+        if (site < 0)
+            throw new InvalidOperationException("CpuPaint: " + owner + ".cctor has no " + siteName);
+        // Walk back over the argument chain (locals, vendor boxing);
+        // terminate at the ContainerFormats getter that opens it.
+        int head = site;
+        bool headed = false;
+        while (head > 0)
+        {
+            var prev = instrs[head - 1].Operand as Mono.Cecil.MethodReference;
+            if (prev is not null && prev.DeclaringType.Name == "ContainerFormats")
+            { head--; headed = true; break; }
+            string code = instrs[head - 1].OpCode.Code.ToString();
+            bool ok = code == "Call" || code == "Newobj"
+                || code.StartsWith("Stloc") || code.StartsWith("Ldloc");
+            if (!ok)
+                throw new InvalidOperationException("CpuPaint: " + owner + ".cctor chain holds " + code);
+            head--;
+        }
+        if (!headed)
+            throw new InvalidOperationException("CpuPaint: " + owner + ".cctor " + siteName + " has no format chain");
+        var il = cctor.Body.GetILProcessor();
+        var seq = new System.Collections.Generic.List<Mono.Cecil.Cil.Instruction>();
+        seq.Add(il.Create(Mono.Cecil.Cil.OpCodes.Ldc_I4, exts.Length));
+        seq.Add(il.Create(Mono.Cecil.Cil.OpCodes.Newarr, cctor.Module.TypeSystem.String));
+        for (int i = 0; i < exts.Length; i++)
+        {
+            seq.Add(il.Create(Mono.Cecil.Cil.OpCodes.Dup));
+            seq.Add(il.Create(Mono.Cecil.Cil.OpCodes.Ldc_I4, i));
+            seq.Add(il.Create(Mono.Cecil.Cil.OpCodes.Ldstr, exts[i]));
+            seq.Add(il.Create(Mono.Cecil.Cil.OpCodes.Stelem_Ref));
+        }
+        for (int i = site; i >= head; i--)
+            il.Remove(instrs[head]);
+        var anchor = instrs[head];
+        foreach (var ni in seq)
+            il.InsertBefore(anchor, ni);
+        if (cctor.Body.MaxStackSize < 8)
+            cctor.Body.MaxStackSize = 8;
+    }
+    // HeadingLabel measures its heading through a null DirectWrite context
+    // (DrawNull): headless the layout never materializes, the cached height
+    // stays null, and every layout pass dies on Nullable.Value (the PNG
+    // SaveConfigDialog never constructs). Answer the WinForms font line
+    // height instead: single-line headings meter by font ascent (our
+    // Font.Height is a pure 96dpi computation, no native metrics). A few
+    // pixels off DWrite's exact ascent is cosmetically harmless; a dead
+    // dialog is not. Only external callees are our own fork assemblies
+    // (proven-safe redirect targets, cf. ResourceHelper).
+    // Public so the rewrite tests pin it directly, like the Redirect* rules.
+    public static void RedirectHeadingLabelPreferredHeight(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        Mono.Cecil.TypeDefinition label = module.GetType("PaintDotNet.Controls.HeadingLabel")
+            ?? throw new InvalidOperationException("CpuPaint: HeadingLabel missing");
+        Mono.Cecil.MethodDefinition? target = null;
+        foreach (var m in label.Methods)
+            if (m.Name == "GetPreferredTextHeight" && m.HasBody && m.Parameters.Count == 0)
+            { target = m; break; }
+        if (target is null)
+            throw new InvalidOperationException("CpuPaint: GetPreferredTextHeight missing");
+        Mono.Cecil.AssemblyNameReference? formsScope = null;
+        Mono.Cecil.AssemblyNameReference? drawingScope = null;
+        foreach (var r in module.AssemblyReferences)
+        {
+            if (r.Name == "WfWasm.Shim" || r.Name == "WfWasm.WinForms" || r.Name == "System.Windows.Forms")
+                formsScope ??= r;
+            if (r.Name == "WfWasm.Drawing" || r.Name == "System.Drawing" || r.Name == "System.Drawing.Common")
+                drawingScope ??= r;
+        }
+        if (formsScope is null || drawingScope is null)
+            throw new InvalidOperationException("CpuPaint: fork scopes missing");
+        var controlRef = new Mono.Cecil.TypeReference(
+            "System.Windows.Forms", "Control", module, formsScope);
+        var fontRef = new Mono.Cecil.TypeReference(
+            "System.Drawing", "Font", module, drawingScope);
+        var getFont = new Mono.Cecil.MethodReference("get_Font", fontRef, controlRef)
+        { HasThis = true };
+        var getHeight = new Mono.Cecil.MethodReference("get_Height", module.TypeSystem.Int32, fontRef)
+        { HasThis = true };
+        target.Body.ExceptionHandlers.Clear();
+        target.Body.Variables.Clear();
+        target.Body.Instructions.Clear();
+        var il = target.Body.GetILProcessor();
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Callvirt, getFont);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Callvirt, getHeight);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+        if (target.Body.MaxStackSize < 8)
+            target.Body.MaxStackSize = 8;
+    }
     // BitmapImage.CreateReinterpretedBitmap answers the source: see
     // the Windows.Framework gate above for why the wrapper is skipped.
     private static void EnsureCpuReinterpretIdentity(ModuleDefinition module)
@@ -6733,6 +8701,50 @@ public static class AssemblyRewriter
             if (m.Body.MaxStackSize < 8)
                 m.Body.MaxStackSize = 8;
         }
+    }
+    // CreateImpl wraps the reinterpreted tile source in
+    // RefHandle<IBitmapSource>(ownsRef: true) and disposes it after
+    // tiling. That custody is only sound for a fresh wrapper; the
+    // identity above answers the caller-owned bitmap, so the dispose
+    // pool-returns a live source and every later tile lock reads
+    // empty (large uploads fail while small ones survive on spare
+    // refs). The sibling branches already wrap the source with
+    // ownsRef: false, so the single ownsRef: true site is flipped
+    // to match. Any other site count aborts loudly.
+    private static void EnsureCpuReinterpretCustody(ModuleDefinition module)
+    {
+        TypeDefinition img = module.GetType("PaintDotNet.Direct2D1.BitmapImage")
+            ?? throw new InvalidOperationException("CpuPaint: BitmapImage missing");
+        var matches = new System.Collections.Generic.List<MethodDefinition>();
+        foreach (var m in img.Methods)
+        {
+            if (m.Name != "CreateImpl" || !m.HasBody)
+                continue;
+            if (m.Parameters.Count != 5
+                || m.ReturnType.FullName != "PaintDotNet.Direct2D1.BitmapImage")
+                continue;
+            matches.Add(m);
+        }
+        if (matches.Count != 1)
+            throw new InvalidOperationException("CpuPaint: BitmapImage.CreateImpl x" + matches.Count);
+        int flipped = 0;
+        var insns = matches[0].Body.Instructions;
+        for (int i = 1; i < insns.Count; i++)
+        {
+            if (insns[i].OpCode != OpCodes.Newobj)
+                continue;
+            if (insns[i].Operand is not MethodReference ctor || ctor.Name != ".ctor")
+                continue;
+            if (!ctor.DeclaringType.FullName.StartsWith("PaintDotNet.ComponentModel.RefHandle`1", System.StringComparison.Ordinal))
+                continue;
+            if (insns[i - 1].OpCode == OpCodes.Ldc_I4_1)
+            {
+                insns[i - 1].OpCode = OpCodes.Ldc_I4_0;
+                flipped++;
+            }
+        }
+        if (flipped != 1)
+            throw new InvalidOperationException("CpuPaint: CreateImpl RefHandle custody sites=" + flipped);
     }
     // BitmapImage.PostProcessImage answers its image: the tail is an
     // EnsurePrecision + PremultiplyEffect device chain whose factory
@@ -6820,6 +8832,44 @@ public static class AssemblyRewriter
         }
         if (neutered != 4)
             throw new InvalidOperationException($"Pdn: expected 4 plugin factories, neutered {neutered}");
+    }
+    // UWP Toolkit headless init: Initialize() walks COM activation,
+    // CLSID/AppUserModelId registry, and shortcut identity - none of
+    // which exist in the browser. Seed a constant AUMID and answer the
+    // activator factory without touching the OS; notification calls
+    // then run against the WinRT stubs.
+    private static void EnsureToolkitHeadlessInit(ModuleDefinition module)
+    {
+        TypeDefinition? compat = module.GetType("Microsoft.Toolkit.Uwp.Notifications.ToastNotificationManagerCompat");
+        if (compat is null)
+            throw new InvalidOperationException("Toolkit: ToastNotificationManagerCompat not found");
+        FieldDefinition? aumid = compat.Fields.FirstOrDefault(f => f.Name == "_win32Aumid");
+        FieldDefinition? registered = compat.Fields.FirstOrDefault(f => f.Name == "_registeredOnActivated");
+        MethodDefinition? init = compat.Methods.FirstOrDefault(m => m.Name == "Initialize" && m.IsStatic && m.Parameters.Count == 0);
+        MethodDefinition? factory = compat.Methods.FirstOrDefault(m => m.Name == "CreateAndRegisterActivator" && m.IsStatic && m.Parameters.Count == 0);
+        if (aumid is null || registered is null || init is null || factory is null || !init.HasBody || !factory.HasBody)
+            throw new InvalidOperationException("Toolkit: headless-init targets not found");
+        MethodReference getTypeFromHandle = module.ImportReference(typeof(Type).GetMethod("GetTypeFromHandle", new[] { typeof(RuntimeTypeHandle) })!);
+        init.Body.ExceptionHandlers.Clear();
+        init.Body.Variables.Clear();
+        init.Body.Instructions.Clear();
+        var initIl = init.Body.GetILProcessor();
+        initIl.Emit(OpCodes.Ldstr, "WfWasm.Toast");
+        initIl.Emit(OpCodes.Stsfld, aumid);
+        initIl.Emit(OpCodes.Ret);
+        if (init.Body.MaxStackSize < 8)
+            init.Body.MaxStackSize = 8;
+        factory.Body.ExceptionHandlers.Clear();
+        factory.Body.Variables.Clear();
+        factory.Body.Instructions.Clear();
+        var factoryIl = factory.Body.GetILProcessor();
+        factoryIl.Emit(OpCodes.Ldc_I4_1);
+        factoryIl.Emit(OpCodes.Stsfld, registered);
+        factoryIl.Emit(OpCodes.Ldtoken, compat);
+        factoryIl.Emit(OpCodes.Call, getTypeFromHandle);
+        factoryIl.Emit(OpCodes.Ret);
+        if (factory.Body.MaxStackSize < 8)
+            factory.Body.MaxStackSize = 8;
     }
     // CPU drawing-context extensions: the context is software by
     // definition, and image measurements answer local bounds for
@@ -8179,11 +10229,29 @@ public static class AssemblyRewriter
         TypeReference idrawingRef =
             LocalOrOwnedCpuRef(module, "PaintDotNet.Direct2D1.IDrawingContext");
         TypeDefinition idrawingDef = ResolveCpuDef(idrawingRef);
+        // IDeviceContext (BeginDraw/FromBitmap pipelines) + the resource-cache
+        // holder the DrawingContext ctor demands (GetResourceCache(InnerRef)).
+        TypeReference ideviceRef = LocalOrOwnedCpuRef(module, "PaintDotNet.Direct2D1.IDeviceContext");
+        TypeDefinition ideviceDef = ResolveCpuDef(ideviceRef);
+        TypeReference iresHolderRef = LocalOrOwnedCpuRef(module, "PaintDotNet.Direct2D1.IResourceCacheHolder");
+        TypeDefinition iresHolderDef = ResolveCpuDef(iresHolderRef);
+        TypeReference icompRef =
+            LocalOrOwnedCpuRef(module, "PaintDotNet.Direct2D1.ICompatibleDeviceContext");
+        TypeDefinition icompDef = ResolveCpuDef(icompRef);
+        // RefTrackedObject base: managed, parameterless, no abstract members.
+        TypeReference refTrackedRef = LocalOrOwnedCpuRef(module, "PaintDotNet.ComponentModel.RefTrackedObject");
+        ResolveCpuDef(refTrackedRef);
+        MethodReference refTrackedCtor = CtorCpuRef(module, "PaintDotNet.ComponentModel.RefTrackedObject", 0);
         var ctx = new TypeDefinition(
             "PaintDotNet.Direct2D1", "CpuDrawingContext",
             TypeAttributes.Class | TypeAttributes.Public | TypeAttributes.Sealed,
-            module.TypeSystem.Object);
+            refTrackedRef);
         ctx.Interfaces.Add(new InterfaceImplementation(idrawingRef));
+        ctx.Interfaces.Add(new InterfaceImplementation(ideviceRef));
+        ctx.Interfaces.Add(new InterfaceImplementation(iresHolderRef));
+        // ICompatibleDeviceContext: CreateCompatibleDeviceContext answers
+        // this same object shape (plus a Bitmap view over its target).
+        ctx.Interfaces.Add(new InterfaceImplementation(icompRef));
         var targetField = new FieldDefinition("_target", FieldAttributes.Private, module.TypeSystem.Int64);
         var m11Field = new FieldDefinition("_m11", FieldAttributes.Private, module.TypeSystem.Single);
         var m12Field = new FieldDefinition("_m12", FieldAttributes.Private, module.TypeSystem.Single);
@@ -8198,6 +10266,10 @@ public static class AssemblyRewriter
         ctx.Fields.Add(m22Field);
         ctx.Fields.Add(dxField);
         ctx.Fields.Add(dyField);
+        // IResourceCacheHolder backing: the single resource cache the
+        // DrawingContext .ctor installs via TrySet (null until then).
+        var holderCacheField = new FieldDefinition("_holderCache", FieldAttributes.Private, module.TypeSystem.Object);
+        ctx.Fields.Add(holderCacheField);
 
         // Corlib glue (Hashtable cache, reflection reads, messages) goes
         // through ImportReference like the rest of this file: host and
@@ -8216,7 +10288,8 @@ public static class AssemblyRewriter
         ctxCtor.Parameters.Add(new ParameterDefinition(module.TypeSystem.Int64));
         var ctorIl = ctxCtor.Body.GetILProcessor();
         ctorIl.Emit(OpCodes.Ldarg_0);
-        ctorIl.Emit(OpCodes.Call, objectCtor);
+        // RefTrackedObject base: the parameterless .ctor seeds refCount=1.
+        ctorIl.Emit(OpCodes.Call, refTrackedCtor);
         ctorIl.Emit(OpCodes.Ldarg_0);
         ctorIl.Emit(OpCodes.Ldarg_1);
         ctorIl.Emit(OpCodes.Stfld, targetField);
@@ -8243,6 +10316,21 @@ public static class AssemblyRewriter
         ctx.Methods.Add(getHandle);
 
         List<MethodDefinition> contracts = InterfaceCpuMethods(idrawingDef).ToList();
+        // Union: IDrawingContext already walks IDeviceContext, but
+        // ICompatibleDeviceContext (+Bitmap) and the internal
+        // IResourceCacheHolder (TryGet/TrySet) sit outside that walk.
+        // Same key shape as InterfaceCpuMethods so inherited slots dedupe.
+        var unionSeen = new HashSet<string>(contracts.Select(c =>
+            c.Name + "(" + string.Join(",", c.Parameters.Select(p => p.ParameterType.FullName)) + ")"));
+        foreach (TypeDefinition extraIface in new[] { ideviceDef, icompDef, iresHolderDef })
+        {
+            foreach (MethodDefinition extra in InterfaceCpuMethods(extraIface))
+            {
+                string extraKey = extra.Name + "(" + string.Join(",", extra.Parameters.Select(p => p.ParameterType.FullName)) + ")";
+                if (unionSeen.Add(extraKey))
+                    contracts.Add(extra);
+            }
+        }
         var implemented = new HashSet<MethodDefinition>();
         MethodDefinition Contract(string name, Func<MethodDefinition, bool> match)
         {
@@ -8970,7 +11058,6 @@ public static class AssemblyRewriter
             il.Emit(OpCodes.Ldloc, objLoc);
             il.Emit(OpCodes.Isinst, sysColorRef!);
             il.Emit(OpCodes.Brfalse, tryText);
-            il.Emit(OpCodes.Ldloc, objLoc);
             il.Emit(OpCodes.Ldloc, miLoc);
             il.Emit(OpCodes.Ldarg_1);
             il.Emit(OpCodes.Ldnull);
@@ -9604,8 +11691,12 @@ public static class AssemblyRewriter
             }
             catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
             { hasCheckerPath = false; }
-            // Same-module color effect (Windows.Core hosts both).
-            TypeReference? colorMgmtRef = module.GetType("PaintDotNet.Direct2D1.Effects.ColorManagementEffect");
+            // ColorManagementEffect used to Ret here as a headless identity
+            // no-op ("already-painted source"), but that blanks primary
+            // blits like the color wheel: the effect falls through to the
+            // proxy unwrap below (GetProxySourceImage allowlists
+            // ColorManagementEffect and blits its Source input; the srgb/scRGB
+            // transform itself stays identity headless).
             var il = drawImage.Body.GetILProcessor();
             MethodReference rectX = StructCpuGetter(module, "PaintDotNet.Rendering.RectFloat", "get_X");
             MethodReference rectY = StructCpuGetter(module, "PaintDotNet.Rendering.RectFloat", "get_Y");
@@ -9741,17 +11832,6 @@ public static class AssemblyRewriter
                 il.Emit(OpCodes.Call, drawCheckerCpu);
                 il.Emit(OpCodes.Ret);
                 il.Append(toThrow);
-            }
-            // Color-management draws composite an already-painted source
-            // through an srgb/scRGB transform: headless identity no-op.
-            if (colorMgmtRef is not null)
-            {
-                il.Emit(OpCodes.Ldarg_1);
-                il.Emit(OpCodes.Isinst, colorMgmtRef);
-                var notColorMgmt = il.Create(OpCodes.Nop);
-                il.Emit(OpCodes.Brfalse_S, notColorMgmt);
-                il.Emit(OpCodes.Ret);
-                il.Append(notColorMgmt);
             }
             // Effect proxies (palette swatches draw through a color
             // management proxy): unwrap pass-through inputs to the
@@ -9892,6 +11972,421 @@ public static class AssemblyRewriter
             il.Emit(OpCodes.Ret);
             il.Append(imgDone);
             il.Emit(OpCodes.Ret);
+        // -- Cross-module call helper: resolve through the input closure
+        // (version-agnostic) and import with the real scope. Only public
+        // members: emitted code runs as Windows.Core, so PDN internals
+        // (struct fields, GetInnermostRef) stay out of reach by construction.
+        TypeReference XRef(string asm, string full)
+        {
+            int xdot = full.LastIndexOf('.');
+            var xscope = module.AssemblyReferences.FirstOrDefault(a => a.Name == asm)
+                ?? throw new InvalidOperationException("CpuPaint: assembly reference missing: " + asm);
+            return new TypeReference(full.Substring(0, xdot), full.Substring(xdot + 1), module, xscope);
+        }
+        MethodReference XCall(string asm, string typeFull, string name, int argc, bool statik = false)
+        {
+            TypeDefinition xdef = ResolveCpuDef(XRef(asm, typeFull));
+            MethodDefinition? xhit = xdef.Methods.FirstOrDefault(x =>
+                    x.Name == name && x.Parameters.Count == argc && x.IsStatic == statik && !x.HasGenericParameters)
+                ?? throw new InvalidOperationException("CpuPaint: " + typeFull + "." + name + "/" + argc + " missing");
+            return module.ImportReference(xhit);
+        }
+        MethodReference XCtor(string asm, string typeFull, int argc)
+        {
+            TypeDefinition xdef = ResolveCpuDef(XRef(asm, typeFull));
+            MethodDefinition? xhit = xdef.Methods.FirstOrDefault(x => x.Name == ".ctor" && x.Parameters.Count == argc)
+                ?? throw new InvalidOperationException("CpuPaint: " + typeFull + "..ctor/" + argc + " missing");
+            return module.ImportReference(xhit);
+        }
+        TypeReference sizeIntRef = module.ImportReference(ResolveCpuDef(XRef("PaintDotNet.Primitives", "PaintDotNet.Rendering.SizeInt32")));
+        TypeReference rectIntRef = module.ImportReference(ResolveCpuDef(XRef("PaintDotNet.Primitives", "PaintDotNet.Rendering.RectInt32")));
+        TypeReference pixelFormatRef = module.ImportReference(ResolveCpuDef(XRef("PaintDotNet.Primitives", "PaintDotNet.Imaging.PixelFormat")));
+        TypeReference ibitmapRef = module.ImportReference(ResolveCpuDef(XRef("PaintDotNet.Windows", "PaintDotNet.Imaging.IBitmap")));
+        TypeReference ibitmapLockRef = module.ImportReference(ResolveCpuDef(XRef("PaintDotNet.Windows", "PaintDotNet.Imaging.IBitmapLock")));
+        MethodReference getSizeCall = XCall("PaintDotNet.Windows", "PaintDotNet.Imaging.IBitmapSource", "get_Size", 0);
+        MethodReference getPixelFormatCall = XCall("PaintDotNet.Windows", "PaintDotNet.Imaging.IBitmapSource", "get_PixelFormat", 0);
+        MethodReference copyPixelsCall = XCall("PaintDotNet.Windows", "PaintDotNet.Imaging.IBitmapSource", "CopyPixels", 4);
+        MethodReference lockCall = XCall("PaintDotNet.Windows", "PaintDotNet.Imaging.IBitmap", "Lock", 2);
+        MethodReference getBufferCall = XCall("PaintDotNet.Windows", "PaintDotNet.Imaging.IBitmapLock", "get_Buffer", 0);
+        MethodReference getBufferStrideCall = XCall("PaintDotNet.Windows", "PaintDotNet.Imaging.IBitmapLock", "get_BufferStride", 0);
+        MethodReference getWidthCall = XCall("PaintDotNet.Primitives", "PaintDotNet.Rendering.SizeInt32", "get_Width", 0);
+        MethodReference getHeightCall = XCall("PaintDotNet.Primitives", "PaintDotNet.Rendering.SizeInt32", "get_Height", 0);
+        MethodReference getBppCall = XCall("PaintDotNet.Primitives", "PaintDotNet.Imaging.PixelFormat", "GetBitsPerPixel", 0);
+        MethodReference rectCtor = XCtor("PaintDotNet.Primitives", "PaintDotNet.Rendering.RectInt32", 4);
+        MethodReference cpuHtCtor = module.ImportReference(typeof(System.Collections.Hashtable).GetConstructor(Type.EmptyTypes)!);
+        MethodReference cpuHtAdd = module.ImportReference(typeof(System.Collections.Hashtable).GetMethod("Add")!);
+        MethodReference cpuHtContains = module.ImportReference(typeof(System.Collections.Hashtable).GetMethod("ContainsKey")!);
+        MethodReference cpuHtGet = module.ImportReference(typeof(System.Collections.Hashtable).GetMethod("get_Item")!);
+        MethodReference disposableDispose = module.ImportReference(typeof(IDisposable).GetMethod("Dispose")!);
+        MethodReference getTargetWidthCpu = Cpu("GetTargetWidth", 1);
+        MethodReference getTargetHeightCpu = Cpu("GetTargetHeight", 1);
+        MethodReference downloadCpu = Cpu("DownloadBitmap", 3);
+        var nullableOpen = module.ImportReference(typeof(Nullable<>));
+        var optRectType = new GenericInstanceType(nullableOpen);
+        optRectType.GenericArguments.Add(rectIntRef);
+        // -- Write-back: EndDraw/Dispose copy painted pixels back into the
+        // FromBitmap source (registered in _resCache by CpuFromBitmap).
+        var writeback = new MethodDefinition(
+            "WritebackIfRegistered",
+            MethodAttributes.Private | MethodAttributes.HideBySig,
+            module.TypeSystem.Void);
+        {
+            var wil = writeback.Body.GetILProcessor();
+            var wbCache = new VariableDefinition(resCacheHtRef);
+            var wbKey = new VariableDefinition(module.TypeSystem.Object);
+            var wbBmp = new VariableDefinition(ibitmapRef);
+            var wbSize = new VariableDefinition(sizeIntRef);
+            var wbW = new VariableDefinition(module.TypeSystem.Int32);
+            var wbH = new VariableDefinition(module.TypeSystem.Int32);
+            var wbRect = new VariableDefinition(rectIntRef);
+            var wbLock = new VariableDefinition(ibitmapLockRef);
+            writeback.Body.Variables.Add(wbCache);
+            writeback.Body.Variables.Add(wbKey);
+            writeback.Body.Variables.Add(wbBmp);
+            writeback.Body.Variables.Add(wbSize);
+            writeback.Body.Variables.Add(wbW);
+            writeback.Body.Variables.Add(wbH);
+            writeback.Body.Variables.Add(wbRect);
+            writeback.Body.Variables.Add(wbLock);
+            writeback.Body.InitLocals = true;
+            var wbDone = wil.Create(OpCodes.Nop);
+            wil.Emit(OpCodes.Ldarg_0);
+            wil.Emit(OpCodes.Ldfld, resCacheField);
+            wil.Emit(OpCodes.Dup);
+            wil.Emit(OpCodes.Stloc, wbCache);
+            wil.Emit(OpCodes.Brfalse, wbDone);
+            wil.Emit(OpCodes.Ldarg_0);
+            wil.Emit(OpCodes.Ldfld, targetField);
+            wil.Emit(OpCodes.Box, module.TypeSystem.Int64);
+            wil.Emit(OpCodes.Stloc, wbKey);
+            wil.Emit(OpCodes.Ldloc, wbCache);
+            wil.Emit(OpCodes.Ldloc, wbKey);
+            wil.Emit(OpCodes.Callvirt, cpuHtContains);
+            wil.Emit(OpCodes.Brfalse, wbDone);
+            wil.Emit(OpCodes.Ldloc, wbCache);
+            wil.Emit(OpCodes.Ldloc, wbKey);
+            wil.Emit(OpCodes.Callvirt, cpuHtGet);
+            wil.Emit(OpCodes.Isinst, ibitmapRef);
+            wil.Emit(OpCodes.Stloc, wbBmp);
+            wil.Emit(OpCodes.Ldloc, wbBmp);
+            wil.Emit(OpCodes.Brfalse, wbDone);
+            wil.Emit(OpCodes.Ldloc, wbBmp);
+            wil.Emit(OpCodes.Callvirt, getSizeCall);
+            wil.Emit(OpCodes.Stloc, wbSize);
+            wil.Emit(OpCodes.Ldloca_S, wbSize);
+            wil.Emit(OpCodes.Call, getWidthCall);
+            wil.Emit(OpCodes.Stloc, wbW);
+            wil.Emit(OpCodes.Ldloca_S, wbSize);
+            wil.Emit(OpCodes.Call, getHeightCall);
+            wil.Emit(OpCodes.Stloc, wbH);
+            wil.Emit(OpCodes.Ldc_I4_0);
+            wil.Emit(OpCodes.Ldc_I4_0);
+            wil.Emit(OpCodes.Ldloc, wbW);
+            wil.Emit(OpCodes.Ldloc, wbH);
+            wil.Emit(OpCodes.Newobj, rectCtor);
+            wil.Emit(OpCodes.Stloc, wbRect);
+            wil.Emit(OpCodes.Ldloc, wbBmp);
+            wil.Emit(OpCodes.Ldloc, wbRect);
+            wil.Emit(OpCodes.Ldc_I4_2);
+            wil.Emit(OpCodes.Callvirt, lockCall);
+            wil.Emit(OpCodes.Stloc, wbLock);
+            wil.Emit(OpCodes.Ldarg_0);
+            wil.Emit(OpCodes.Ldfld, targetField);
+            wil.Emit(OpCodes.Ldloc, wbLock);
+            wil.Emit(OpCodes.Callvirt, getBufferCall);
+            wil.Emit(OpCodes.Ldloc, wbLock);
+            wil.Emit(OpCodes.Callvirt, getBufferStrideCall);
+            wil.Emit(OpCodes.Call, downloadCpu);
+            wil.Emit(OpCodes.Ldloc, wbLock);
+            wil.Emit(OpCodes.Callvirt, disposableDispose);
+            wil.Append(wbDone);
+            wil.Emit(OpCodes.Ret);
+            writeback.Body.MaxStackSize = 32;
+            ctx.Methods.Add(writeback);
+        }
+        // -- Upload: DeviceContext.FromBitmap funnels here. 32-bit sources
+        // become CPU targets (copy-in + write-back registration); anything
+        // else keeps the null today-shape instead of the PerThread NRE.
+        var cpuFromBitmap = new MethodDefinition(
+            "CpuFromBitmap",
+            MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig,
+            ideviceRef);
+        cpuFromBitmap.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
+        cpuFromBitmap.Parameters.Add(new ParameterDefinition(ibitmapRef));
+        {
+            var fil = cpuFromBitmap.Body.GetILProcessor();
+            var fbSize = new VariableDefinition(sizeIntRef);
+            var fbPf = new VariableDefinition(pixelFormatRef);
+            var fbW = new VariableDefinition(module.TypeSystem.Int32);
+            var fbH = new VariableDefinition(module.TypeSystem.Int32);
+            var fbBpp = new VariableDefinition(module.TypeSystem.Int32);
+            var fbTarget = new VariableDefinition(module.TypeSystem.Int64);
+            var fbSrc = new VariableDefinition(module.TypeSystem.IntPtr);
+            var fbRect = new VariableDefinition(rectIntRef);
+            var fbOptRect = new VariableDefinition(optRectType);
+            var fbLock = new VariableDefinition(ibitmapLockRef);
+            var fbCtx = new VariableDefinition(ctx);
+            cpuFromBitmap.Body.Variables.Add(fbSize);
+            cpuFromBitmap.Body.Variables.Add(fbPf);
+            cpuFromBitmap.Body.Variables.Add(fbW);
+            cpuFromBitmap.Body.Variables.Add(fbH);
+            cpuFromBitmap.Body.Variables.Add(fbBpp);
+            cpuFromBitmap.Body.Variables.Add(fbTarget);
+            cpuFromBitmap.Body.Variables.Add(fbSrc);
+            cpuFromBitmap.Body.Variables.Add(fbRect);
+            cpuFromBitmap.Body.Variables.Add(fbOptRect);
+            cpuFromBitmap.Body.Variables.Add(fbLock);
+            cpuFromBitmap.Body.Variables.Add(fbCtx);
+            cpuFromBitmap.Body.InitLocals = true;
+            var fbNull = fil.Create(OpCodes.Nop);
+            var fbHasCache = fil.Create(OpCodes.Nop);
+            fil.Emit(OpCodes.Ldarg_1);
+            fil.Emit(OpCodes.Callvirt, getSizeCall);
+            fil.Emit(OpCodes.Stloc, fbSize);
+            fil.Emit(OpCodes.Ldloca_S, fbSize);
+            fil.Emit(OpCodes.Call, getWidthCall);
+            fil.Emit(OpCodes.Stloc, fbW);
+            fil.Emit(OpCodes.Ldloca_S, fbSize);
+            fil.Emit(OpCodes.Call, getHeightCall);
+            fil.Emit(OpCodes.Stloc, fbH);
+            fil.Emit(OpCodes.Ldloc, fbW);
+            fil.Emit(OpCodes.Ldc_I4_0);
+            fil.Emit(OpCodes.Ble, fbNull);
+            fil.Emit(OpCodes.Ldloc, fbH);
+            fil.Emit(OpCodes.Ldc_I4_0);
+            fil.Emit(OpCodes.Ble, fbNull);
+            fil.Emit(OpCodes.Ldarg_1);
+            fil.Emit(OpCodes.Callvirt, getPixelFormatCall);
+            fil.Emit(OpCodes.Stloc, fbPf);
+            fil.Emit(OpCodes.Ldloca_S, fbPf);
+            fil.Emit(OpCodes.Call, getBppCall);
+            fil.Emit(OpCodes.Stloc, fbBpp);
+            fil.Emit(OpCodes.Ldloc, fbBpp);
+            fil.Emit(OpCodes.Ldc_I4, 32);
+            fil.Emit(OpCodes.Bne_Un, fbNull);
+            fil.Emit(OpCodes.Ldloc, fbW);
+            fil.Emit(OpCodes.Ldloc, fbH);
+            fil.Emit(OpCodes.Call, createBitmapEmpty);
+            fil.Emit(OpCodes.Stloc, fbTarget);
+            fil.Emit(OpCodes.Ldloc, fbTarget);
+            fil.Emit(OpCodes.Ldc_I8, 0L);
+            fil.Emit(OpCodes.Beq, fbNull);
+            fil.Emit(OpCodes.Ldloc, fbTarget);
+            fil.Emit(OpCodes.Call, lockBitmap);
+            fil.Emit(OpCodes.Stloc, fbSrc);
+            fil.Emit(OpCodes.Ldc_I4_0);
+            fil.Emit(OpCodes.Ldc_I4_0);
+            fil.Emit(OpCodes.Ldloc, fbW);
+            fil.Emit(OpCodes.Ldloc, fbH);
+            fil.Emit(OpCodes.Newobj, rectCtor);
+            fil.Emit(OpCodes.Stloc, fbRect);
+            fil.Emit(OpCodes.Ldarg_1);
+            fil.Emit(OpCodes.Ldloc, fbRect);
+            fil.Emit(OpCodes.Ldc_I4_3);
+            fil.Emit(OpCodes.Callvirt, lockCall);
+            fil.Emit(OpCodes.Stloc, fbLock);
+            fil.Emit(OpCodes.Ldarg_1);
+            fil.Emit(OpCodes.Ldloc, fbSrc);
+            fil.Emit(OpCodes.Ldloc, fbW);
+            fil.Emit(OpCodes.Ldc_I4_4);
+            fil.Emit(OpCodes.Mul);
+            fil.Emit(OpCodes.Ldloc, fbW);
+            fil.Emit(OpCodes.Ldloc, fbH);
+            fil.Emit(OpCodes.Mul);
+            fil.Emit(OpCodes.Ldc_I4_4);
+            fil.Emit(OpCodes.Mul);
+            fil.Emit(OpCodes.Ldloca_S, fbOptRect);
+            fil.Emit(OpCodes.Callvirt, copyPixelsCall);
+            fil.Emit(OpCodes.Ldloc, fbTarget);
+            fil.Emit(OpCodes.Call, unlockBitmap);
+            fil.Emit(OpCodes.Ldloc, fbLock);
+            fil.Emit(OpCodes.Callvirt, disposableDispose);
+            fil.Emit(OpCodes.Ldloc, fbTarget);
+            fil.Emit(OpCodes.Newobj, ctxCtor);
+            fil.Emit(OpCodes.Stloc, fbCtx);
+            fil.Emit(OpCodes.Ldloc, fbCtx);
+            fil.Emit(OpCodes.Ldfld, resCacheField);
+            fil.Emit(OpCodes.Brtrue, fbHasCache);
+            fil.Emit(OpCodes.Ldloc, fbCtx);
+            fil.Emit(OpCodes.Newobj, cpuHtCtor);
+            fil.Emit(OpCodes.Stfld, resCacheField);
+            fil.Append(fbHasCache);
+            fil.Emit(OpCodes.Ldloc, fbCtx);
+            fil.Emit(OpCodes.Ldfld, resCacheField);
+            fil.Emit(OpCodes.Ldloc, fbTarget);
+            fil.Emit(OpCodes.Box, module.TypeSystem.Int64);
+            fil.Emit(OpCodes.Ldarg_1);
+            fil.Emit(OpCodes.Callvirt, cpuHtAdd);
+            fil.Emit(OpCodes.Ldloc, fbCtx);
+            fil.Emit(OpCodes.Ret);
+            fil.Append(fbNull);
+            fil.Emit(OpCodes.Ldnull);
+            fil.Emit(OpCodes.Ret);
+            cpuFromBitmap.Body.MaxStackSize = 32;
+            ctx.Methods.Add(cpuFromBitmap);
+        }
+        // -- Holder core: answer the installed cache (null until the
+        // DrawingContext .ctor installs one via TrySet below).
+        MethodDefinition cTryGet = Contract("TryGetResourceCache", m => m.HasGenericParameters && m.Parameters.Count == 0);
+        {
+            var tryGet = new MethodDefinition(cTryGet.Name,
+                MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.Final
+                    | MethodAttributes.HideBySig | MethodAttributes.NewSlot,
+                module.TypeSystem.Object);
+            var gp = new GenericParameter("T", tryGet);
+            gp.Attributes = cTryGet.GenericParameters[0].Attributes;
+            // Rebuild each constraint against the target module: sharing the
+            // contract's instances carries the SOURCE module's scope object,
+            // which Cecil 0.11.6 emits against the wrong AssemblyRef at write
+            // time (observed: IObjectRef re-scoped to System.Numerics.Vectors,
+            // fatal TypeLoad at bind). Importing re-roots the reference.
+            foreach (var gc in cTryGet.GenericParameters[0].Constraints)
+                gp.Constraints.Add(new Mono.Cecil.GenericParameterConstraint(
+                    module.ImportReference(gc.ConstraintType)));
+            tryGet.GenericParameters.Add(gp);
+            tryGet.ReturnType = gp;
+            var til = tryGet.Body.GetILProcessor();
+            til.Emit(OpCodes.Ldarg_0);
+            til.Emit(OpCodes.Ldfld, holderCacheField);
+            til.Emit(OpCodes.Isinst, gp);
+            til.Emit(OpCodes.Ret);
+            tryGet.Body.MaxStackSize = 32;
+            ctx.Methods.Add(tryGet);
+            implemented.Add(cTryGet);
+        }
+        // -- Holder core: install (last writer wins; headless is single-threaded).
+        var trySet = Impl(Contract("TrySetResourceCache", m => m.Parameters.Count == 1));
+        {
+            var ilTrySet = trySet.Body.GetILProcessor();
+            ilTrySet.Emit(OpCodes.Ldarg_0);
+            ilTrySet.Emit(OpCodes.Ldarg_1);
+            ilTrySet.Emit(OpCodes.Stfld, holderCacheField);
+            ilTrySet.Emit(OpCodes.Ldc_I4_1);
+            ilTrySet.Emit(OpCodes.Ret);
+        }
+        // -- GetDeviceContext: desktop-identical AddRef through the public
+        // CreateRef<T> extension (the proxy machinery is PDN's own code).
+        var getDC = Impl(Contract("GetDeviceContext", m => m.Parameters.Count == 0));
+        {
+            TypeDefinition extDef = ResolveCpuDef(XRef("PaintDotNet.ComponentModel", "PaintDotNet.ComponentModel.ObjectRefExtensions"));
+            MethodDefinition openRef = extDef.Methods.First(m => m.Name == "CreateRef" && m.HasGenericParameters && m.Parameters.Count == 1);
+            var gim = new GenericInstanceMethod(module.ImportReference(openRef));
+            gim.GenericArguments.Add(ideviceRef);
+            var ilGetDC = getDC.Body.GetILProcessor();
+            ilGetDC.Emit(OpCodes.Ldarg_0);
+            ilGetDC.Emit(OpCodes.Call, gim);
+            ilGetDC.Emit(OpCodes.Ret);
+        }
+        // -- CreateCompatibleDeviceContext: parent-sized CPU target (desired
+        // sizes need Nullable accessors the loader cannot bind; a parent-size
+        // target is a compatible buffer by construction).
+        var compat = Impl(Contract("CreateCompatibleDeviceContext", m => m.Parameters.Count == 4));
+        {
+            var ilCompat = compat.Body.GetILProcessor();
+            var cW = new VariableDefinition(module.TypeSystem.Int32);
+            var cH = new VariableDefinition(module.TypeSystem.Int32);
+            var cT = new VariableDefinition(module.TypeSystem.Int64);
+            compat.Body.Variables.Add(cW);
+            compat.Body.Variables.Add(cH);
+            compat.Body.Variables.Add(cT);
+            compat.Body.InitLocals = true;
+            var cOkW = ilCompat.Create(OpCodes.Nop);
+            var cOkH = ilCompat.Create(OpCodes.Nop);
+            ilCompat.Emit(OpCodes.Ldarg_0);
+            ilCompat.Emit(OpCodes.Ldfld, targetField);
+            ilCompat.Emit(OpCodes.Call, getTargetWidthCpu);
+            ilCompat.Emit(OpCodes.Stloc, cW);
+            ilCompat.Emit(OpCodes.Ldarg_0);
+            ilCompat.Emit(OpCodes.Ldfld, targetField);
+            ilCompat.Emit(OpCodes.Call, getTargetHeightCpu);
+            ilCompat.Emit(OpCodes.Stloc, cH);
+            ilCompat.Emit(OpCodes.Ldloc, cW);
+            ilCompat.Emit(OpCodes.Ldc_I4_1);
+            ilCompat.Emit(OpCodes.Bge, cOkW);
+            ilCompat.Emit(OpCodes.Ldc_I4_1);
+            ilCompat.Emit(OpCodes.Stloc, cW);
+            ilCompat.Append(cOkW);
+            ilCompat.Emit(OpCodes.Ldloc, cH);
+            ilCompat.Emit(OpCodes.Ldc_I4_1);
+            ilCompat.Emit(OpCodes.Bge, cOkH);
+            ilCompat.Emit(OpCodes.Ldc_I4_1);
+            ilCompat.Emit(OpCodes.Stloc, cH);
+            ilCompat.Append(cOkH);
+            ilCompat.Emit(OpCodes.Ldloc, cW);
+            ilCompat.Emit(OpCodes.Ldloc, cH);
+            ilCompat.Emit(OpCodes.Call, createBitmapEmpty);
+            ilCompat.Emit(OpCodes.Stloc, cT);
+            ilCompat.Emit(OpCodes.Ldloc, cT);
+            ilCompat.Emit(OpCodes.Newobj, ctxCtor);
+            ilCompat.Emit(OpCodes.Ret);
+        }
+        // -- ICompatibleDeviceContext.Bitmap: device-bitmap view over the target.
+        var getBmp = Impl(Contract("get_Bitmap", m => m.Parameters.Count == 0));
+        {
+            var ilGetBmp = getBmp.Body.GetILProcessor();
+            var bT = new VariableDefinition(module.TypeSystem.Int64);
+            getBmp.Body.Variables.Add(bT);
+            ilGetBmp.Emit(OpCodes.Ldarg_0);
+            ilGetBmp.Emit(OpCodes.Ldfld, targetField);
+            ilGetBmp.Emit(OpCodes.Stloc, bT);
+            ilGetBmp.Emit(OpCodes.Ldloc, bT);
+            ilGetBmp.Emit(OpCodes.Ldloc, bT);
+            ilGetBmp.Emit(OpCodes.Call, getTargetWidthCpu);
+            ilGetBmp.Emit(OpCodes.Ldloc, bT);
+            ilGetBmp.Emit(OpCodes.Call, getTargetHeightCpu);
+            ilGetBmp.Emit(OpCodes.Newobj, module.ImportReference(bmpCtor));
+            ilGetBmp.Emit(OpCodes.Ret);
+        }
+        // -- EndDraw: flush painted pixels back to the FromBitmap source.
+        // -- MaximumBitmapSize: the CPU has no texture limit; answer PDN's
+        // own tile clamp (BitmapImage tiles by min(MaximumBitmapSize,8192)).
+        // The tail-loop default (0) makes a zero tile size: divide-by-zero
+        // in the tile math and empty clippers downstream (wheel upload).
+        var maxBmpSize = Impl(Contract("get_MaximumBitmapSize", m => m.Parameters.Count == 0));
+        {
+            var ilMaxBmp = maxBmpSize.Body.GetILProcessor();
+            ilMaxBmp.Emit(OpCodes.Ldc_I4, 8192);
+            ilMaxBmp.Emit(OpCodes.Ret);
+        }
+        var endDraw = Impl(Contract("EndDraw", m => m.Parameters.Count == 0));
+        {
+            var ilEndDraw = endDraw.Body.GetILProcessor();
+            ilEndDraw.Emit(OpCodes.Ldarg_0);
+            ilEndDraw.Emit(OpCodes.Call, writeback);
+            ilEndDraw.Emit(OpCodes.Ret);
+        }
+        // -- Dispose: release the primary ref through the base (the last ref
+        // frees the target in Dispose(bool)); never free inline, outstanding
+        // CreateRef proxies still draw until their own release.
+        var disp = Impl(Contract("Dispose", m => m.Parameters.Count == 0));
+        {
+            MethodDefinition baseDispose = ResolveCpuDef(refTrackedRef).Methods
+                .First(m => m.Name == "Dispose" && m.Parameters.Count == 0 && !m.IsStatic);
+            var ilDisp = disp.Body.GetILProcessor();
+            ilDisp.Emit(OpCodes.Ldarg_0);
+            ilDisp.Emit(OpCodes.Call, module.ImportReference(baseDispose));
+            ilDisp.Emit(OpCodes.Ret);
+        }
+        // -- Dispose(bool): last-ref teardown (write-back, then free).
+        {
+            MethodDefinition baseDisposing = FindBaseVirtual(
+                ResolveCpuDef(refTrackedRef), "Dispose", m => m.Parameters.Count == 1);
+            var dispB = new MethodDefinition(
+                "Dispose",
+                MethodAttributes.Family | MethodAttributes.Virtual | MethodAttributes.HideBySig,
+                module.TypeSystem.Void);
+            dispB.Parameters.Add(new ParameterDefinition(module.TypeSystem.Boolean));
+            dispB.Overrides.Add(module.ImportReference(baseDisposing));
+            var ilDispB = dispB.Body.GetILProcessor();
+            ilDispB.Emit(OpCodes.Ldarg_0);
+            ilDispB.Emit(OpCodes.Call, writeback);
+            ilDispB.Emit(OpCodes.Ldarg_0);
+            ilDispB.Emit(OpCodes.Ldfld, targetField);
+            ilDispB.Emit(OpCodes.Call, freeContext);
+            ilDispB.Emit(OpCodes.Ret);
+            dispB.Body.MaxStackSize = 32;
+            ctx.Methods.Add(dispB);
+        }
         }        // -- Remaining IDrawingContext members: device-neutral defaults.
         // Dispose releases the CPU target; reference-typed device objects
         // throw loudly (a null would explode far from the cause); value
@@ -9962,6 +12457,75 @@ public static class AssemblyRewriter
 
         module.Types.Add(ctx);
 
+        // -- FromBitmap/BeginDraw CPU bodies: the factory is null headless,
+        // so these always took the PerThread NRE path. Route 32-bit sources
+        // to the CPU upload instead; exotic formats keep the null today-shape.
+        {
+            TypeDefinition devCtxCls = module.GetType("PaintDotNet.Direct2D1.DeviceContext")
+                ?? throw new InvalidOperationException("CpuPaint: DeviceContext missing");
+            MethodDefinition fromBmp = devCtxCls.Methods
+                .FirstOrDefault(m => m.Name == "FromBitmap" && m.Parameters.Count == 2 && m.IsStatic && !m.HasGenericParameters)
+                ?? throw new InvalidOperationException("CpuPaint: DeviceContext.FromBitmap/2 missing");
+            if (fromBmp.Parameters[0].ParameterType.FullName != "PaintDotNet.Direct2D1.IDirect2DFactory"
+                || fromBmp.Parameters[1].ParameterType.FullName != "PaintDotNet.Imaging.IBitmap")
+                throw new InvalidOperationException("CpuPaint: DeviceContext.FromBitmap/2 shape drifted");
+            MethodDefinition cpuFromBitmapRef = ctx.Methods.First(m => m.Name == "CpuFromBitmap");
+            fromBmp.Body.ExceptionHandlers.Clear();
+            fromBmp.Body.Variables.Clear();
+            fromBmp.Body.Instructions.Clear();
+            var fbil = fromBmp.Body.GetILProcessor();
+            fbil.Emit(OpCodes.Ldarg_0);
+            fbil.Emit(OpCodes.Ldarg_1);
+            fbil.Emit(OpCodes.Call, cpuFromBitmapRef);
+            fbil.Emit(OpCodes.Ret);
+            fromBmp.Body.MaxStackSize = 32;
+            foreach (MethodDefinition bd in drawCtx.Methods.Where(m => m.Name == "BeginDraw" && m.HasBody))
+            {
+                string bdp0 = bd.Parameters.Count > 0 ? bd.Parameters[0].ParameterType.FullName : "";
+                string bdp1 = bd.Parameters.Count > 1 ? bd.Parameters[1].ParameterType.FullName : "";
+                bd.Body.ExceptionHandlers.Clear();
+                bd.Body.Variables.Clear();
+                bd.Body.Instructions.Clear();
+                var bil = bd.Body.GetILProcessor();
+                if (bd.Parameters.Count == 1 && bdp0 == "PaintDotNet.Direct2D1.IDeviceContext")
+                {
+                    // A CPU context already IS a drawing context (wrapping it
+                    // in DrawingContext would throw: it implements
+                    // IDrawingContext). Anything else keeps the null shape.
+                    var bdOk = bil.Create(OpCodes.Nop);
+                    bil.Emit(OpCodes.Ldarg_0);
+                    bil.Emit(OpCodes.Isinst, ctx);
+                    bil.Emit(OpCodes.Dup);
+                    bil.Emit(OpCodes.Brtrue, bdOk);
+                    bil.Emit(OpCodes.Pop);
+                    bil.Emit(OpCodes.Ldnull);
+                    bil.Emit(OpCodes.Ret);
+                    bil.Append(bdOk);
+                    bil.Emit(OpCodes.Ret);
+                }
+                else if (bd.Parameters.Count == 2
+                    && bdp0 == "PaintDotNet.Direct2D1.IDirect2DFactory"
+                    && bdp1 == "PaintDotNet.Imaging.IBitmap")
+                {
+                    bil.Emit(OpCodes.Ldarg_0);
+                    bil.Emit(OpCodes.Ldarg_1);
+                    bil.Emit(OpCodes.Call, cpuFromBitmapRef);
+                    bil.Emit(OpCodes.Castclass, idrawingRef);
+                    bil.Emit(OpCodes.Ret);
+                }
+                else if (bd.Parameters.Count == 1 && bdp0 == "PaintDotNet.Imaging.IBitmap")
+                {
+                    bil.Emit(OpCodes.Ldnull);
+                    bil.Emit(OpCodes.Ldarg_0);
+                    bil.Emit(OpCodes.Call, cpuFromBitmapRef);
+                    bil.Emit(OpCodes.Castclass, idrawingRef);
+                    bil.Emit(OpCodes.Ret);
+                }
+                // else: generic surface/region overloads + BeginDrawNull keep
+                // their neutered shape (status quo ante).
+                bd.Body.MaxStackSize = 32;
+            }
+        }
         // -- Static Draw(RegionPtr<TPixel>, Action<IDrawingContext>) [+ the
         // factory overload]: bind the mask bytes to a CPU context and run
         // the action under try/finally (the helper's retry loop only
@@ -10984,6 +13548,135 @@ public static class AssemblyRewriter
         }
     }
 
+    public static void RedirectIsolatedStorageTypeReferences(Mono.Cecil.ModuleDefinition module)
+    {
+        Mono.Cecil.AssemblyNameReference? isoScope = null;
+        foreach (Mono.Cecil.TypeReference typeRef in module.GetTypeReferences())
+        {
+            if (typeRef is Mono.Cecil.TypeSpecification || typeRef.Scope == module)
+                continue;
+            // The compatibility assembly implements only these two classes.
+            // Keep enums/exceptions in the framework: redirecting IsolatedStorageScope
+            // to a nonexistent stub type breaks constant emission in Syncfusion.Shared.Base.
+            if (typeRef.Namespace != "System.IO.IsolatedStorage"
+                || typeRef.Name is not ("IsolatedStorageFile" or "IsolatedStorageFileStream"))
+                continue;
+            isoScope ??= module.AssemblyReferences.FirstOrDefault(r => r.Name == "WfWasm.IsolatedStorage");
+            if (isoScope is null)
+            {
+                isoScope = new Mono.Cecil.AssemblyNameReference("WfWasm.IsolatedStorage", new Version(1, 0, 0, 0));
+                isoScope.PublicKeyToken = Array.Empty<byte>();
+                module.AssemblyReferences.Add(isoScope);
+            }
+            typeRef.Scope = isoScope;
+        }
+    }
+
+    public static void RetargetNativeLoaderCalls(Mono.Cecil.ModuleDefinition module)
+    {
+        // kernel32 loader queries are absent headless (no Win32 loader in
+        // WASM): LoadLibraryEx/GetModuleHandle answer null-handle instead of
+        // trapping inside an unresolvable PInvoke (RichTextBox.CreateParams
+        // loads MsftEdit on first construction and OOB-trapped the session
+        // with no managed frame). The null handle keeps documented failure
+        // paths (Win32Exception). String overloads only: wider signatures
+        // (PCWSTR/HANDLE) keep their imports and stay visible.
+        Mono.Cecil.AssemblyNameReference? formsScope = null;
+        Mono.Cecil.TypeReference? nativeLibType = null;
+        Mono.Cecil.MethodReference? loadLibraryExNull = null;
+        Mono.Cecil.MethodReference? getModuleHandleNull = null;
+        foreach (var type in module.GetTypes())
+        {
+            foreach (var method in type.Methods)
+            {
+                if (!method.HasBody) continue;
+                foreach (var instruction in method.Body.Instructions.ToList())
+                {
+                    if ((instruction.OpCode == Mono.Cecil.Cil.OpCodes.Call || instruction.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt)
+                        && instruction.Operand is Mono.Cecil.MethodReference mr
+                        && (mr.Name == "LoadLibraryEx" || mr.Name == "GetModuleHandle")
+                        && mr.DeclaringType.FullName == "Windows.Win32.PInvoke")
+                    {
+                        bool wantLoad = mr.Name == "LoadLibraryEx" && mr.Parameters.Count == 2
+                            && mr.Parameters[0].ParameterType.FullName == "System.String";
+                        bool wantHandle = mr.Name == "GetModuleHandle" && mr.Parameters.Count == 1
+                            && mr.Parameters[0].ParameterType.FullName == "System.String";
+                        if (!wantLoad && !wantHandle) continue;
+                        // Self-exclusion: the shim desktop passthrough calls
+                        // the same API; retargeting it would recurse.
+                        if (type.FullName == "System.Windows.Forms.WasmNativeLibrary"
+                            && (method.Name == "LoadLibraryExNull" || method.Name == "GetModuleHandleNull"))
+                            continue;
+                        if (formsScope is null)
+                        {
+                            formsScope = module.AssemblyReferences.FirstOrDefault(r => r.Name == "WfWasm.WinForms");
+                            if (formsScope is null)
+                            {
+                                formsScope = new Mono.Cecil.AssemblyNameReference("WfWasm.WinForms", new Version(1, 0, 0, 0));
+                                module.AssemblyReferences.Add(formsScope);
+                            }
+                            nativeLibType = new Mono.Cecil.TypeReference("System.Windows.Forms", "WasmNativeLibrary", module, formsScope);
+                            var hinstanceType = new Mono.Cecil.TypeReference("Windows.Win32.Foundation", "HINSTANCE", module, formsScope);
+                            var loadFlagsType = new Mono.Cecil.TypeReference("Windows.Win32.System.LibraryLoader", "LOAD_LIBRARY_FLAGS", module, formsScope);
+                            loadLibraryExNull = new Mono.Cecil.MethodReference("LoadLibraryExNull", hinstanceType, nativeLibType)
+                            {
+                                HasThis = false,
+                            };
+                            loadLibraryExNull.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.String));
+                            loadLibraryExNull.Parameters.Add(new Mono.Cecil.ParameterDefinition(loadFlagsType));
+                            getModuleHandleNull = new Mono.Cecil.MethodReference("GetModuleHandleNull", hinstanceType, nativeLibType)
+                            {
+                                HasThis = false,
+                            };
+                            getModuleHandleNull.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.String));
+                        }
+                        instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                        instruction.Operand = wantLoad ? loadLibraryExNull : getModuleHandleNull;
+                    }
+                }
+            }
+        }
+    }
+    public static void RedirectMediaTypeReferences(Mono.Cecil.ModuleDefinition module)
+    {
+        Mono.Cecil.AssemblyNameReference? mediaScope = null;
+        foreach (Mono.Cecil.TypeReference typeRef in module.GetTypeReferences())
+        {
+            if (typeRef is Mono.Cecil.TypeSpecification || typeRef.Scope == module)
+                continue;
+            if (typeRef.Namespace != "System.Media")
+                continue;
+            mediaScope ??= module.AssemblyReferences.FirstOrDefault(r => r.Name == "System.Windows.Extensions");
+            if (mediaScope is null)
+            {
+                mediaScope = new Mono.Cecil.AssemblyNameReference("System.Windows.Extensions", new Version(4, 0, 0, 0));
+                mediaScope.PublicKeyToken = Array.Empty<byte>();
+                module.AssemblyReferences.Add(mediaScope);
+            }
+            typeRef.Scope = mediaScope;
+        }
+    }
+
+    public static void RedirectOleDbTypeReferences(Mono.Cecil.ModuleDefinition module)
+    {
+        Mono.Cecil.AssemblyNameReference? oleDbScope = null;
+        foreach (Mono.Cecil.TypeReference typeRef in module.GetTypeReferences())
+        {
+            if (typeRef is Mono.Cecil.TypeSpecification || typeRef.Scope == module)
+                continue;
+            if (typeRef.Namespace != "System.Data.OleDb")
+                continue;
+            oleDbScope ??= module.AssemblyReferences.FirstOrDefault(r => r.Name == "System.Data.OleDb");
+            if (oleDbScope is null)
+            {
+                oleDbScope = new Mono.Cecil.AssemblyNameReference("System.Data.OleDb", new Version(4, 0, 0, 0));
+                oleDbScope.PublicKeyToken = Array.Empty<byte>();
+                module.AssemblyReferences.Add(oleDbScope);
+            }
+            typeRef.Scope = oleDbScope;
+        }
+    }
+
     public static void StubModulePInvokes(Mono.Cecil.ModuleDefinition module)
     {
             MethodReference? allocZeroedRef = null;
@@ -10997,6 +13690,20 @@ public static class AssemblyRewriter
                 if (freeM != null) freeRef = module.ImportReference(freeM);
                 var reallocM = typeof(System.Runtime.InteropServices.NativeMemory).GetMethod("Realloc", [typeof(void*), typeof(nuint)]);
                 if (reallocM != null) reallocRef = module.ImportReference(reallocM);
+            }
+            catch { }
+
+            // Rev61: fork GDI text surface for app-private extent
+            // imports (helper refs are built per method from that
+            // method's own parameter types, so the Size reference is
+            // the app's own and remaps with everything else). Null
+            // when the module has no WinForms reference to anchor to.
+            TypeReference? gdiTextType = null;
+            try
+            {
+                var gdiFormsScope = module.AssemblyReferences.FirstOrDefault(r => r.Name == "System.Windows.Forms");
+                if (gdiFormsScope != null)
+                    gdiTextType = new TypeReference("System.Windows.Forms", "WasmGdiText", module, gdiFormsScope);
             }
             catch { }
 
@@ -11227,9 +13934,296 @@ public static class AssemblyRewriter
                         il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
                         il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
                     }
+                    else if (method.Name == "GetWindowThreadProcessId")
+                    {
+                        // Thread-affinity coherence: the single browser UI
+                        // thread owns every window, and GetCurrentThreadId
+                        // stubs to 1 above. Returning the generic 0 here
+                        // made dispatcher thread checks (Paint.NET's
+                        // ControlDispatcher) conclude their controls were
+                        // created on the wrong thread. Also report process
+                        // id 1 through the out pointer when one is passed.
+                        var pidParam = method.Parameters.FirstOrDefault(p =>
+                            p.ParameterType is Mono.Cecil.PointerType or Mono.Cecil.ByReferenceType);
+                        if (pidParam != null)
+                        {
+                            var skipWrite = il.Create(Mono.Cecil.Cil.OpCodes.Nop);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg, pidParam);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Brfalse, skipWrite);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg, pidParam);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Stind_I4);
+                            il.Append(skipWrite);
+                        }
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                    }
                     else if (method.Name == "GetDeviceCaps")
                     {
                         il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4, 96);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                    }
+                    else if (gdiTextType != null
+                        && (method.Name == "GetTextExtentPoint32" || method.Name == "GetTextExtentPoint32W" || method.Name == "GetTextExtentPoint32A")
+                        && method.Parameters.Count == 4
+                        && method.Parameters[0].ParameterType.FullName == "System.IntPtr"
+                        && method.Parameters[1].ParameterType.FullName == "System.String"
+                        && method.Parameters[3].ParameterType is Mono.Cecil.ByReferenceType
+                        && (method.ReturnType.FullName == "System.Int32" || method.ReturnType.FullName == "System.UInt32" || method.ReturnType.FullName == "System.Boolean"))
+                    {
+                        // Rev61: app-private GDI text extents must WRITE the
+                        // out Size (fork text bridge); the generic stub
+                        // returned 0 with a zeroed struct, so every Telerik
+                        // document span measured (0,0) and typed glyphs
+                        // never rastered. Regression: ZZ invisible <-
+                        // RadTextMeasurer <- NativeTextRenderer import.
+                        var extentRef = new MethodReference("GetTextExtentPoint32", module.TypeSystem.Int32, gdiTextType) { HasThis = false };
+                        extentRef.Parameters.Add(new ParameterDefinition(module.TypeSystem.IntPtr));
+                        extentRef.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+                        extentRef.Parameters.Add(new ParameterDefinition(module.TypeSystem.Int32));
+                        extentRef.Parameters.Add(new ParameterDefinition(method.Parameters[3].ParameterType));
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_1);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_2);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_3);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Call, extentRef);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                    }
+                    else if (gdiTextType != null
+                        && (method.Name == "GetTextExtentExPoint" || method.Name == "GetTextExtentExPointW" || method.Name == "GetTextExtentExPointA")
+                        && method.Parameters.Count == 7
+                        && method.Parameters[0].ParameterType.FullName == "System.IntPtr"
+                        && method.Parameters[1].ParameterType.FullName == "System.String"
+                        && method.Parameters[4].ParameterType is Mono.Cecil.ArrayType
+                        && method.Parameters[5].ParameterType is Mono.Cecil.ArrayType
+                        && method.Parameters[6].ParameterType is Mono.Cecil.ByReferenceType
+                        && (method.ReturnType.FullName == "System.Boolean" || method.ReturnType.FullName == "System.Int32" || method.ReturnType.FullName == "System.UInt32"))
+                    {
+                        var extentExRef = new MethodReference("GetTextExtentExPoint", module.TypeSystem.Boolean, gdiTextType) { HasThis = false };
+                        extentExRef.Parameters.Add(new ParameterDefinition(module.TypeSystem.IntPtr));
+                        extentExRef.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+                        extentExRef.Parameters.Add(new ParameterDefinition(module.TypeSystem.Int32));
+                        extentExRef.Parameters.Add(new ParameterDefinition(module.TypeSystem.Int32));
+                        extentExRef.Parameters.Add(new ParameterDefinition(method.Parameters[4].ParameterType));
+                        extentExRef.Parameters.Add(new ParameterDefinition(method.Parameters[5].ParameterType));
+                        extentExRef.Parameters.Add(new ParameterDefinition(method.Parameters[6].ParameterType));
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_1);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_2);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_3);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg, method.Parameters[4]);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg, method.Parameters[5]);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg, method.Parameters[6]);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Call, extentExRef);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                    }
+                    else if (gdiTextType != null
+                        && method.Name == "SelectObject"
+                        && type.Name == "NativeTextRenderer"
+                        && method.Parameters.Count == 2
+                        && method.Parameters[0].ParameterType.FullName == "System.IntPtr"
+                        && method.Parameters[1].ParameterType.FullName == "System.IntPtr"
+                        && method.ReturnType.FullName == "System.IntPtr")
+                    {
+                        // Registers the selected HFONT with the bridge so
+                        // the extents above measure with the right font.
+                        var selectRef = new MethodReference("SelectObject", module.TypeSystem.IntPtr, gdiTextType) { HasThis = false };
+                        selectRef.Parameters.Add(new ParameterDefinition(module.TypeSystem.IntPtr));
+                        selectRef.Parameters.Add(new ParameterDefinition(module.TypeSystem.IntPtr));
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_1);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Call, selectRef);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                    }
+                    else if (gdiTextType != null
+                        && (method.Name == "DrawText" || method.Name == "DrawTextW" || method.Name == "DrawTextA")
+                        && method.Parameters.Count == 5
+                        && method.Parameters[0].ParameterType.FullName == "System.IntPtr"
+                        && method.Parameters[1].ParameterType.FullName == "System.String"
+                        && method.Parameters[2].ParameterType.FullName == "System.Int32"
+                        && method.Parameters[3].ParameterType is Mono.Cecil.ByReferenceType
+                        && (method.ReturnType.FullName == "System.Int32" || method.ReturnType.FullName == "System.UInt32"))
+                    {
+                        // Rev81: app-private gdi32 DrawText imports (Syncfusion
+                        // NativeMethods/NativePaint/ComboBoxEx/Win32API nested
+                        // RECT&) trap the interpreter as native imports; the
+                        // generic stub's success-shaped zero drops all node
+                        // text (TreeViewAdv paints labels through this path on
+                        // a zero fork HDC, resolved by WasmFillBridge during
+                        // scoped paint). Retarget to WasmGdiText.DrawText: the
+                        // rect decomposes through the signature's own struct
+                        // (field-name casing varies: left vs Left), so take
+                        // the first four Int32 fields in declaration order.
+                        // Unresolvable shapes keep the stub (quiet zero, no
+                        // worse than today). CALCRECT extents write back
+                        // through the out pair. Regression: zero-width labels <-
+                        // DrawText <- TreeViewAdv.OnPaint.
+                        var dtRectDef = (method.Parameters[3].ParameterType as Mono.Cecil.ByReferenceType)?.ElementType.Resolve();
+                        var dtFields = dtRectDef?.Fields
+                            .Where(f => !f.IsStatic && f.FieldType.FullName == "System.Int32")
+                            .Take(4).ToList();
+                        var dtFifth = method.Parameters[4].ParameterType.FullName;
+                        bool dtFifthOk = dtFifth == "System.Int32" || dtFifth == "System.UInt32";
+                        if (!dtFifthOk)
+                        {
+                            try { dtFifthOk = method.Parameters[4].ParameterType.Resolve()?.IsEnum == true; }
+                            catch { dtFifthOk = false; }
+                        }
+                        if (dtFields is not null && dtFields.Count == 4 && dtFifthOk)
+                        {
+                            var dtRectElem = ((Mono.Cecil.ByReferenceType)method.Parameters[3].ParameterType).ElementType;
+                            var drawRef = new MethodReference("DrawText", module.TypeSystem.Int32, gdiTextType) { HasThis = false };
+                            drawRef.Parameters.Add(new ParameterDefinition(module.TypeSystem.IntPtr));
+                            drawRef.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+                            for (int dti = 0; dti < 6; dti++)
+                                drawRef.Parameters.Add(new ParameterDefinition(module.TypeSystem.Int32));
+                            var dtIntByRef = new Mono.Cecil.ByReferenceType(module.TypeSystem.Int32);
+                            drawRef.Parameters.Add(new ParameterDefinition(dtIntByRef));
+                            drawRef.Parameters.Add(new ParameterDefinition(dtIntByRef));
+                            var dtRightVar = new Mono.Cecil.Cil.VariableDefinition(module.TypeSystem.Int32);
+                            var dtBottomVar = new Mono.Cecil.Cil.VariableDefinition(module.TypeSystem.Int32);
+                            var dtRectVar = new Mono.Cecil.Cil.VariableDefinition(module.ImportReference(dtRectElem));
+                            method.Body.Variables.Add(dtRectVar);
+                            method.Body.Variables.Add(dtRightVar);
+                            method.Body.Variables.Add(dtBottomVar);
+                            method.Body.InitLocals = true;
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_1);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_2);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_3);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldobj, module.ImportReference(dtRectElem));
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Stloc, dtRectVar);
+                            foreach (var dtField in dtFields)
+                            {
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Ldloc, dtRectVar);
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Ldfld, module.ImportReference(dtField));
+                            }
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg, method.Parameters[4]);
+                            if (dtFifth != "System.Int32")
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Conv_I4);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldloca_S, dtRightVar);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldloca_S, dtBottomVar);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Call, drawRef);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg, method.Parameters[3]);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldloc, dtRightVar);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Stfld, module.ImportReference(dtFields[2]));
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg, method.Parameters[3]);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldloc, dtBottomVar);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Stfld, module.ImportReference(dtFields[3]));
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                            method.Body.MaxStackSize = System.Math.Max(method.Body.MaxStackSize, 12);
+                        }
+                        else
+                        {
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_0);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                        }
+                    }
+                    else if (method.Name == "GetDpiForMonitor")
+                    {
+                        // Monitor-DPI queries report S_OK with 96/96 through
+                        // the out params. The generic IntPtr sentinel (0x1000)
+                        // reads as a failed HRESULT here (Telerik declares the
+                        // HRESULT as IntPtr), and the generic int default (0)
+                        // leaves the outs zeroed, which scales fonts to zero.
+                        // Any dpiType spelling answers 96: headless has one
+                        // scale. Regression: COMException E_FAIL <-
+                        // GetMonitorDpi <- GetScaledFont <- RadForm..ctor <-
+                        // PhotoAlbum boot (silent death).
+                        foreach (var p in method.Parameters)
+                        {
+                            if (p.ParameterType is not Mono.Cecil.ByReferenceType
+                                and not Mono.Cecil.PointerType)
+                                continue;
+                            var skipDpiWrite = il.Create(Mono.Cecil.Cil.OpCodes.Nop);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg, p);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Brfalse, skipDpiWrite);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg, p);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4, 96);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Stind_I4);
+                            il.Append(skipDpiWrite);
+                        }
+                        if (method.ReturnType.FullName == "System.Void")
+                        {
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                        }
+                        else if (method.ReturnType.FullName == "System.IntPtr" || method.ReturnType.FullName == "System.UIntPtr")
+                        {
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_0);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Conv_I);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                        }
+                        else if (method.ReturnType.FullName == "System.Int32" || method.ReturnType.FullName == "System.UInt32")
+                        {
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_0);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                        }
+                        else if (method.ReturnType.IsValueType)
+                        {
+                            var dpiLoc = new Mono.Cecil.Cil.VariableDefinition(method.ReturnType);
+                            method.Body.Variables.Add(dpiLoc);
+                            method.Body.InitLocals = true;
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldloca_S, dpiLoc);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Initobj, method.ReturnType);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldloc, dpiLoc);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                        }
+                        else
+                        {
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldnull);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                        }
+                    }
+                    else if (method.Name == "GetDpiForWindow" || method.Name == "GetDpiForSystem")
+                    {
+                        // Value-returning DPI queries (UINT, not HRESULT):
+                        // one headless scale, 96.
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4, 96);
+                        if (method.ReturnType.FullName == "System.IntPtr" || method.ReturnType.FullName == "System.UIntPtr")
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Conv_I);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                    }
+                    else if (method.Name == "GetScrollBarInfo" && method.Parameters.Count == 3)
+                    {
+                        // Native scroll-state reads leave managed int[] fields virgin
+                        // headless (the desktop marshaller materializes them when native
+                        // fills the struct): Syncfusion
+                        // ScrollersFrame.UpdateScrollerSettings ldelem's
+                        // SCROLLBARINFO.rgstate unconditionally, so a virgin struct NREs
+                        // during TreeViewAdv parenting once any fake handle exists
+                        // (the IsHandleCreated bail the vendor relies on pre-Show no
+                        // longer holds). Materialize the 6-DWORD state buffer (native
+                        // CCHILDREN_SCROLLBAR layout) when null; zeros mean "no state
+                        // flags", matching the vendor defaults the pre-handle bail takes
+                        // on desktop. Still returns FALSE (no native state). Pointer-
+                        // shaped params keep the old behavior (no safe deref).
+                        // Regression: NRE <- UpdateScrollerSettings <-
+                        // SynchronizeScrollbars <- TreeViewAdvDragDrop.Form1..ctor
+                        // (treeview window failure).
+                        var sbiParam = method.Parameters[2];
+                        if (sbiParam.ParameterType is Mono.Cecil.ByReferenceType sbiRef
+                            && sbiRef.ElementType.Resolve() is { } sbiDef)
+                        {
+                            var rgField = sbiDef.Fields.FirstOrDefault(f => f.Name == "rgstate"
+                                && f.FieldType.FullName == "System.Int32[]");
+                            if (rgField != null)
+                            {
+                                var rgRef = module.ImportReference(rgField);
+                                var haveRg = il.Create(Mono.Cecil.Cil.OpCodes.Nop);
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg, sbiParam);
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Ldfld, rgRef);
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Brtrue, haveRg);
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg, sbiParam);
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_6);
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Newarr, module.TypeSystem.Int32);
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Stfld, rgRef);
+                                il.Append(haveRg);
+                            }
+                        }
+                        method.Body.MaxStackSize = System.Math.Max(method.Body.MaxStackSize, 1);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_0);
+                        if (method.ReturnType.FullName == "System.IntPtr" || method.ReturnType.FullName == "System.UIntPtr")
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Conv_I);
                         il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
                     }
                     else if (method.Name == "ReleaseDC" || method.Name == "DeleteDC" || method.Name == "DeleteObject")
@@ -11293,6 +14287,24 @@ public static class AssemblyRewriter
                         il.Emit(Mono.Cecil.Cil.OpCodes.Ldloc, loc);
                         il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
                     }
+                    else if (IsNativeAddressQuery(method.Name)
+                        && (method.ReturnType.IsPointer
+                            || method.ReturnType.FullName == "System.IntPtr"
+                            || method.ReturnType.FullName == "System.UIntPtr"))
+                    {
+                        // Module/proc-address queries fail closed: no native
+                        // module can load headless, so LoadLibrary /
+                        // GetModuleHandle / GetProcAddress answer NULL (the
+                        // desktop failure shape). Callers null-check and
+                        // degrade; the 0x1000 sentinel instead reads as a
+                        // live address and the runtime traps generating the
+                        // call stub. Regression: func[7893] OOB <-
+                        // GetDelegateForFunctionPointer <- DllWrapper <-
+                        // ShapedForm..ctor <- ERP boot (silent death).
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_0);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Conv_U);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                    }
                     else if (method.ReturnType.IsPointer || method.ReturnType.IsByReference)
                     {
                         il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4, 0x1000);
@@ -11310,6 +14322,20 @@ public static class AssemblyRewriter
                         il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
                         il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
                     }
+                    else if ((method.Name == "GetDynamicTimeZoneInformation" || method.Name == "GetTimeZoneInformation")
+                        && (method.ReturnType.FullName == "System.UInt32" || method.ReturnType.FullName == "System.Int32"))
+                    {
+                        // Win32 time-zone queries fail closed with
+                        // TIME_ZONE_ID_INVALID (-1): the documented failure
+                        // code, which callers must handle (branch to a
+                        // custom/UTC zone). Answering 0 (UNKNOWN) instead
+                        // sends Telerik down the registry-read path, which
+                        // has no headless answers. Regression: MME/NRE <-
+                        // TimeZoneInfo.GetLocalTimeZone <- Scheduler <-
+                        // hotelapp boot (silent-ish death).
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_M1);
+                        il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                    }
                     else if (method.ReturnType.FullName == "System.UInt32" || method.ReturnType.FullName == "System.Int32")
                     {
                         if (method.Name.StartsWith("Register") || method.Name == "RegisterWindowMessage")
@@ -11317,6 +14343,73 @@ public static class AssemblyRewriter
                         else
                             il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_0);
                         il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                    }
+                    else if ((method.Name == "GetTextMetrics" || method.Name == "GetTextMetricsA" || method.Name == "GetTextMetricsW")
+                        && method.Parameters.Any(p => p.ParameterType is Mono.Cecil.ByReferenceType))
+                    {
+                        // GDI text metrics drive baseline ratios (ascent/height)
+                        // in rich-text/grid stacks; the generic stub answered
+                        // success with a zeroed struct, so 0/0.0 poisoned layout
+                        // with NaN. Fill the well-known int/char fields with
+                        // coherent 13px-UI-font metrics (ascent+descent==height,
+                        // same scale as the fork PInvoke stub) and report success.
+                        // Absolute scale stays a guess until real font metrics
+                        // arrive; zeros are never valid for height/ascent.
+                        // Regression: InvalidOperationException MeasureOverride-NaN
+                        // <- ParagraphLayoutBox <- RichTextEditor boot.
+                        var fills = new (string Name, int Value)[]
+                        {
+                            ("tmHeight", 13), ("tmAscent", 11), ("tmDescent", 2),
+                            ("tmInternalLeading", 1), ("tmAveCharWidth", 7),
+                            ("tmMaxCharWidth", 13), ("tmDigitizedAspectX", 96),
+                            ("tmDigitizedAspectY", 96), ("tmFirstChar", 32),
+                            ("tmLastChar", 255), ("tmDefaultChar", 63),
+                            ("tmBreakChar", 32),
+                        };
+                        var tmParam = method.Parameters.First(p => p.ParameterType is Mono.Cecil.ByReferenceType);
+                        var tmElem = ((Mono.Cecil.ByReferenceType)tmParam.ParameterType).ElementType;
+                        var tmDef = tmElem.Resolve();
+                        if (tmDef != null)
+                        {
+                            foreach (var (name, value) in fills)
+                            {
+                                var field = tmDef.Fields.FirstOrDefault(f => f.Name == name
+                                    && (f.FieldType.FullName == "System.Int32" || f.FieldType.FullName == "System.Char"));
+                                if (field == null)
+                                    continue;
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg, tmParam);
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4, value);
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Stfld, module.ImportReference(field));
+                            }
+                        }
+                        if (method.ReturnType.FullName == "System.Void")
+                        {
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                        }
+                        else if (method.ReturnType.FullName == "System.Boolean"
+                            || method.ReturnType.FullName == "System.Int32"
+                            || method.ReturnType.FullName == "System.UInt32")
+                        {
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                        }
+                        else
+                        {
+                            var loc = new Mono.Cecil.Cil.VariableDefinition(method.ReturnType);
+                            method.Body.Variables.Add(loc);
+                            method.Body.InitLocals = true;
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldloca_S, loc);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Initobj, method.ReturnType);
+                            var valField = method.ReturnType.Resolve()?.Fields.FirstOrDefault(f => f.Name == "Value");
+                            if (valField != null)
+                            {
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Ldloca_S, loc);
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Stfld, module.ImportReference(valField));
+                            }
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldloc, loc);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                        }
                     }
                     else if (method.ReturnType.FullName == "System.Boolean"
                         && method.Name.Length > 2
@@ -11372,7 +14465,7 @@ public static class AssemblyRewriter
                                 il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
                                 il.Emit(Mono.Cecil.Cil.OpCodes.Stfld, module.ImportReference(valField));
                             }
-                            else if (method.ReturnType.Name != "HRESULT")
+                            else if (method.ReturnType.Name != "HRESULT" && !IsNativeAddressQuery(method.Name))
                             {
                                 il.Emit(Mono.Cecil.Cil.OpCodes.Ldloca_S, loc);
                                 il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4, 0x1000);
@@ -11392,13 +14485,187 @@ public static class AssemblyRewriter
             }
     }
 
+    // Scopes the writer still emits typerefs against: reachability from
+    // live metadata (signatures, bodies, attributes, forwarders), not
+    // TypeRef-table presence (strip passes leave dead rows the writer
+    // prunes). Assembly-ref trimming consults this; dropping a live
+    // scope orphans its typerefs and Cecil re-emits them against the
+    // wrong table (observed: System.Private.CoreLib, fatal at bind).
+    private static HashSet<Mono.Cecil.IMetadataScope> LiveScopes(Mono.Cecil.ModuleDefinition module)
+    {
+        var live = new HashSet<Mono.Cecil.IMetadataScope>();
+        foreach (Mono.Cecil.CustomAttribute attribute in module.Assembly.CustomAttributes)
+            CollectScopes(attribute, live);
+        foreach (Mono.Cecil.CustomAttribute attribute in module.CustomAttributes)
+            CollectScopes(attribute, live);
+        CollectSecurityScopes(module.Assembly, live);
+        foreach (Mono.Cecil.ExportedType forwarded in module.ExportedTypes)
+            if (forwarded.Scope is not null)
+                live.Add(forwarded.Scope);
+        foreach (Mono.Cecil.TypeDefinition type in module.GetTypes())
+        {
+            CollectScopes(type.BaseType, live);
+            foreach (Mono.Cecil.InterfaceImplementation face in type.Interfaces)
+                CollectScopes(face.InterfaceType, live);
+            foreach (Mono.Cecil.GenericParameter generic in type.GenericParameters)
+                foreach (Mono.Cecil.GenericParameterConstraint constraint in generic.Constraints)
+                    CollectScopes(constraint.ConstraintType, live);
+            foreach (Mono.Cecil.FieldDefinition field in type.Fields)
+            {
+                CollectScopes(field.FieldType, live);
+                foreach (Mono.Cecil.CustomAttribute attribute in field.CustomAttributes)
+                    CollectScopes(attribute, live);
+            }
+            foreach (Mono.Cecil.PropertyDefinition property in type.Properties)
+            {
+                CollectScopes(property.PropertyType, live);
+                foreach (Mono.Cecil.CustomAttribute attribute in property.CustomAttributes)
+                    CollectScopes(attribute, live);
+            }
+            foreach (Mono.Cecil.EventDefinition @event in type.Events)
+            {
+                CollectScopes(@event.EventType, live);
+                foreach (Mono.Cecil.CustomAttribute attribute in @event.CustomAttributes)
+                    CollectScopes(attribute, live);
+            }
+            foreach (Mono.Cecil.MethodDefinition method in type.Methods)
+            {
+                CollectScopes(method.ReturnType, live);
+                foreach (Mono.Cecil.ParameterDefinition parameter in method.Parameters)
+                    CollectScopes(parameter.ParameterType, live);
+                foreach (Mono.Cecil.GenericParameter generic in method.GenericParameters)
+                    foreach (Mono.Cecil.GenericParameterConstraint constraint in generic.Constraints)
+                        CollectScopes(constraint.ConstraintType, live);
+                if (method.HasBody)
+                {
+                    foreach (Mono.Cecil.Cil.VariableDefinition variable in method.Body.Variables)
+                        CollectScopes(variable.VariableType, live);
+                    foreach (Mono.Cecil.Cil.Instruction instruction in method.Body.Instructions)
+                        CollectScopes(instruction.Operand, live);
+                    foreach (Mono.Cecil.Cil.ExceptionHandler handler in method.Body.ExceptionHandlers)
+                        CollectScopes(handler.CatchType, live);
+                }
+                foreach (Mono.Cecil.CustomAttribute attribute in method.CustomAttributes)
+                    CollectScopes(attribute, live);
+                CollectSecurityScopes(method, live);
+            }
+            foreach (Mono.Cecil.CustomAttribute attribute in type.CustomAttributes)
+                CollectScopes(attribute, live);
+            CollectSecurityScopes(type, live);
+        }
+        return live;
+    }
+
+    private static void CollectSecurityScopes(Mono.Cecil.ICustomAttributeProvider owner, HashSet<Mono.Cecil.IMetadataScope> live)
+    {
+        if (owner is Mono.Cecil.AssemblyDefinition assembly && assembly.HasSecurityDeclarations)
+            foreach (Mono.Cecil.SecurityDeclaration declaration in assembly.SecurityDeclarations)
+                CollectScopes(declaration, live);
+        if (owner is Mono.Cecil.TypeDefinition type && type.HasSecurityDeclarations)
+            foreach (Mono.Cecil.SecurityDeclaration declaration in type.SecurityDeclarations)
+                CollectScopes(declaration, live);
+        if (owner is Mono.Cecil.MethodDefinition method && method.HasSecurityDeclarations)
+            foreach (Mono.Cecil.SecurityDeclaration declaration in method.SecurityDeclarations)
+                CollectScopes(declaration, live);
+    }
+
+    private static void CollectScopes(object? node, HashSet<Mono.Cecil.IMetadataScope> live)
+    {
+        CollectScopes(node, live, new HashSet<object>(ReferenceEqualityComparer.Instance));
+    }
+
+    private static void CollectScopes(object? node, HashSet<Mono.Cecil.IMetadataScope> live, HashSet<object> seen)
+    {
+        if (node is null || !seen.Add(node))
+            return;
+        switch (node)
+        {
+            case null:
+                return;
+            case Mono.Cecil.TypeReference type:
+                if (type.Scope is not null)
+                    live.Add(type.Scope);
+                switch (type)
+                {
+                    case Mono.Cecil.GenericInstanceType generic:
+                        foreach (Mono.Cecil.TypeReference argument in generic.GenericArguments)
+                            CollectScopes(argument, live, seen);
+                        CollectScopes(generic.ElementType, live, seen);
+                        break;
+                    case Mono.Cecil.TypeSpecification specification:
+                        CollectScopes(specification.ElementType, live, seen);
+                        break;
+                    case Mono.Cecil.GenericParameter parameter:
+                        foreach (Mono.Cecil.GenericParameterConstraint constraint in parameter.Constraints)
+                            CollectScopes(constraint.ConstraintType, live, seen);
+                        break;
+                }
+                // FunctionPointerType stores its signature off-band (ElementType is null).
+                if (type is Mono.Cecil.FunctionPointerType fnptr)
+                {
+                    CollectScopes(fnptr.ReturnType, live, seen);
+                    foreach (Mono.Cecil.ParameterDefinition parameter in fnptr.Parameters)
+                        CollectScopes(parameter.ParameterType, live, seen);
+                }
+                return;
+            case Mono.Cecil.MethodReference method:
+                CollectScopes(method.DeclaringType, live, seen);
+                CollectScopes(method.ReturnType, live, seen);
+                foreach (Mono.Cecil.ParameterDefinition parameter in method.Parameters)
+                    CollectScopes(parameter.ParameterType, live, seen);
+                if (method is Mono.Cecil.GenericInstanceMethod genericMethod)
+                    foreach (Mono.Cecil.TypeReference argument in genericMethod.GenericArguments)
+                        CollectScopes(argument, live, seen);
+                return;
+            case Mono.Cecil.FieldReference field:
+                CollectScopes(field.DeclaringType, live, seen);
+                CollectScopes(field.FieldType, live, seen);
+                return;
+            case Mono.Cecil.ParameterDefinition parameter:
+                CollectScopes(parameter.ParameterType, live, seen);
+                return;
+            case Mono.Cecil.Cil.VariableDefinition variable:
+                CollectScopes(variable.VariableType, live, seen);
+                return;
+            case Mono.Cecil.CustomAttribute attribute:
+                CollectScopes(attribute.AttributeType, live, seen);
+                foreach (Mono.Cecil.CustomAttributeArgument argument in attribute.ConstructorArguments)
+                    CollectScopes(argument.Type, live, seen);
+                foreach (Mono.Cecil.CustomAttributeNamedArgument argument in attribute.Properties)
+                    CollectScopes(argument.Argument.Type, live, seen);
+                foreach (Mono.Cecil.CustomAttributeNamedArgument argument in attribute.Fields)
+                    CollectScopes(argument.Argument.Type, live, seen);
+                return;
+            case Mono.Cecil.SecurityDeclaration declaration:
+                foreach (Mono.Cecil.SecurityAttribute attribute in declaration.SecurityAttributes)
+                    CollectScopes(attribute, live, seen);
+                return;
+            default:
+                return;
+        }
+    }
+
+    // Native module/proc-address queries: LoadLibrary / GetModuleHandle /
+    // GetProcAddress in any entry-point spelling (A/W suffixed or bare).
+    // These fail closed (NULL) in the stubber; every other shape keeps
+    // the sentinel/success defaults.
+    private static bool IsNativeAddressQuery(string name)
+    {
+        string bare = name;
+        if (bare.Length > 1 && (bare.EndsWith('A') || bare.EndsWith('W')))
+        {
+            string trimmed = bare.Substring(0, bare.Length - 1);
+            if (trimmed is "LoadLibrary" or "LoadLibraryEx" or "GetModuleHandle" or "GetModuleHandleEx" or "GetProcAddress")
+                return true;
+        }
+
+        return bare is "LoadLibrary" or "LoadLibraryEx" or "GetModuleHandle" or "GetModuleHandleEx" or "GetProcAddress";
+    }
+
     public static void StubPInvokes(string assemblyPath, string outputPath)
     {
-        var resolver = new DefaultAssemblyResolver();
-        resolver.AddSearchDirectory(@"C:\Program Files\dotnet\shared\Microsoft.NETCore.App\9.0.20");
-        resolver.AddSearchDirectory(@"C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App\9.0.20");
-        if (Path.GetDirectoryName(assemblyPath) is string dir && Directory.Exists(dir))
-            resolver.AddSearchDirectory(dir);
+        string? fileDir = Path.GetDirectoryName(assemblyPath);
+        using var resolver = new FrameworkResolver(fileDir);
         var bytes = File.ReadAllBytes(assemblyPath);
         var readerParams = new ReaderParameters { AssemblyResolver = resolver };
         using var stream = new MemoryStream(bytes);
@@ -11425,19 +14692,107 @@ public static class AssemblyRewriter
     /// of the shipping rewrite; applied manually on top of a regen and
     /// wiped by the next regen.
     /// </summary>
+    // Diagnostic only (--calls): enumerate every method/PInvoke/member
+    // reference used by the named method bodies. Read-only.
+    public static int DumpMethodCalls(string assemblyPath, IEnumerable<string> methodKeys)
+    {
+        var keys = new HashSet<string>(methodKeys, StringComparer.Ordinal);
+        string? dir = Path.GetDirectoryName(assemblyPath);
+        using var resolver = new FrameworkResolver(dir, [AppContext.BaseDirectory]);
+        var bytes = File.ReadAllBytes(assemblyPath);
+        var readerParams = new ReaderParameters { AssemblyResolver = resolver };
+        using var stream = new MemoryStream(bytes);
+        using var assembly = AssemblyDefinition.ReadAssembly(stream, readerParams);
+        int dumped = 0;
+        foreach (var type in assembly.MainModule.GetTypes())
+        {
+            foreach (var method in type.Methods)
+            {
+                if (!method.HasBody) continue;
+                if (!keys.Contains(type.FullName + "::" + method.Name)) continue;
+                dumped++;
+                Console.WriteLine("METHOD " + type.FullName + "::" + method.ToString());
+                foreach (var ins in method.Body.Instructions)
+                {
+                    try
+                    {
+                        if (ins.Operand is MethodReference mr)
+                        {
+                            string pinvoke = "";
+                            try
+                            {
+                                var def = mr.Resolve();
+                                if (def is not null && def.IsPInvokeImpl && def.PInvokeInfo is not null)
+                                    pinvoke = " [PInvoke " + def.PInvokeInfo.Module.Name + "!" + def.PInvokeInfo.EntryPoint + "]";
+                            }
+                            catch { }
+                            Console.WriteLine("  " + ins.OpCode.ToString() + " " + mr.DeclaringType.FullName + "::" + mr.Name + pinvoke);
+                        }
+                        else if (ins.Operand is FieldReference fr)
+                            Console.WriteLine("  " + ins.OpCode.ToString() + " field " + fr.DeclaringType.FullName + "::" + fr.Name);
+                    }
+                    catch { }
+                }
+            }
+        }
+        return dumped;
+    }
+
+    // Diagnostic only: --ildump <dll> <Type::Method>... prints full
+    // IL (offsets, opcodes, operands) plus exception handlers, for
+    // triage where the call list hides control flow. Read-only.
+    public static int DumpIL(string assemblyPath, IEnumerable<string> methodKeys)
+    {
+        var keys = new HashSet<string>(methodKeys, StringComparer.Ordinal);
+        string? dir = Path.GetDirectoryName(assemblyPath);
+        using var resolver = new FrameworkResolver(dir, [AppContext.BaseDirectory]);
+        var bytes = File.ReadAllBytes(assemblyPath);
+        var readerParams = new ReaderParameters { AssemblyResolver = resolver };
+        using var stream = new MemoryStream(bytes);
+        using var assembly = AssemblyDefinition.ReadAssembly(stream, readerParams);
+        int dumped = 0;
+        foreach (var type in assembly.MainModule.GetTypes())
+        {
+            foreach (var method in type.Methods)
+            {
+                if (!method.HasBody) continue;
+                if (!keys.Contains(type.FullName + "::" + method.Name)) continue;
+                dumped++;
+                Console.WriteLine("METHOD " + type.FullName + "::" + method.ToString());
+                foreach (var h in method.Body.ExceptionHandlers)
+                    Console.WriteLine($"  handler {h.HandlerType} try {h.TryStart?.Offset:X4}-{h.TryEnd?.Offset:X4} handler {h.HandlerStart?.Offset:X4}-{h.HandlerEnd?.Offset:X4} catch={h.CatchType?.FullName}");
+                foreach (var ins in method.Body.Instructions)
+                {
+                    string op;
+                    try
+                    {
+                        op = ins.Operand switch
+                        {
+                            MethodReference mr => mr.DeclaringType.FullName + "::" + mr.Name,
+                            FieldReference fr => "field " + fr.DeclaringType.FullName + "::" + fr.Name,
+                            TypeReference tr => "type " + tr.FullName,
+                            string s => "\"" + (s.Length > 60 ? s[..60] + "..." : s) + "\"",
+                            null => "",
+                            _ => ins.Operand.ToString() ?? "",
+                        };
+                    }
+                    catch { op = "?"; }
+                    Console.WriteLine($"  {ins.Offset:X4}: {ins.OpCode} {op}");
+                }
+            }
+        }
+        return dumped;
+    }
     public static int InstrumentProbes(string assemblyPath, string outputPath, IEnumerable<string> methodKeys)
     {
         var keys = new HashSet<string>(methodKeys, StringComparer.Ordinal);
-        var resolver = new DefaultAssemblyResolver();
-        resolver.AddSearchDirectory(@"C:\Program Files\dotnet\shared\Microsoft.NETCore.App\9.0.20");
-        resolver.AddSearchDirectory(@"C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App\9.0.20");
+        // (Shared framework dirs come from FrameworkResolver discovery, not the
+        // stale hardcoded 9.0.20 paths that used to sit here.)
         // Rewritten app assemblies reference the migrated fork, which
         // lives in the scratch staging dirs (see rewrite-*.ps1), not next
         // to the app DLLs: metadata resolution needs them on the path.
-        resolver.AddSearchDirectory(@"E:\tmp\rewritten-small");
-        resolver.AddSearchDirectory(@"E:\tmp\rewritten-paint");
-        if (Path.GetDirectoryName(assemblyPath) is string dir && Directory.Exists(dir))
-            resolver.AddSearchDirectory(dir);
+        string? probeDir = Path.GetDirectoryName(assemblyPath);
+        using var resolver = new FrameworkResolver(probeDir, [AppContext.BaseDirectory]);
         var bytes = File.ReadAllBytes(assemblyPath);
         var readerParams = new ReaderParameters { AssemblyResolver = resolver };
         using var stream = new MemoryStream(bytes);
@@ -11465,6 +14820,36 @@ public static class AssemblyRewriter
                     il.InsertBefore(ret, il.Create(OpCodes.Call, writeLine));
                 }
 
+                // The inserts add one net stack slot (ldstr ahead of its call):
+                // keep the stored max honest or the method goes InvalidProgram
+                // (a self-defeating probe: it would die at transform with no ENTER).
+                method.Body.MaxStackSize++;
+                // The EXIT pair before each ret grows the distance between
+                // existing short branches and their targets (and loop
+                // back-edges to method start grow from the ENTER pair). A
+                // branch sitting at the +/-127 edge then writes a bad
+                // target (Cecil never expands short branches): expand
+                // every short form up front, the same long-form rule the
+                // emitters follow. This retires the historic victims
+                // (SetVisualStyle, GetFormatString, FocusManager.Draw,
+                // RenderRulers, DrawDocumentBackground, set_Unit, EndUpdate).
+                foreach (var ins in method.Body.Instructions)
+                {
+                    if (ins.OpCode == OpCodes.Br_S) ins.OpCode = OpCodes.Br;
+                    else if (ins.OpCode == OpCodes.Brfalse_S) ins.OpCode = OpCodes.Brfalse;
+                    else if (ins.OpCode == OpCodes.Brtrue_S) ins.OpCode = OpCodes.Brtrue;
+                    else if (ins.OpCode == OpCodes.Beq_S) ins.OpCode = OpCodes.Beq;
+                    else if (ins.OpCode == OpCodes.Bge_S) ins.OpCode = OpCodes.Bge;
+                    else if (ins.OpCode == OpCodes.Bgt_S) ins.OpCode = OpCodes.Bgt;
+                    else if (ins.OpCode == OpCodes.Ble_S) ins.OpCode = OpCodes.Ble;
+                    else if (ins.OpCode == OpCodes.Blt_S) ins.OpCode = OpCodes.Blt;
+                    else if (ins.OpCode == OpCodes.Bne_Un_S) ins.OpCode = OpCodes.Bne_Un;
+                    else if (ins.OpCode == OpCodes.Bge_Un_S) ins.OpCode = OpCodes.Bge_Un;
+                    else if (ins.OpCode == OpCodes.Bgt_Un_S) ins.OpCode = OpCodes.Bgt_Un;
+                    else if (ins.OpCode == OpCodes.Ble_Un_S) ins.OpCode = OpCodes.Ble_Un;
+                    else if (ins.OpCode == OpCodes.Blt_Un_S) ins.OpCode = OpCodes.Blt_Un;
+                    else if (ins.OpCode == OpCodes.Leave_S) ins.OpCode = OpCodes.Leave;
+                }
                 probed++;
             }
         }
@@ -11482,11 +14867,8 @@ public static class AssemblyRewriter
         // Managed environment probes that throw in the browser: WPF tracing
         // reads the Windows registry during DependencyObject..cctor, which
         // breaks AppWorkspace creation. Answer "disabled" instead.
-        var resolver = new DefaultAssemblyResolver();
-        resolver.AddSearchDirectory(@"C:\Program Files\dotnet\shared\Microsoft.NETCore.App\9.0.20");
-        resolver.AddSearchDirectory(@"C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App\9.0.20");
-        if (Path.GetDirectoryName(assemblyPath) is string dir && Directory.Exists(dir))
-            resolver.AddSearchDirectory(dir);
+        string? fileDir = Path.GetDirectoryName(assemblyPath);
+        using var resolver = new FrameworkResolver(fileDir);
         var bytes = File.ReadAllBytes(assemblyPath);
         var readerParams = new ReaderParameters { AssemblyResolver = resolver };
         using var stream = new MemoryStream(bytes);
@@ -11644,5 +15026,188 @@ public static class AssemblyRewriter
         assembly.Write(tempFile);
         assembly.Dispose();
         File.Move(tempFile, outputPath, true);
+    }
+
+    // Verbatim-plus micro-pass (rev58): WPF AssemblyHelper.OnLoaded
+    // guards on Assembly.ReflectionOnly, whose Mono-WASM builder
+    // override throws NIE; escaping an AssemblyResolve handler that
+    // kills the runtime (paint MONO cascade). Answer false: exact
+    // .NET Core behavior (no reflection-only context exists), so the
+    // GAC-record loop below stays intact. Stack-neutral rewrite:
+    // the instance call pops the assembly and pushes a bool, so the
+    // call becomes pop + ldc.i4.0. Returns neutralized site count.
+    public static int NeutralizeModuleReflectionOnlyGuards(ModuleDefinition module)
+    {
+        int sites = 0;
+        foreach (var type in module.GetTypes())
+        {
+            foreach (var method in type.Methods.ToList())
+            {
+                if (!method.HasBody)
+                    continue;
+                var il = method.Body.GetILProcessor();
+                foreach (var ins in method.Body.Instructions.ToList())
+                {
+                    if ((ins.OpCode != Mono.Cecil.Cil.OpCodes.Callvirt && ins.OpCode != Mono.Cecil.Cil.OpCodes.Call)
+                        || ins.Operand is not MethodReference mr
+                        || mr.Name != "get_ReflectionOnly"
+                        || mr.DeclaringType.FullName != "System.Reflection.Assembly"
+                        || mr.Parameters.Count != 0)
+                        continue;
+                    var pop = il.Create(Mono.Cecil.Cil.OpCodes.Pop);
+                    il.Replace(ins, pop);
+                    il.InsertAfter(pop, il.Create(Mono.Cecil.Cil.OpCodes.Ldc_I4_0));
+                    sites++;
+                }
+            }
+        }
+        return sites;
+    }
+
+    public static int NeutralizeReflectionOnlyGuards(string assemblyPath, string outputPath)
+    {
+        string? fileDir = Path.GetDirectoryName(assemblyPath);
+        using var resolver = new FrameworkResolver(fileDir);
+        var bytes = File.ReadAllBytes(assemblyPath);
+        var readerParams = new ReaderParameters { AssemblyResolver = resolver };
+        using var stream = new MemoryStream(bytes);
+        using var assembly = AssemblyDefinition.ReadAssembly(stream, readerParams);
+        int sites = NeutralizeModuleReflectionOnlyGuards(assembly.MainModule);
+        // Clean files stay byte-identical: the host-bundle pass (Fix 3)
+        // runs over _framework DLLs it must not churn, and the served
+        // path has no reason to round-trip an untouched file either.
+        if (sites == 0)
+            return 0;
+        var outDir = Path.GetDirectoryName(outputPath) ?? ".";
+        var tempFile = Path.Combine(outDir, Guid.NewGuid() + ".tmp");
+        assembly.Write(tempFile);
+        assembly.Dispose();
+        File.Move(tempFile, outputPath, true);
+        return sites;
+    }
+
+    // Rev59: Telerik's ContextLayoutManager posts its measure/arrange
+    // pass via RadControl.InvokeLayoutCallback, gated on IsHandleCreated
+    // (always false headless): the post is silently dropped and TPF
+    // layout queues starve after boot, so edited content paints stale
+    // layout indefinitely. Neutralize the handle check in that one
+    // method (pop this + ldc.i4.1): the same-thread BeginInvoke then
+    // runs the layout callback inline, exactly like the desktop
+    // Dispatcher.BeginInvoke UI-thread fast path. The Disposing/
+    // IsDisposed guards after it stay. Returns neutralized site count.
+    // Rev62: document span glyphs paint through TextBlock.DrawGdi
+    // (GDI DrawTransparentText: DIB section + TextOut + AlphaBlend,
+    // none of which has a headless backend, so every run paints
+    // nothing). The sibling DrawGdiPlus path paints the same runs
+    // through managed Graphics.DrawString (fork-supported); the
+    // signatures match, so retarget the single PaintElement call.
+    // Regression: typed/deleted-region glyphs invisible (X/ZZ) while
+    // selection/deletion reflow painted fine.
+    public static int RetargetTextBlockGdiPaint(ModuleDefinition module)
+    {
+        int sites = 0;
+        foreach (var type in module.GetTypes())
+        {
+            if (type.FullName != "Telerik.WinControls.RichTextEditor.UI.TextBlock")
+                continue;
+            var target = type.Methods.FirstOrDefault(m => m.Name == "DrawGdiPlus" && m.Parameters.Count == 3);
+            if (target is null)
+                continue;
+            foreach (var method in type.Methods.ToList())
+            {
+                if (method.Name != "PaintElement" || !method.HasBody)
+                    continue;
+                var il = method.Body.GetILProcessor();
+                foreach (var ins in method.Body.Instructions.ToList())
+                {
+                    if ((ins.OpCode != Mono.Cecil.Cil.OpCodes.Callvirt && ins.OpCode != Mono.Cecil.Cil.OpCodes.Call)
+                        || ins.Operand is not MethodReference mr
+                        || mr.Name != "DrawGdi"
+                        || mr.DeclaringType.FullName != "Telerik.WinControls.RichTextEditor.UI.TextBlock"
+                        || mr.Parameters.Count != 3)
+                        continue;
+                    il.Replace(ins, il.Create(Mono.Cecil.Cil.OpCodes.Callvirt, module.ImportReference(target)));
+                    sites++;
+                }
+            }
+        }
+        return sites;
+    }
+    public static int NeutralizeModuleLayoutHandleGuard(ModuleDefinition module)
+    {
+        // The retarget needs the fork scope; without it, leave the
+        // guard alone (ungating into a throwing BeginInvoke is worse
+        // than the silent drop).
+        var formsScope = module.AssemblyReferences.FirstOrDefault(r => r.Name == "System.Windows.Forms");
+        if (formsScope is null)
+            return 0;
+        var queueType = new TypeReference("System.Windows.Forms", "WasmLayoutQueue", module, formsScope);
+        var controlType = new TypeReference("System.Windows.Forms", "Control", module, formsScope);
+        var post = new MethodReference("Post", module.ImportReference(typeof(System.IAsyncResult)), queueType)
+        {
+            HasThis = false,
+        };
+        post.Parameters.Add(new ParameterDefinition(controlType));
+        post.Parameters.Add(new ParameterDefinition(module.ImportReference(typeof(System.Delegate))));
+        post.Parameters.Add(new ParameterDefinition(new ArrayType(module.TypeSystem.Object)));
+        int sites = 0;
+        foreach (var type in module.GetTypes())
+        {
+            if (type.FullName != "Telerik.WinControls.RadControl")
+                continue;
+            foreach (var method in type.Methods.ToList())
+            {
+                if (method.Name != "InvokeLayoutCallback" || !method.HasBody)
+                    continue;
+                var il = method.Body.GetILProcessor();
+                foreach (var ins in method.Body.Instructions.ToList())
+                {
+                    if ((ins.OpCode != Mono.Cecil.Cil.OpCodes.Callvirt && ins.OpCode != Mono.Cecil.Cil.OpCodes.Call)
+                        || ins.Operand is not MethodReference mr
+                        || mr.Name != "get_IsHandleCreated"
+                        || mr.DeclaringType.FullName != "System.Windows.Forms.Control"
+                        || mr.Parameters.Count != 0)
+                        continue;
+                    var pop = il.Create(Mono.Cecil.Cil.OpCodes.Pop);
+                    il.Replace(ins, pop);
+                    il.InsertAfter(pop, il.Create(Mono.Cecil.Cil.OpCodes.Ldc_I4_1));
+                    sites++;
+                }
+                foreach (var ins in method.Body.Instructions.ToList())
+                {
+                    // BeginInvoke needs a window handle (throws without
+                    // one); the fork layout queue is drained by the host
+                    // once per frame, the headless message-loop turn.
+                    if (ins.Operand is MethodReference begin && begin.Name == "BeginInvoke"
+                        && begin.DeclaringType.FullName == "System.Windows.Forms.Control"
+                        && begin.Parameters.Count == 2)
+                    {
+                        ins.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                        ins.Operand = post;
+                    }
+                }
+            }
+        }
+        return sites;
+    }
+
+    public static int NeutralizeLayoutHandleGuard(string assemblyPath, string outputPath)
+    {
+        string? fileDir = Path.GetDirectoryName(assemblyPath);
+        using var resolver = new FrameworkResolver(fileDir);
+        var bytes = File.ReadAllBytes(assemblyPath);
+        var readerParams = new ReaderParameters { AssemblyResolver = resolver };
+        using var stream = new MemoryStream(bytes);
+        using var assembly = AssemblyDefinition.ReadAssembly(stream, readerParams);
+        int sites = NeutralizeModuleLayoutHandleGuard(assembly.MainModule);
+        // No RadControl (every other module): stay byte-identical.
+        if (sites == 0)
+            return 0;
+        var outDir = Path.GetDirectoryName(outputPath) ?? ".";
+        var tempFile = Path.Combine(outDir, Guid.NewGuid() + ".tmp");
+        assembly.Write(tempFile);
+        assembly.Dispose();
+        File.Move(tempFile, outputPath, true);
+        return sites;
     }
 }

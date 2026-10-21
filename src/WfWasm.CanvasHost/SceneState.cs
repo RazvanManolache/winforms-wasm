@@ -75,7 +75,9 @@ public sealed class SceneState
         new SceneEntry(AppScene.TelerikToast, "Telerik: ToastNotificationManager",
             "Telerik UI for WinForms demos", null,
             null, "telerik-toastnotificationmanagerexamples"),
-    };
+    }.Concat(SyncfusionDemos.Entries.Select(demo => new SceneEntry(demo.Scene, "Syncfusion: " + demo.Label,
+        "Syncfusion WinForms demos · experimental compatibility test", SyncfusionDemos.RepositoryUrl,
+        null, demo.Slug))).ToArray();
 
     public AppScene Current { get; private set; } = AppScene.Smoke;
 
@@ -114,11 +116,26 @@ public sealed class SceneState
         AppScene.TelerikRssReader => "telerik-rssreader",
         AppScene.TelerikSpellCheck => "telerik-spellcheckasyoutype",
         AppScene.TelerikToast => "telerik-toastnotificationmanagerexamples",
-        _ => "smoke",
+        _ => SyncfusionDemos.Find(scene)?.Slug ?? "smoke",
+    };
+
+    // Server-side folder names differ from URL slugs for a few apps
+    // (paintnet, tictactoe): deep links in folder spelling (and any
+    // hyphenless spelling) must resolve instead of silently landing on
+    // the default scene.
+    private static string? AppFolderOf(AppScene scene) => scene switch
+    {
+        AppScene.Smoke => null,
+        AppScene.Paint => "paintnet",
+        AppScene.TicTacToe => "tictactoe",
+        _ => ToSlug(scene),
     };
 
     public static bool TryParseSlug(string? slug, out AppScene scene)
     {
+        scene = AppScene.Smoke;
+        if (string.IsNullOrWhiteSpace(slug))
+            return false;
         foreach (var entry in Enum.GetValues<AppScene>())
         {
             if (string.Equals(slug, ToSlug(entry), StringComparison.OrdinalIgnoreCase))
@@ -128,7 +145,20 @@ public sealed class SceneState
             }
         }
 
-        scene = AppScene.Smoke;
+        string flat = slug.Replace("-", string.Empty, StringComparison.Ordinal);
+        foreach (var entry in Enum.GetValues<AppScene>())
+        {
+            string? folder = AppFolderOf(entry);
+            if (folder is null)
+                continue;
+            if (string.Equals(slug, folder, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(flat, folder.Replace("-", string.Empty, StringComparison.Ordinal), StringComparison.OrdinalIgnoreCase))
+            {
+                scene = entry;
+                return true;
+            }
+        }
+
         return false;
     }
 
@@ -139,8 +169,6 @@ public sealed class SceneState
 
     public void Select(AppScene scene)
     {
-        if (!Entries.Any(e => e.Scene == scene))
-            return;
         if (scene == Current)
             return;
         Current = scene;

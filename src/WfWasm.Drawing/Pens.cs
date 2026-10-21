@@ -315,8 +315,8 @@ namespace System.Drawing.Drawing2D
             Positions = new float[count];
         }
 
-        public Color[] Colors { get; set; } = [Color.Empty];
-        public float[] Positions { get; set; } = [0f, 1f];
+        public Color[] Colors { get; set; } = [];
+        public float[] Positions { get; set; } = [];
     }
 
     /// <summary>Custom cap base (cf. System.Drawing.Drawing2D.CustomLineCap).</summary>

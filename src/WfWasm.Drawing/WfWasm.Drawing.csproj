@@ -10,4 +10,10 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- Display Graphics adapter (Graphics.ForDisplay): Drawing may reference
+         the neutral Rendering leaf (no Renderer/CanvasHost cycle). -->
+    <ProjectReference Include="..\WfWasm.Rendering\WfWasm.Rendering.csproj" />
+  </ItemGroup>
+
 </Project>

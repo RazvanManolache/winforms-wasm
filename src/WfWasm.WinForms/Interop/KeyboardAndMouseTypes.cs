@@ -221,12 +221,12 @@ namespace Windows.Win32
     {
         public static uint SendInput(ReadOnlySpan<UI.Input.KeyboardAndMouse.INPUT> pInputs, int cbSize) => (uint)pInputs.Length;
         public static BOOL BlockInput(BOOL fBlock) => (BOOL)true;
-        // Mouse buttons reflect the host-fed WasmMouseState (high bit set
-        // while pressed, matching Win32); keyboard/modifier keys still read
-        // 0 — the host does not feed them yet.
+        // Mouse buttons and Shift/Ctrl/Alt reflect the host-fed
+        // WasmMouseState (high bit set while pressed, matching Win32).
         public static short GetKeyState(int nVirtKey)
         {
             var buttons = global::System.Windows.Forms.WasmMouseState.Buttons;
+            var modifiers = global::System.Windows.Forms.WasmMouseState.Modifiers;
             return nVirtKey switch
             {
                 0x01 when (buttons & global::System.Windows.Forms.MouseButtons.Left) != 0 => unchecked((short)0x8000),
@@ -234,6 +234,9 @@ namespace Windows.Win32
                 0x04 when (buttons & global::System.Windows.Forms.MouseButtons.Middle) != 0 => unchecked((short)0x8000),
                 0x05 when (buttons & global::System.Windows.Forms.MouseButtons.XButton1) != 0 => unchecked((short)0x8000),
                 0x06 when (buttons & global::System.Windows.Forms.MouseButtons.XButton2) != 0 => unchecked((short)0x8000),
+                0x10 when (modifiers & global::System.Windows.Forms.Keys.Shift) != 0 => unchecked((short)0x8000),
+                0x11 when (modifiers & global::System.Windows.Forms.Keys.Control) != 0 => unchecked((short)0x8000),
+                0x12 when (modifiers & global::System.Windows.Forms.Keys.Alt) != 0 => unchecked((short)0x8000),
                 _ => 0,
             };
         }

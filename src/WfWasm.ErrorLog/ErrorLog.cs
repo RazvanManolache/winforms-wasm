@@ -12,7 +12,10 @@ public sealed record ErrorReport(
     string? Stack,
     string Source,
     DateTimeOffset Time,
-    string? Context = null);
+    string? Context = null,
+    string? App = null,
+    string? SessionId = null,
+    string? AppLabel = null);
 
 /// <summary>
 /// Aggregated inventory entry per error signature.
@@ -26,7 +29,8 @@ public sealed record ErrorIndexEntry(
     int Count,
     string Status,
     string? FixedNote,
-    int PostFixCount);
+    int PostFixCount,
+    string[]? Apps = null);
 
 /// <summary>
 /// File-backed browser error sink. Appends every report to
@@ -74,6 +78,7 @@ public static class ErrorLog
         string? stack = report.Stack == null ? null : Truncate(report.Stack, 8000);
         string? context = report.Context == null ? null : Truncate(report.Context, 8000);
         string source = Truncate(report.Source.Trim(), 120);
+        string? app = string.IsNullOrWhiteSpace(report.App) ? null : Truncate(report.App.Trim(), 120);
         var stamped = report with
         {
             Signature = signature,
@@ -81,6 +86,9 @@ public static class ErrorLog
             Stack = stack,
             Source = source,
             Context = context,
+            App = app,
+            SessionId = report.SessionId == null ? null : Truncate(report.SessionId.Trim(), 120),
+            AppLabel = report.AppLabel == null ? null : Truncate(report.AppLabel.Trim(), 200),
         };
 
         lock (s_gate)
@@ -91,7 +99,7 @@ public static class ErrorLog
             ErrorIndexEntry updated;
             if (at < 0)
             {
-                updated = new ErrorIndexEntry(signature, message, source, stamped.Time, stamped.Time, 1, StatusOpen, null, 0);
+                updated = new ErrorIndexEntry(signature, message, source, stamped.Time, stamped.Time, 1, StatusOpen, null, 0, app == null ? [] : [app]);
                 entries.Add(updated);
             }
             else
@@ -103,6 +111,7 @@ public static class ErrorLog
                     LastSeen = stamped.Time,
                     Count = cur.Count + 1,
                     PostFixCount = cur.PostFixCount + (fixedNow ? 1 : 0),
+                    Apps = MergeApp(cur.Apps, app),
                 };
                 entries[at] = updated;
             }
@@ -112,12 +121,16 @@ public static class ErrorLog
         }
     }
 
-    public static IReadOnlyList<ErrorIndexEntry> ReadIndex(string logDir)
+    public static IReadOnlyList<ErrorIndexEntry> ReadIndex(string logDir, string? app = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(logDir);
         lock (s_gate)
         {
-            return ReadIndexCore(logDir);
+            var entries = ReadIndexCore(logDir);
+            if (string.IsNullOrWhiteSpace(app))
+                return entries;
+            string want = app.Trim();
+            return entries.Where(e => (e.Apps ?? []).Contains(want, StringComparer.OrdinalIgnoreCase)).ToList();
         }
     }
 
@@ -144,12 +157,30 @@ public static class ErrorLog
             return [];
         try
         {
-            return JsonSerializer.Deserialize<List<ErrorIndexEntry>>(File.ReadAllText(path), s_json) ?? [];
+            var entries = JsonSerializer.Deserialize<List<ErrorIndexEntry>>(File.ReadAllText(path), s_json) ?? [];
+            // Pre-attribution rows lack Apps: normalize so consumers never see null.
+            for (int i = 0; i < entries.Count; i++)
+            {
+                if (entries[i].Apps is null)
+                    entries[i] = entries[i] with { Apps = [] };
+            }
+
+            return entries;
         }
         catch (JsonException)
         {
             return [];
         }
+    }
+
+    // Distinct sorted app slugs per signature, capped so one noisy shared
+    // signature (e.g. a framework first-chance) cannot grow the index row.
+    private static string[] MergeApp(string[]? current, string? app)
+    {
+        var set = new SortedSet<string>(current ?? [], StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrEmpty(app))
+            set.Add(app);
+        return set.Take(8).ToArray();
     }
 
     private static void WriteIndexCore(string logDir, List<ErrorIndexEntry> entries)

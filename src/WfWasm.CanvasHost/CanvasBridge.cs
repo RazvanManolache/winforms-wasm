@@ -30,6 +30,16 @@ public static partial class CanvasBridge
     [JSImport("globalThis.wfwasmTexPatch")]
     internal static partial string TexPatch(string layerId, byte[] rgba, int x, int y, int width, int height);
 
+    // Perf item 4 bridge anchors (B-1). PerfNowMs places managed events
+    // on the JS axis (ordering only). PerfMoveSlot reads the latest raw
+    // mousemove captured by the native listener (rule M); null when the
+    // listener is off or no move arrived.
+    [JSImport("globalThis.wfwasmNow")]
+    internal static partial double PerfNowMs();
+
+    [JSImport("globalThis.wfwasmPerfLastMove")]
+    internal static partial double[]? PerfMoveSlot();
+
     public sealed record BitmapUpload(string LayerId, byte[] Rgba, int Width, int Height, int X = 0, int Y = 0, bool IsPatch = false);
 
     public static string SerializeCommands(IReadOnlyList<DrawCommand> commands)
@@ -119,5 +129,48 @@ public static partial class CanvasBridge
                 TexDef(u.LayerId, u.Rgba, u.Width, u.Height);
         }
         return js.InvokeAsync<string>("wfwasm.paint", canvasId, SerializeCommands(json));
+    }
+
+    // Perf item 4 staged overload (B-2/B-3): times the upload loop (S6)
+    // and the serialize step (S7) into PerfTimeline accumulators, and
+    // passes frameSeq through to wfwasm.paint for the JS join (0/absent
+    // = perf off, JS ignores). Upload/invoke Stopwatches live here so
+    // the S6/S7/S8 split survives without touching SerializeCommands.
+    public static async ValueTask<(string Result, long UploadTicks, long SerializeTicks)> PaintAsyncTimed(
+        IJSRuntime js, string canvasId, IReadOnlyList<DrawCommand> commands, int frameSeq)
+    {
+        ArgumentNullException.ThrowIfNull(js);
+        var (json, uploads) = SplitUploads(commands);
+        long t0 = PerfTimeline.Enabled ? PerfTimeline.Stamp() : 0;
+        foreach (BitmapUpload u in uploads)
+        {
+            if (u.IsPatch)
+                TexPatch(u.LayerId, u.Rgba, u.X, u.Y, u.Width, u.Height);
+            else
+                TexDef(u.LayerId, u.Rgba, u.Width, u.Height);
+            if (PerfTimeline.Enabled)
+                PerfTimeline.AddUpload(u.Rgba.Length);
+        }
+        long uploadTicks = PerfTimeline.Enabled ? PerfTimeline.Stamp() - t0 : 0;
+        long op7 = 0;
+        long b64 = 0;
+        if (PerfTimeline.Enabled)
+        {
+            foreach (DrawCommand c in json)
+            {
+                if (c is DrawImageCommand i)
+                {
+                    op7++;
+                    b64 += i.Rgba.Length;
+                }
+            }
+        }
+        t0 = PerfTimeline.Enabled ? PerfTimeline.Stamp() : 0;
+        string payload = SerializeCommands(json);
+        long serializeTicks = PerfTimeline.Enabled ? PerfTimeline.Stamp() - t0 : 0;
+        if (PerfTimeline.Enabled)
+            PerfTimeline.AddSerialize(payload.Length, op7, b64);
+        string result = await js.InvokeAsync<string>("wfwasm.paint", canvasId, payload, frameSeq);
+        return (result, uploadTicks, serializeTicks);
     }
 }

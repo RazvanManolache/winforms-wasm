@@ -1,4 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk.BlazorWebAssembly">
+  <ItemGroup><EmbeddedResource Include="SyncfusionDemos.json" /></ItemGroup>
 
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
@@ -10,8 +11,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly" Version="9.0.20" />
-    <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.DevServer" Version="9.0.20" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly" Version="9.0.21" />
+    <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.DevServer" Version="9.0.21" PrivateAssets="all" />
     <PackageReference Include="System.Resources.Extensions" Version="9.0.0" />
     <!-- Full System.Configuration impl (app settings + AppSettings):
          the fork's own package reference does not flow through the
@@ -23,10 +24,19 @@
 
   <ItemGroup>
     <ProjectReference Include="..\WfWasm.Shim\WfWasm.Shim.csproj" />
+    <!-- GPU probe only: real WebGL2 IGlesContext binding (GpuProbe.cs). The
+         Gles project stays out of WfWasm.sln; production painting untouched. -->
+    <ProjectReference Include="..\WfWasm.Rendering.Gles\WfWasm.Rendering.Gles.csproj" />
     <ProjectReference Include="..\WfWasm.Renderer\WfWasm.Renderer.csproj" />
     <ProjectReference Include="..\WfWasm.Drawing\WfWasm.Drawing.csproj" />
     <ProjectReference Include="..\WfWasm.PdnCpu\WfWasm.PdnCpu.csproj" />
     <ProjectReference Include="..\Microsoft.Win32.SystemEvents\Microsoft.Win32.SystemEvents.csproj" />
+    <!-- Headless System.Data.OleDb shape stub: netfx System.Data scope has no OleDb types in the browser, so typed-DataSet apps TypeLoad without it. The rewriter retargets System.Data.OleDb.* refs here (rev41). -->
+    <ProjectReference Include="..\WfWasm.Data.OleDb\WfWasm.Data.OleDb.csproj" />
+    <!-- Headless System.Windows.Extensions shape stub: netfx System scope has no System.Media types in the browser (the facade forwards to an unbundled assembly), so RadMessageBox et al TypeLoad without it. The rewriter retargets System.Media.* refs here. -->
+    <ProjectReference Include="..\WfWasm.WindowsExtensions\WfWasm.WindowsExtensions.csproj" />
+    <!-- Headless System.IO.IsolatedStorage: the browser runtime throws PlatformNotSupported for every member, so dictionary/settings flows die without it. The rewriter retargets System.IO.IsolatedStorage.* refs here. -->
+    <ProjectReference Include="..\WfWasm.IsolatedStorage\WfWasm.IsolatedStorage.csproj" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="$(WfWasmMigratedForms)" />

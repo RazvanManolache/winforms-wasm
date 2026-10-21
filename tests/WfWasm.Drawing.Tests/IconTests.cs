@@ -329,4 +329,64 @@ public sealed class IconTests
         }
         return (b << 16) | a;
     }
+
+    // Regression: RadDiagram MouseDown calls FromHicon during input handling;
+    // throwing aborts selection entirely, so answer the same blank 16x16
+    // placeholder Icon.FromHandle uses.
+    [Fact]
+    public void FromHicon_Answers_Blank_Placeholder_Instead_Of_Throwing()
+    {
+        using WfBitmap bmp = WfBitmap.FromHicon(System.IntPtr.Zero);
+        Assert.Equal(16, bmp.Width);
+        Assert.Equal(16, bmp.Height);
+        Assert.Equal(0, bmp.GetPixel(0, 0).A);
+        using WfBitmap other = WfBitmap.FromHicon(new System.IntPtr(1234));
+        Assert.Equal(16, other.Width);
+        Assert.Equal(16, other.Height);
+    }
+
+    // Real icons understate the directory size field (WinForms down.ico
+    // declares 104 bytes for a 16x16x32 entry needing 1128); Windows
+    // reads by geometry. Truncate the declared size and require decode.
+    [Fact]
+    public void Understated_Directory_Size_Decodes_By_Geometry()
+    {
+        byte[] entry = BuildBmpEntry(2, 2, 32, Array.Empty<int>(),
+            topRows:
+            [
+                [(255, 0, 0, 255), (0, 255, 0, 255)],
+                [(0, 0, 255, 255), (255, 255, 255, 255)],
+            ],
+            andMask: [0, 0, 0, 0, 0, 0, 0, 0]);
+        byte[] ico = BuildIco([(2, 2, 32, entry)]);
+        ico[14] = 48; ico[15] = 0; ico[16] = 0; ico[17] = 0;
+        using var icon = new WfIcon(new MemoryStream(ico));
+        Assert.Equal(new WfDraw::System.Drawing.Size(2, 2), icon.Size);
+        using WfBitmap bmp = icon.ToBitmap();
+        Assert.Equal(WfColor.Red.ToArgb(), bmp.GetPixel(0, 0).ToArgb());
+        Assert.Equal(WfColor.White.ToArgb(), bmp.GetPixel(1, 1).ToArgb());
+    }
+
+    // 32bpp icons with an alpha channel routinely omit the AND mask
+    // (WinForms up.ico ships header+XOR only); Windows treats the
+    // missing mask as all-opaque. Truncate it and require decode with
+    // alpha taken from the XOR channel.
+    [Fact]
+    public void Missing_And_Mask_Decodes_As_Opaque()
+    {
+        byte[] full = BuildBmpEntry(2, 2, 32, Array.Empty<int>(),
+            topRows:
+            [
+                [(255, 0, 0, 255), (0, 255, 0, 255)],
+                [(0, 0, 255, 255), (255, 255, 255, 255)],
+            ],
+            andMask: [0, 0, 0, 0, 0, 0, 0, 0]);
+        byte[] entry = full[..^8];
+        byte[] ico = BuildIco([(2, 2, 32, entry)]);
+        using var icon = new WfIcon(new MemoryStream(ico));
+        Assert.Equal(new WfDraw::System.Drawing.Size(2, 2), icon.Size);
+        using WfBitmap bmp = icon.ToBitmap();
+        Assert.Equal(WfColor.Red.ToArgb(), bmp.GetPixel(0, 0).ToArgb());
+        Assert.Equal(255, bmp.GetPixel(0, 0).A);
+    }
 }

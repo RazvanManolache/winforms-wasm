@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <AssemblyName>System.Data.OleDb</AssemblyName>
+    <AssemblyVersion>4.0.0.0</AssemblyVersion>
+    <Version>4.0.0.0</Version>
+    <RootNamespace>System.Data.OleDb</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <SignAssembly>false</SignAssembly>
+    <Description>Headless System.Data.OleDb shape stub for the browser: type loads succeed and Fill/Open degrade to empty results (no Jet/ACE provider exists on WASM). The rewriter retargets System.Data-scoped OleDb typerefs here.</Description>
+  </PropertyGroup>
+
+</Project>

@@ -176,13 +176,16 @@ public sealed class RotatedDrawImageTests
             using var graphics = WfGraphics.FromImage(bitmap);
             using var font = new WfFont("Arial", 12f);
             var first = graphics.MeasureString("hi", font);
-            Assert.Equal(42f, first.Width);
-            Assert.Equal(13f, first.Height);
+            // GDI+ layout pad (Arial 12pt, em 16px): 42 + 16/3 + 0.03*42 - 0.5.
+            Assert.InRange(first.Width, 48.0, 48.2);
+            // GDI+ line-box height: 16 x 1.1172 + 16/8 = 19.88.
+            Assert.InRange(first.Height, 19.8, 20.0);
             Assert.Equal(first, graphics.MeasureString("hi", font));
             // Narrow layout wraps into rows like the historical fallback.
             var wrapped = graphics.MeasureString("hi", font, new WfSizeF(10, 0), null);
             Assert.Equal(10f, wrapped.Width);
-            Assert.Equal(5 * 13f, wrapped.Height);
+            // GDI+ wrapped height: 5 x 16 x 1.1172 + 16/8 = 91.38.
+            Assert.InRange(wrapped.Height, 91.3, 91.5);
         }
         finally
         {

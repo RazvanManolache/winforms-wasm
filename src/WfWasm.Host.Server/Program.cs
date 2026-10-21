@@ -1,5 +1,6 @@
 using WfWasm.ErrorLog;
 using WfWasm.Host.Server;
+using WfWasm.CanvasHost;
 using System.Security.Cryptography;
 using Microsoft.Net.Http.Headers;
 using Microsoft.AspNetCore.ResponseCompression;
@@ -17,13 +18,24 @@ builder.Services.AddResponseCompression(options =>
 var app = builder.Build();
 app.UseResponseCompression();
 
-// A source checkout includes the built-in smoke form, not third-party apps.
-// Only show an external app after its entry assembly is supplied locally.
-app.MapGet("/api/apps", () => AppTransform.AppFolders.Keys.Where(id =>
-    AppTransform.TryGetSpec(id, out var spec) && spec is not null &&
-    AppTransform.TryResolveAssembly(id, spec.Entry, out _)).ToArray());
-
 string logDir = Path.Combine(app.Environment.ContentRootPath, "logs");
+
+app.MapGet("/api/preview-config", (HttpContext context) =>
+{
+    context.Response.Headers.CacheControl = "no-cache";
+    return Results.Ok(new {
+        runtimeOrigin = app.Configuration["Preview:RuntimeOrigin"],
+        apps = new SceneState().Entries.Where(entry => entry.AppFolder is null ||
+            (AppTransform.TryGetSpec(entry.AppFolder, out var spec) && spec is not null &&
+             AppTransform.TryResolveAssembly(entry.AppFolder, spec.Entry, out _))).Select(entry => new {
+            slug = SceneState.ToSlug(entry.Scene), entry.Label, entry.SourceLabel,
+            entry.SourceUrl, entry.AppFolder,
+            family = SyncfusionDemos.Find(entry.Scene)?.Family,
+            purpose = SyncfusionDemos.Find(entry.Scene)?.Purpose,
+            components = SyncfusionDemos.Find(entry.Scene)?.Components,
+        }),
+    });
+});
 
 app.MapPost("/api/client-errors", (List<ErrorReport>? batch) =>
 {
@@ -43,7 +55,7 @@ app.MapPost("/api/client-errors", (List<ErrorReport>? batch) =>
     return Results.Ok(new { logged });
 });
 
-app.MapGet("/api/client-errors", () => Results.Ok(ErrorLog.ReadIndex(logDir)));
+app.MapGet("/api/client-errors", (string? app) => Results.Ok(ErrorLog.ReadIndex(logDir, app)));
 
 app.MapPost("/api/errors/mark-fixed", (MarkFixedRequest req) =>
 {
@@ -54,8 +66,8 @@ app.MapPost("/api/errors/mark-fixed", (MarkFixedRequest req) =>
         : Results.NotFound("unknown signature");
 });
 
-app.MapGet("/errors", () =>
-    Results.Content(ErrorInventoryPage.Render(ErrorLog.ReadIndex(logDir)), "text/html"));
+app.MapGet("/errors", (string? app) =>
+    Results.Content(ErrorInventoryPage.Render(ErrorLog.ReadIndex(logDir, app)), "text/html"));
 
 // On-demand app delivery: the browser fetches the manifest, then the
 // assemblies it needs. Transform output is content-hashed and cached,
@@ -82,7 +94,23 @@ app.MapGet("/api/appmanifest", (string app, HttpContext context) =>
             return new { name = file.Key, sha256 = hash,
                 url = $"/api/appcontent?app={Uri.EscapeDataString(app)}&name={Uri.EscapeDataString(file.Key)}&v={hash}" };
         }).ToList();
-        return Results.Ok(new { entry = spec.Entry, files, content });
+        var (fontName, fontSize) = AppTransform.DefaultFontFor(app);
+        // Prefetch closure: names only (no transformed hashes — hashing
+        // would transform the whole closure synchronously and stall boot).
+        // The client warms these in parallel after the entry is live; the
+        // demand hook stays the fallback. Native/unreadable files are
+        // skipped: they can never bind.
+        var prefetch = spec.Assemblies.Concat(spec.SourceOverride.Keys)
+            .Where(name => !Path.GetFileNameWithoutExtension(name).Equals(spec.Entry, StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(name => AppTransform.TryPrefetchPath(app, name, out string? path) && path is not null
+                ? new { name, url = $"/api/appasm?app={Uri.EscapeDataString(app)}&name={Uri.EscapeDataString(name)}",
+                    size = new FileInfo(path).Length,
+                    sha256 = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))) }
+                : null)
+            .Where(item => item is not null)
+            .ToList();
+        return Results.Ok(new { entry = spec.Entry, files, content, defaultFont = new { name = fontName, size = fontSize }, prefetch });
     }
     catch (Exception ex)
     {

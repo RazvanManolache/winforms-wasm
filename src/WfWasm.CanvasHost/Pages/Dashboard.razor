@@ -1,0 +1,113 @@
+@page "/dashboard"
+@using System.Net.Http.Json
+@inject HttpClient Http
+
+<PageTitle>Evaluation dashboard · App Studio</PageTitle>
+
+<style>
+    .eval-dash { padding: 1rem 1.25rem 2rem; max-width: 1200px; }
+    .eval-dash h2 { margin: 0.25rem 0 0.5rem; }
+    .eval-meta { color: #555; margin-bottom: 0.75rem; }
+    .eval-chips { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem; }
+    .eval-chip { border: 1px solid #d5dbe3; border-radius: 999px; padding: 0.15rem 0.7rem; font-size: 0.85rem; background: #f6f8fb; }
+    .eval-chip.bad { border-color: #e0a3a3; background: #fdf0f0; }
+    .eval-chip.good { border-color: #9fd3a7; background: #effaf1; }
+    table.eval-table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+    table.eval-table th, table.eval-table td { border-bottom: 1px solid #e3e8ef; padding: 0.4rem 0.5rem; text-align: left; vertical-align: top; }
+    table.eval-table th { white-space: nowrap; color: #445; font-weight: 600; }
+    .eval-bar { height: 0.45rem; border-radius: 3px; background: #e8edf3; min-width: 64px; margin-top: 0.2rem; }
+    .eval-bar > span { display: block; height: 100%; border-radius: 3px; background: #4c9aff; }
+    .eval-bar > span.full { background: #3fb950; }
+    .eval-bar > span.none { background: #e5534b; }
+    .eval-verdict { font-weight: 700; }
+    .eval-verdict.pass { color: #1a7f37; }
+    .eval-verdict.fail { color: #cf222e; }
+    .eval-note { color: #555; font-size: 0.8rem; }
+</style>
+
+<div class="eval-dash">
+    <div class="panel-eyebrow">EVALUATION</div>
+    <h2>App evaluation dashboard</h2>
+    @if (_pending)
+    {
+        <p>Reading evaluation results…</p>
+    }
+    else if (_error is not null)
+    {
+        <div class="reference-notice">@_error</div>
+    }
+    else if (_run is not null)
+    {
+        <p class="eval-meta">Run at @_run.runAt (UTC) · server @_run.server · rows sorted worst-first. Frame budget @_run.budgets.frameMs ms; parity bar @_run.budgets.parity.</p>
+        <div class="eval-chips">
+            <span class="eval-chip">@_run.apps.Count apps</span>
+            <span class="eval-chip @(_bootFails == 0 ? "good" : "bad")">@_bootFails boot failures</span>
+            <span class="eval-chip">@_featPass/@_featTested features pass</span>
+            <span class="eval-chip @(_frameFails == 0 ? "good" : "bad")">@_frameFails slower than @_run.budgets.frameMs ms/frame</span>
+        </div>
+        <table class="eval-table">
+            <thead>
+                <tr><th>App</th><th>Boot</th><th>Frame (ms)</th><th>Features</th><th>Parity</th><th>Errors</th><th>Notes</th></tr>
+            </thead>
+            <tbody>
+                @foreach (var a in Sorted)
+                {
+                    <tr>
+                        <td><a href="@a.url">@a.label</a></td>
+                        <td>@(a.bootMs is null ? "—" : a.bootMs + " ms")</td>
+                        <td>
+                            <span class="eval-verdict @a.frameVerdict">@a.frameVerdict.ToUpperInvariant()</span>
+                            @(a.frameMs is null ? "—" : " · " + a.frameMs + " ms")
+                            <div class="eval-note">input→paint @(a.firstMs is null ? "—" : a.firstMs + " ms")</div>
+                        </td>
+                        <td>
+                            @a.featuresPass/@a.featuresTested
+                            <div class="eval-bar"><span class="@(a.featuresPass == a.featuresTested ? "full" : a.featuresPass == 0 ? "none" : "")" style="width:@(a.featuresTested == 0 ? 0 : a.featuresPass * 100 / a.featuresTested)%"></span></div>
+                        </td>
+                        <td>
+                            @a.parity.status@(a.parity.failfrac is null ? "" : " " + a.parity.failfrac.Value.ToString("0.0%"))
+                            <div class="eval-note">@a.parity.note</div>
+                        </td>
+                        <td><a href="@a.errors.url" target="_blank" rel="noopener">@a.errors.count</a></td>
+                        <td class="eval-note">@string.Join(" · ", a.notes)</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+</div>
+
+@code {
+    private sealed record Budgets(int frameMs, string parity, double parityPass, double parityMarginal, string frameDef);
+    private sealed record Parity(string status, double? failfrac, string note);
+    private sealed record ErrInfo(int count, int pageerrors, int consoleErrors, List<string> reports, string url);
+    private sealed record Action(string note, int frames, double? firstMs, double? frameMs, List<double> intervalsMs, bool pass);
+    private sealed record App(string slug, string label, string url, double? bootMs, double? bootAppMs, bool bootOk,
+        double? firstMs, double? frameMs, string frameVerdict, int featuresPass, int featuresTested,
+        List<Action> actions, Parity parity, ErrInfo errors, List<string> notes);
+    private sealed record Run(string runAt, string server, Budgets budgets, List<App> apps);
+
+    private Run? _run;
+    private string? _error;
+    private bool _pending = true;
+    private int _bootFails, _featPass, _featTested, _frameFails;
+
+    private IEnumerable<App> Sorted => _run!.apps
+        .OrderBy(a => a.bootOk ? (a.featuresPass < a.featuresTested ? 1 : a.errors.count > 0 ? 2 : 3) : 0)
+        .ThenByDescending(a => a.frameMs ?? double.MaxValue);
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            _run = await Http.GetFromJsonAsync<Run>("eval/latest.json");
+            if (_run is null || _run.apps.Count == 0) throw new InvalidDataException();
+            _bootFails = _run.apps.Count(a => !a.bootOk);
+            _featPass = _run.apps.Sum(a => a.featuresPass);
+            _featTested = _run.apps.Sum(a => a.featuresTested);
+            _frameFails = _run.apps.Count(a => a.frameVerdict != "pass");
+        }
+        catch (Exception) { _error = "The evaluation results could not be loaded. No evaluation run has been published."; }
+        finally { _pending = false; }
+    }
+}

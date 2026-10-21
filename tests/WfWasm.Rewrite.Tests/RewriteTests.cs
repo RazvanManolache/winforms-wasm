@@ -583,7 +583,11 @@ public sealed class RewriteTests
     {
         // No WIC codecs exist in the browser: extension enumeration dies
         // (NRE) and kills every built-in FileType .cctor when the Open
-        // dialog lists file types. The rewrite must answer empty lists.
+        // dialog lists file types. Non-cctor callers (detection paths) keep
+        // answering empty lists; the built-in FileType .cctors themselves
+        // get desktop-exact literal tables from RedirectFileTypeCctorTables
+        // (a member-call switch over cross-assembly structs fails runtime
+        // member resolution headless: TypeLoadException kind 17).
         string input = Path.Combine(Path.GetTempPath(), "wichelpers.input.dll");
         using var image = new MemoryStream(File.ReadAllBytes(FixtureDll()));
         using (var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(image))
@@ -668,6 +672,64 @@ public sealed class RewriteTests
         Assert.Equal(
             [Mono.Cecil.Cil.OpCodes.Ldc_I4_0, Mono.Cecil.Cil.OpCodes.Ret],
             method.Body.Instructions.Select(i => i.OpCode).ToList());
+    }
+
+    [Fact]
+    public void Rewrite_Telerik_NoAnimations_Answers_False()
+    {
+        // Single-threaded browser: Telerik popup animations spawn a worker
+        // thread and block in a start-handshake WaitOne, but Thread.Start is
+        // neutered headless, so grid right-click wedges forever. The rewrite
+        // forces AllowAnimations false (popups show instantly).
+        string input = Path.Combine(Path.GetTempPath(), "telerikanim.input.dll");
+        using var image = new MemoryStream(File.ReadAllBytes(FixtureDll()));
+        using (var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(image))
+        {
+            asm.Name.Name = "Telerik.WinControls";
+            var module = asm.MainModule;
+            var svc = new Mono.Cecil.TypeDefinition(
+                "Telerik.WinControls", "ThemeResolutionService",
+                Mono.Cecil.TypeAttributes.Public | Mono.Cecil.TypeAttributes.Abstract | Mono.Cecil.TypeAttributes.Sealed,
+                module.TypeSystem.Object);
+            module.Types.Add(svc);
+            var flag = new Mono.Cecil.FieldDefinition(
+                "allowAnimations",
+                Mono.Cecil.FieldAttributes.Private | Mono.Cecil.FieldAttributes.Static,
+                module.TypeSystem.Boolean);
+            svc.Fields.Add(flag);
+            var getter = new Mono.Cecil.MethodDefinition(
+                "get_AllowAnimations",
+                Mono.Cecil.MethodAttributes.Public | Mono.Cecil.MethodAttributes.Static | Mono.Cecil.MethodAttributes.SpecialName,
+                module.TypeSystem.Boolean);
+            svc.Methods.Add(getter);
+            var gil = getter.Body.GetILProcessor();
+            gil.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
+            gil.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+            var cctor = new Mono.Cecil.MethodDefinition(
+                ".cctor",
+                Mono.Cecil.MethodAttributes.Private | Mono.Cecil.MethodAttributes.Static | Mono.Cecil.MethodAttributes.SpecialName | Mono.Cecil.MethodAttributes.RTSpecialName,
+                module.TypeSystem.Void);
+            svc.Methods.Add(cctor);
+            var cil = cctor.Body.GetILProcessor();
+            cil.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
+            cil.Emit(Mono.Cecil.Cil.OpCodes.Stsfld, flag);
+            cil.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+            asm.Write(input);
+        }
+
+        string output = Path.Combine(Path.GetTempPath(), "telerikanim.rewritten.dll");
+        AssemblyRewriter.Rewrite(input, output, ShimMap());
+
+        using var rewritten = Mono.Cecil.AssemblyDefinition.ReadAssembly(output);
+        var type = rewritten.MainModule.GetTypes()
+            .First(t => t.FullName == "Telerik.WinControls.ThemeResolutionService");
+        var method = type.Methods.First(m => m.Name == "get_AllowAnimations");
+        Assert.Equal(
+            [Mono.Cecil.Cil.OpCodes.Ldc_I4_0, Mono.Cecil.Cil.OpCodes.Ret],
+            method.Body.Instructions.Select(i => i.OpCode).ToList());
+        var ctor = type.Methods.First(m => m.Name == ".cctor");
+        var codes = ctor.Body.Instructions.Select(i => i.OpCode).ToList();
+        Assert.DoesNotContain(Mono.Cecil.Cil.OpCodes.Ldc_I4_1, codes);
     }
 
     [Fact]
@@ -2087,6 +2149,551 @@ public sealed class RewriteTests
     }
 
     [Fact]
+    public void StubPInvokes_GetTextMetrics_Fills_Coherent_Metrics()
+    {
+        // Rich-text baseline math divides tmAscent/tmHeight; the
+        // generic stub answered success with a zeroed struct, so 0/0.0
+        // poisoned layout with NaN (RTE ParagraphLayoutBox boot death).
+        // The stub must fill coherent UI-font metrics and report true.
+        string input = Path.Combine(Path.GetTempPath(), "textmetrics.input.dll");
+        using var image = new MemoryStream(File.ReadAllBytes(FixtureDll()));
+        using (var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(image))
+        {
+            var module = asm.MainModule;
+            var modRef = new Mono.Cecil.ModuleReference("gdi32.dll");
+            module.ModuleReferences.Add(modRef);
+            var tm = new Mono.Cecil.TypeDefinition(
+                "PinvokeProbe", "TextMetric",
+                Mono.Cecil.TypeAttributes.Public | Mono.Cecil.TypeAttributes.Sealed | Mono.Cecil.TypeAttributes.SequentialLayout,
+                module.ImportReference(typeof(System.ValueType)));
+            tm.Fields.Add(new Mono.Cecil.FieldDefinition("tmHeight", Mono.Cecil.FieldAttributes.Public, module.TypeSystem.Int32));
+            tm.Fields.Add(new Mono.Cecil.FieldDefinition("tmAscent", Mono.Cecil.FieldAttributes.Public, module.TypeSystem.Int32));
+            tm.Fields.Add(new Mono.Cecil.FieldDefinition("tmDescent", Mono.Cecil.FieldAttributes.Public, module.TypeSystem.Int32));
+            module.Types.Add(tm);
+            var native = new Mono.Cecil.TypeDefinition(
+                "PinvokeProbe", "Native",
+                Mono.Cecil.TypeAttributes.Public | Mono.Cecil.TypeAttributes.Abstract | Mono.Cecil.TypeAttributes.Sealed,
+                module.TypeSystem.Object);
+            module.Types.Add(native);
+            var method = new Mono.Cecil.MethodDefinition(
+                "GetTextMetrics",
+                Mono.Cecil.MethodAttributes.Public | Mono.Cecil.MethodAttributes.Static | Mono.Cecil.MethodAttributes.PInvokeImpl,
+                module.TypeSystem.Boolean);
+            method.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.IntPtr));
+            method.Parameters.Add(new Mono.Cecil.ParameterDefinition(new Mono.Cecil.ByReferenceType(tm)));
+            method.PInvokeInfo = new Mono.Cecil.PInvokeInfo(
+                Mono.Cecil.PInvokeAttributes.CallConvWinapi, "GetTextMetrics", modRef);
+            native.Methods.Add(method);
+            asm.Write(input);
+        }
+
+        string output = Path.Combine(Path.GetTempPath(), "textmetrics.stubbed.dll");
+        AssemblyRewriter.StubPInvokes(input, output);
+
+        using var stubbed = Mono.Cecil.AssemblyDefinition.ReadAssembly(output);
+        var stub = stubbed.MainModule.GetTypes()
+            .First(t => t.FullName == "PinvokeProbe.Native").Methods
+            .First(m => m.Name == "GetTextMetrics");
+        Assert.False(stub.IsPInvokeImpl);
+        var ins = stub.Body.Instructions;
+        Assert.Contains(ins, i =>
+            i.OpCode == Mono.Cecil.Cil.OpCodes.Stfld
+            && ((Mono.Cecil.FieldReference)i.Operand).Name == "tmHeight" && i.Previous.OpCode == Mono.Cecil.Cil.OpCodes.Ldc_I4 && (int)i.Previous.Operand == 13);
+        Assert.Contains(ins, i =>
+            i.OpCode == Mono.Cecil.Cil.OpCodes.Stfld
+            && ((Mono.Cecil.FieldReference)i.Operand).Name == "tmAscent" && i.Previous.OpCode == Mono.Cecil.Cil.OpCodes.Ldc_I4 && (int)i.Previous.Operand == 11);
+        Assert.Contains(ins, i =>
+            i.OpCode == Mono.Cecil.Cil.OpCodes.Stfld
+            && ((Mono.Cecil.FieldReference)i.Operand).Name == "tmDescent" && i.Previous.OpCode == Mono.Cecil.Cil.OpCodes.Ldc_I4 && (int)i.Previous.Operand == 2);
+        Assert.Contains(ins, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
+    }
+
+    [Fact]
+    public void StubPInvokes_GetDpiForMonitor_Reports_Success_96()
+    {
+        // Telerik declares SHCore's GetDpiForMonitor with the HRESULT
+        // as IntPtr; the generic IntPtr sentinel (0x1000) read as a
+        // failed HRESULT, so GetMonitorDpi threw COMException E_FAIL
+        // during RadForm layout (PhotoAlbum boot death). The stub must
+        // report S_OK with 96/96 through the out params; the
+        // value-returning GetDpiForWindow answers 96 directly.
+        string input = Path.Combine(Path.GetTempPath(), "dpimon.input.dll");
+        using var image = new MemoryStream(File.ReadAllBytes(FixtureDll()));
+        using (var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(image))
+        {
+            var module = asm.MainModule;
+            asm.Name.Name = "PinvokeProbe.DpiMon";
+            var modRef = new Mono.Cecil.ModuleReference("shcore.dll");
+            module.ModuleReferences.Add(modRef);
+            var native = new Mono.Cecil.TypeDefinition(
+                "PinvokeProbe", "Native",
+                Mono.Cecil.TypeAttributes.Public | Mono.Cecil.TypeAttributes.Abstract | Mono.Cecil.TypeAttributes.Sealed,
+                module.TypeSystem.Object);
+            module.Types.Add(native);
+            var method = new Mono.Cecil.MethodDefinition(
+                "GetDpiForMonitor",
+                Mono.Cecil.MethodAttributes.Public | Mono.Cecil.MethodAttributes.Static | Mono.Cecil.MethodAttributes.PInvokeImpl,
+                module.TypeSystem.IntPtr);
+            method.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.IntPtr));
+            method.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Int32));
+            method.Parameters.Add(new Mono.Cecil.ParameterDefinition("dpiX",
+                Mono.Cecil.ParameterAttributes.Out, new Mono.Cecil.ByReferenceType(module.TypeSystem.UInt32)));
+            method.Parameters.Add(new Mono.Cecil.ParameterDefinition("dpiY",
+                Mono.Cecil.ParameterAttributes.Out, new Mono.Cecil.ByReferenceType(module.TypeSystem.UInt32)));
+            method.PInvokeInfo = new Mono.Cecil.PInvokeInfo(
+                Mono.Cecil.PInvokeAttributes.CallConvWinapi, "GetDpiForMonitor", modRef);
+            native.Methods.Add(method);
+            var win = new Mono.Cecil.MethodDefinition(
+                "GetDpiForWindow",
+                Mono.Cecil.MethodAttributes.Public | Mono.Cecil.MethodAttributes.Static | Mono.Cecil.MethodAttributes.PInvokeImpl,
+                module.TypeSystem.UInt32);
+            win.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.IntPtr));
+            win.PInvokeInfo = new Mono.Cecil.PInvokeInfo(
+                Mono.Cecil.PInvokeAttributes.CallConvWinapi, "GetDpiForWindow", modRef);
+            native.Methods.Add(win);
+            asm.Write(input);
+        }
+
+        string output = Path.Combine(Path.GetTempPath(), "dpimon.stubbed.dll");
+        AssemblyRewriter.StubPInvokes(input, output);
+
+        using (var stubbed = Mono.Cecil.AssemblyDefinition.ReadAssembly(output))
+        {
+            var natives = stubbed.MainModule.GetTypes()
+                .First(t => t.FullName == "PinvokeProbe.Native").Methods;
+            var mon = natives.First(m => m.Name == "GetDpiForMonitor");
+            Assert.False(mon.IsPInvokeImpl);
+            var fills = mon.Body.Instructions.Where(i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Stind_I4
+                && i.Previous.OpCode == Mono.Cecil.Cil.OpCodes.Ldc_I4 && (int)i.Previous.Operand == 96);
+            Assert.Equal(2, fills.Count());
+            Assert.Contains(mon.Body.Instructions, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Conv_I);
+            var wnd = natives.First(m => m.Name == "GetDpiForWindow");
+            Assert.False(wnd.IsPInvokeImpl);
+            Assert.Contains(wnd.Body.Instructions, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Ldc_I4 && (int)i.Operand == 96);
+        }
+
+        // Runtime: S_OK with 96/96, and the value query at 96.
+        var loaded = Assembly.LoadFrom(output);
+        var nativeT = loaded.GetType("PinvokeProbe.Native")!;
+        var monM = nativeT.GetMethod("GetDpiForMonitor")!;
+        object?[] args = [IntPtr.Zero, 0, (uint)0, (uint)0];
+        object? hr = monM.Invoke(null, args);
+        Assert.Equal(IntPtr.Zero, hr);
+        Assert.Equal((uint)96, args[2]);
+        Assert.Equal((uint)96, args[3]);
+        var wndM = nativeT.GetMethod("GetDpiForWindow")!;
+        Assert.Equal((uint)96, wndM.Invoke(null, [IntPtr.Zero]));
+    }
+
+    [Fact]
+    public void Rewrite_Namespaceless_Nested_Typeref_Remaps_Without_Crash()
+    {
+        // AutoMap matches global-namespace nests (Interop+SHDocVw,
+        // WMExtensions) by name; the remapper split "ns vs nested" at
+        // the last '.' and crashed (Substring -1) when the target had
+        // no namespace (System.Windows.Forms rewrite 500). The whole
+        // name is the nested path with an empty namespace.
+        string input = Path.Combine(Path.GetTempPath(), "globalnest.input.dll");
+        using var image = new MemoryStream(File.ReadAllBytes(FixtureDll()));
+        using (var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(image))
+        {
+            var module = asm.MainModule;
+            asm.Name.Name = "GlobalNest.Probe";
+            var fakeScope = new Mono.Cecil.AssemblyNameReference("FakeForms", new Version(1, 0, 0, 0));
+            module.AssemblyReferences.Add(fakeScope);
+            var interopRef = new Mono.Cecil.TypeReference("", "Interop", module, fakeScope);
+            var shdocRef = new Mono.Cecil.TypeReference("", "SHDocVw", module, fakeScope) { DeclaringType = interopRef };
+            var wmRef = new Mono.Cecil.TypeReference("", "WMExtensions", module, fakeScope);
+            var probe = new Mono.Cecil.TypeDefinition("NestProbe", "Probe",
+                Mono.Cecil.TypeAttributes.Public | Mono.Cecil.TypeAttributes.Abstract | Mono.Cecil.TypeAttributes.Sealed,
+                module.TypeSystem.Object);
+            module.Types.Add(probe);
+            foreach ((string name, Mono.Cecil.TypeReference ret) in new[]
+            {
+                ("GetShdoc", shdocRef), ("GetWm", wmRef),
+            })
+            {
+                var m = new Mono.Cecil.MethodDefinition(name,
+                    Mono.Cecil.MethodAttributes.Public | Mono.Cecil.MethodAttributes.Static, ret);
+                probe.Methods.Add(m);
+                m.Body = new Mono.Cecil.Cil.MethodBody(m);
+                var il = m.Body.GetILProcessor();
+                il.Emit(Mono.Cecil.Cil.OpCodes.Ldnull);
+                il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+            }
+            asm.Write(input);
+        }
+
+        string output = Path.Combine(Path.GetTempPath(), "globalnest.rewritten.dll");
+        var assemblyMap = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["FakeForms"] = FixtureDll(),
+        };
+        var typeMap = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal)
+        {
+            ["Interop+SHDocVw"] = ("WfWasm.WinForms", "Interop+SHDocVw"),
+            ["WMExtensions"] = ("WfWasm.WinForms", "WMExtensions"),
+        };
+        AssemblyRewriter.Rewrite(input, output, assemblyMap, typeMap);
+
+        using var rewritten = Mono.Cecil.AssemblyDefinition.ReadAssembly(output);
+        var refs = rewritten.MainModule.GetTypeReferences();
+        var nested = refs.First(t => t.FullName.Replace('/', '+') == "Interop+SHDocVw");
+        Assert.Equal("WfWasm.WinForms", nested.Scope.Name);
+        Assert.Equal("", nested.Namespace);
+        Assert.Equal("SHDocVw", nested.Name);
+        Assert.NotNull(nested.DeclaringType);
+        Assert.Equal("Interop", nested.DeclaringType.Name);
+        var top = refs.First(t => t.FullName == "WMExtensions");
+        Assert.Equal("WfWasm.WinForms", top.Scope.Name);
+        Assert.Equal("", top.Namespace);
+        Assert.Null(top.DeclaringType);
+    }
+
+    [Fact]
+    public void Analyze_FunctionPointer_Parameter_Renders_Signature_Gap()
+    {
+        // CsWin32 declares hook callbacks as delegate* unmanaged
+        // (SetWinEventHook et al.); the signature renderer walked into
+        // the null ElementType of the function-pointer spec and took
+        // Analyze down with NullReferenceException (batch rewrite of
+        // System.Windows.Forms). Signatures render fnptr:ret(params).
+        string input = Path.Combine(Path.GetTempPath(), "fnptr.input.dll");
+        using var image = new MemoryStream(File.ReadAllBytes(FixtureDll()));
+        using (var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(image))
+        {
+            var module = asm.MainModule;
+            asm.Name.Name = "Fnptr.Probe";
+            var fakeScope = new Mono.Cecil.AssemblyNameReference("FakeLib", new Version(1, 0, 0, 0));
+            module.AssemblyReferences.Add(fakeScope);
+            var foo = new Mono.Cecil.TypeDefinition("", "Foo",
+                Mono.Cecil.TypeAttributes.Public | Mono.Cecil.TypeAttributes.Abstract | Mono.Cecil.TypeAttributes.Sealed,
+                null);
+            module.Types.Add(foo);
+            var barDef = new Mono.Cecil.MethodDefinition("Bar",
+                Mono.Cecil.MethodAttributes.Public | Mono.Cecil.MethodAttributes.Static,
+                module.TypeSystem.Void);
+            barDef.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Int32));
+            barDef.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Int32));
+            foo.Methods.Add(barDef);
+            var fooRef = new Mono.Cecil.TypeReference("", "Foo", module, fakeScope);
+            var barRef = new Mono.Cecil.MethodReference("Bar", module.TypeSystem.Void, fooRef);
+            barRef.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Int32));
+            barRef.Parameters.Add(new Mono.Cecil.ParameterDefinition(
+                new Mono.Cecil.FunctionPointerType { ReturnType = module.TypeSystem.Void }));
+            var caller = new Mono.Cecil.TypeDefinition("FnptrProbe", "Caller",
+                Mono.Cecil.TypeAttributes.Public | Mono.Cecil.TypeAttributes.Abstract | Mono.Cecil.TypeAttributes.Sealed,
+                module.TypeSystem.Object);
+            module.Types.Add(caller);
+            var run = new Mono.Cecil.MethodDefinition("Run",
+                Mono.Cecil.MethodAttributes.Public | Mono.Cecil.MethodAttributes.Static,
+                module.TypeSystem.Void);
+            caller.Methods.Add(run);
+            run.Body = new Mono.Cecil.Cil.MethodBody(run);
+            var il = run.Body.GetILProcessor();
+            il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_0);
+            il.Emit(Mono.Cecil.Cil.OpCodes.Ldnull);
+            il.Emit(Mono.Cecil.Cil.OpCodes.Call, barRef);
+            il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+            asm.Write(input);
+        }
+
+        var assemblyMap = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["FakeLib"] = input,
+        };
+        List<Gap> gaps = GapAnalyzer.Analyze(input, assemblyMap);
+        var bar = Assert.Single(gaps.Where(g => g.Member == "Bar"));
+        Assert.Equal("signature", bar.Kind);
+        Assert.Contains("fnptr:", bar.Detail);
+    }
+
+    [Fact]
+    public void Rewrite_Keeps_Used_AssemblyRef_Drops_Unused()
+    {
+        // The rewriter trims DirectWriteForwarder/System.CodeDom
+        // assembly refs; dropping one that live typerefs still point
+        // at orphans them, and Cecil re-emits the dangling scopes as
+        // System.Private.CoreLib (fatal TypeLoad at bind time: the DWF
+        // fake's self-refs). Only unreferenced scopes may go.
+        string input = Path.Combine(Path.GetTempPath(), "asmreftrim.input.dll");
+        using var image = new MemoryStream(File.ReadAllBytes(FixtureDll()));
+        using (var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(image))
+        {
+            var module = asm.MainModule;
+            asm.Name.Name = "AsmRefTrim.Probe";
+            var dwfScope = new Mono.Cecil.AssemblyNameReference("DirectWriteForwarder", new Version(9, 0, 0, 0));
+            module.AssemblyReferences.Add(dwfScope);
+            var codScope = new Mono.Cecil.AssemblyNameReference("System.CodeDom", new Version(4, 0, 0, 0));
+            module.AssemblyReferences.Add(codScope);
+            var spanRef = new Mono.Cecil.TypeReference("MS.Internal", "Span", module, dwfScope);
+            var probe = new Mono.Cecil.TypeDefinition("TrimProbe", "Probe",
+                Mono.Cecil.TypeAttributes.Public | Mono.Cecil.TypeAttributes.Abstract | Mono.Cecil.TypeAttributes.Sealed,
+                module.TypeSystem.Object);
+            module.Types.Add(probe);
+            var m = new Mono.Cecil.MethodDefinition("GetSpan",
+                Mono.Cecil.MethodAttributes.Public | Mono.Cecil.MethodAttributes.Static, spanRef);
+            probe.Methods.Add(m);
+            m.Body = new Mono.Cecil.Cil.MethodBody(m);
+            var il = m.Body.GetILProcessor();
+            il.Emit(Mono.Cecil.Cil.OpCodes.Ldnull);
+            il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+            asm.Write(input);
+        }
+
+        string output = Path.Combine(Path.GetTempPath(), "asmreftrim.rewritten.dll");
+        AssemblyRewriter.Rewrite(input, output,
+            new Dictionary<string, string>(StringComparer.Ordinal),
+            new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal));
+
+        using var rewritten = Mono.Cecil.AssemblyDefinition.ReadAssembly(output);
+        Assert.Contains(rewritten.MainModule.AssemblyReferences, r => r.Name == "DirectWriteForwarder");
+        Assert.DoesNotContain(rewritten.MainModule.AssemblyReferences, r => r.Name == "System.CodeDom");
+        var span = rewritten.MainModule.GetTypeReferences().First(t => t.FullName == "MS.Internal.Span");
+        Assert.Equal("DirectWriteForwarder", span.Scope.Name);
+    }
+
+    [Fact]
+    public void FrameworkResolver_Prefers_Real_Over_Facade()
+    {
+        // App folders ship stale NuGet-contract facades whose forwarders
+        // disagree with the shared framework's, forming cycles that
+        // stack-overflow Cecil's unguarded ExportedType chase at write
+        // time (AdomdClient killed the server; the same bytes rewrite in
+        // 194ms away from the pool facades). Real assemblies bind from
+        // their own dir; facades unify to the framework set.
+        string root = Path.Combine(Path.GetTempPath(), "fwresolv");
+        string realDir = Path.Combine(root, "real");
+        string facadeLocalDir = Path.Combine(root, "facade-local");
+        string facadeFxDir = Path.Combine(root, "facade-fx");
+        Directory.CreateDirectory(realDir);
+        Directory.CreateDirectory(facadeLocalDir);
+        Directory.CreateDirectory(facadeFxDir);
+        string realPath = Path.Combine(realDir, "ShapeLib.dll");
+        using (var asm = Mono.Cecil.AssemblyDefinition.CreateAssembly(
+            new Mono.Cecil.AssemblyNameDefinition("ShapeLib", new Version(9, 0, 0, 0)), "ShapeLib", Mono.Cecil.ModuleKind.Dll))
+        {
+            for (int i = 0; i < 3; i++)
+                asm.MainModule.Types.Add(new Mono.Cecil.TypeDefinition("", "T" + i,
+                    Mono.Cecil.TypeAttributes.Public, asm.MainModule.TypeSystem.Object));
+            asm.Write(realPath);
+        }
+        void WriteFacade(string path)
+        {
+            using var asm = Mono.Cecil.AssemblyDefinition.CreateAssembly(
+                new Mono.Cecil.AssemblyNameDefinition("ShapeLib", new Version(4, 1, 0, 0)), "ShapeLib", Mono.Cecil.ModuleKind.Dll);
+            var scope = new Mono.Cecil.AssemblyNameReference("Elsewhere", new Version(1, 0, 0, 0));
+            asm.MainModule.AssemblyReferences.Add(scope);
+            asm.MainModule.ExportedTypes.Add(new Mono.Cecil.ExportedType("Ns", "Fwd", asm.MainModule, scope));
+            asm.Write(path);
+        }
+        string facadeLocalPath = Path.Combine(facadeLocalDir, "ShapeLib.dll");
+        string facadeFxPath = Path.Combine(facadeFxDir, "ShapeLib.dll");
+        WriteFacade(facadeLocalPath);
+        WriteFacade(facadeFxPath);
+        var probe = new Mono.Cecil.AssemblyNameReference("ShapeLib", new Version(0, 0, 0, 0));
+        using (var resolver = new FrameworkResolver(facadeLocalDir, null, [facadeFxDir, realDir]))
+        {
+            var resolved = resolver.Resolve(probe);
+            Assert.NotNull(resolved);
+            Assert.Equal(realPath, resolved.MainModule.FileName);
+        }
+        using (var resolver = new FrameworkResolver(realDir, null, [facadeFxDir]))
+        {
+            var resolved = resolver.Resolve(probe);
+            Assert.NotNull(resolved);
+            Assert.Equal(realPath, resolved.MainModule.FileName);
+        }
+        using (var resolver = new FrameworkResolver(facadeLocalDir, null, [facadeFxDir]))
+        {
+            var resolved = resolver.Resolve(probe);
+            Assert.NotNull(resolved);
+            Assert.Equal(facadeFxPath, resolved.MainModule.FileName);
+        }
+    }
+
+    [Fact]
+    public void Rewrite_AdomdClient_PoolFacades_Completes()
+    {
+        // End-to-end of facade coherence: the pool's netstandard-era
+        // contracts vs shared fx formed a forwarder cycle that killed
+        // the server with StackOverflowException at write time.
+        string input = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release\Microsoft.AnalysisServices.AdomdClient.dll");
+        if (!File.Exists(input)) return;
+        string forms = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
+        Assert.True(File.Exists(forms), "regenerate via E:/tmp/rewrite-small.ps1");
+        string drawing = ShimDll("WfWasm.Drawing", "WfWasm.Drawing");
+        var assemblyMap = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["System.Windows.Forms"] = forms,
+            ["System.Windows.Forms.Primitives"] = forms,
+            ["System.Drawing"] = drawing,
+            ["System.Drawing.Common"] = drawing,
+            ["System.Drawing.Primitives"] = drawing,
+        };
+        var typeMap = GapAnalyzer.AutoMap(input, assemblyMap);
+        byte[] bytes = AssemblyRewriter.RewriteToBytes(input, assemblyMap, typeMap);
+        Assert.True(bytes.Length > 1000000, $"suspiciously small output: {bytes.Length}");
+        using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(new MemoryStream(bytes));
+        Assert.Equal("Microsoft.AnalysisServices.AdomdClient", asm.Name.Name);
+    }
+
+    [Fact]
+    public void RewriteToBytes_Resolves_Pool_Siblings_Via_ExtraDirs()
+    {
+        // DiagramFirstLook ships RadDiagram.dll app-locally (exe + dll +
+        // xml, no UI.dll); its Telerik.WinControls.UI sibling lives only
+        // in the shared pool. Lookup searches the app closure but the
+        // transform used to resolve from the input dir alone, so Cecil
+        // threw AssemblyResolutionException (telerik-diagram 500).
+        string input = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\ExamplesProjects\Diagram\DiagramFirstLook\bin\Telerik.WinControls.RadDiagram.dll");
+        string pool = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release");
+        if (!File.Exists(input) || !Directory.Exists(pool)) return;
+        string forms = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
+        Assert.True(File.Exists(forms), "regenerate via E:/tmp/rewrite-small.ps1");
+        string drawing = ShimDll("WfWasm.Drawing", "WfWasm.Drawing");
+        var assemblyMap = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["System.Windows.Forms"] = forms,
+            ["System.Windows.Forms.Primitives"] = forms,
+            ["System.Drawing"] = drawing,
+            ["System.Drawing.Common"] = drawing,
+            ["System.Drawing.Primitives"] = drawing,
+        };
+        var typeMap = GapAnalyzer.AutoMap(input, assemblyMap);
+        Assert.Throws<Mono.Cecil.AssemblyResolutionException>(() =>
+            AssemblyRewriter.RewriteToBytes(input, assemblyMap, typeMap));
+        byte[] bytes = AssemblyRewriter.RewriteToBytes(input, assemblyMap, typeMap, null, null, [pool]);
+        Assert.True(bytes.Length > 1000000, $"suspiciously small output: {bytes.Length}");
+        using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(new MemoryStream(bytes));
+        Assert.Equal("Telerik.WinControls.RadDiagram", asm.Name.Name);
+    }
+
+    [Fact]
+    public void StubPInvokes_WindowThreadProcessId_Matches_CurrentThread()
+    {
+        // Paint.NET's ControlDispatcher asserts the window's thread is the
+        // thread that created it: GetWindowThreadProcessId(handle) must
+        // equal GetCurrentThreadId(). The stubber returns 1 for the latter,
+        // so it must return 1 (and write process id 1) for the former too.
+        string input = Path.Combine(Path.GetTempPath(), "winthread.input.dll");
+        using var image = new MemoryStream(File.ReadAllBytes(FixtureDll()));
+        using (var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(image))
+        {
+            var module = asm.MainModule;
+            var modRef = new Mono.Cecil.ModuleReference("user32.dll");
+            module.ModuleReferences.Add(modRef);
+            var native = new Mono.Cecil.TypeDefinition(
+                "PinvokeProbe", "Native",
+                Mono.Cecil.TypeAttributes.Public | Mono.Cecil.TypeAttributes.Abstract | Mono.Cecil.TypeAttributes.Sealed,
+                module.TypeSystem.Object);
+            module.Types.Add(native);
+            var method = new Mono.Cecil.MethodDefinition(
+                "GetWindowThreadProcessId",
+                Mono.Cecil.MethodAttributes.Public | Mono.Cecil.MethodAttributes.Static | Mono.Cecil.MethodAttributes.PInvokeImpl,
+                module.TypeSystem.UInt32);
+            method.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.IntPtr));
+            method.Parameters.Add(new Mono.Cecil.ParameterDefinition(
+                new Mono.Cecil.PointerType(module.TypeSystem.UInt32)));
+            method.PInvokeInfo = new Mono.Cecil.PInvokeInfo(
+                Mono.Cecil.PInvokeAttributes.CallConvWinapi, "GetWindowThreadProcessId", modRef);
+            native.Methods.Add(method);
+            asm.Write(input);
+        }
+
+        string output = Path.Combine(Path.GetTempPath(), "winthread.stubbed.dll");
+        AssemblyRewriter.StubPInvokes(input, output);
+
+        using var stubbed = Mono.Cecil.AssemblyDefinition.ReadAssembly(output);
+        var stub = stubbed.MainModule.GetTypes()
+            .First(t => t.FullName == "PinvokeProbe.Native").Methods
+            .First(m => m.Name == "GetWindowThreadProcessId");
+        Assert.False(stub.IsPInvokeImpl);
+        Assert.Contains(stub.Body.Instructions, i =>
+            i.OpCode == Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
+        Assert.Contains(stub.Body.Instructions, i =>
+            i.OpCode == Mono.Cecil.Cil.OpCodes.Stind_I4);
+    }
+
+    [Fact]
+    public void Rewrite_PdnFramework_Neutralizes_Direct2D_HandleCreated()
+    {
+        // The transform bypasses Paint.NET's Direct2D device stack (the
+        // Direct2DControl ctors no longer create the device impl), so the
+        // handle-created relay that dereferences that impl must be
+        // neutralized too. Otherwise the native WM_CREATE notification
+        // throws inside GdiControl.OnHandleCreated and the control's
+        // input relay never initializes (Paint.NET canvas goes dead).
+        string frameworkPath = TestPaths.Repo(@"targets\paint.net\PaintDotNet.Framework.dll");
+        if (!File.Exists(frameworkPath)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        string tempOut = Path.Combine(Path.GetTempPath(), $"Framework_D2D_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(
+                frameworkPath, tempOut,
+                new Dictionary<string, string>(StringComparer.Ordinal),
+                new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal),
+                cpuDll);
+
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(Path.GetDirectoryName(frameworkPath)!);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var control = asm.MainModule.GetType("PaintDotNet.Controls.Direct2DControl");
+            Assert.NotNull(control);
+            var hook = control.Methods.First(m => m.Name == "OnHandleCreatedInternal");
+            Assert.True(hook.HasBody);
+            Assert.Single(hook.Body.Instructions);
+            Assert.Equal(Mono.Cecil.Cil.OpCodes.Ret, hook.Body.Instructions[0].OpCode);
+        }
+        finally { if (File.Exists(tempOut)) File.Delete(tempOut); }
+    }
+
+    [Fact]
+    public void Rewrite_RichTextEditor_Neutralizes_ContainsComplexScript()
+    {
+        // Uniscribe (usp10) cannot exist headless: the generic stub
+        // no-ops ScriptGetProperties leaving a null table pointer, and
+        // ContainsComplexScript NREs dereferencing it for every
+        // non-empty string, killing RichTextEditor form creation. The
+        // rewrite answers false (simple text) instead.
+        string input = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release\Telerik.WinControls.RichTextEditor.dll");
+        if (!File.Exists(input)) return;
+        string tempOut = Path.Combine(Path.GetTempPath(), $"RteUniscribe_{Guid.NewGuid()}.dll");
+        try
+        {
+            string formsDll = ShimDll("WfWasm.WinForms", "WfWasm.WinForms");
+            string drawingDll = ShimDll("WfWasm.Drawing", "WfWasm.Drawing");
+            var map = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["System.Windows.Forms"] = formsDll,
+                ["System.Windows.Forms.Primitives"] = formsDll,
+                ["System.Drawing"] = drawingDll,
+                ["System.Drawing.Common"] = drawingDll,
+                ["System.Drawing.Primitives"] = drawingDll,
+            };
+            var typeMap = GapAnalyzer.AutoMap(input, map);
+            AssemblyRewriter.Rewrite(input, tempOut, map, typeMap);
+
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(Path.GetDirectoryName(input)!);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var uni = asm.MainModule.GetType("Telerik.WinForms.RichTextEditor.Uniscribe");
+            Assert.NotNull(uni);
+            var probe = uni.Methods.First(m => m.Name == "ContainsComplexScript");
+            Assert.True(probe.HasBody);
+            Assert.Equal(2, probe.Body.Instructions.Count);
+            Assert.Equal(Mono.Cecil.Cil.OpCodes.Ldc_I4_0, probe.Body.Instructions[0].OpCode);
+            Assert.Equal(Mono.Cecil.Cil.OpCodes.Ret, probe.Body.Instructions[1].OpCode);
+        }
+        finally { if (File.Exists(tempOut)) File.Delete(tempOut); }
+    }
+
+    [Fact]
     public void Rewrite_PdnResources_InstalledLanguages_Skips_Disk_Probe()
     {
         // No satellite language files ship in the browser bundle:
@@ -3483,7 +4090,7 @@ public sealed class RewriteTests
             var ctrlField = compositor.Fields.First(f => f.Name == "compositorController");
             Assert.Equal("System.Object", ctrlField.FieldType.FullName);
 
-            string pdnDir = TestPaths.Repo(@".artifacts\rewritten-paint");
+            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.Framework.dll"), overwrite: true);
@@ -3525,7 +4132,7 @@ public sealed class RewriteTests
             Assert.Contains(preRenderPump.Body.Instructions, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Ret);
             Assert.DoesNotContain(preRenderPump.Body.Instructions, i => i.Operand?.ToString()?.Contains("BeginModalUIFrame") == true);
 
-            string pdnDir = TestPaths.Repo(@".artifacts\rewritten-paint");
+            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "paintdotnet.dll"), overwrite: true);
@@ -3562,7 +4169,7 @@ public sealed class RewriteTests
             var createF7 = dxgi.Methods.First(m => m.Name == "CreateFactory7" && m.ReturnType.FullName == "PaintDotNet.Dxgi.IDxgiFactory7");
             Assert.Contains(createF7.Body.Instructions, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Ldnull);
 
-            string pdnDir = TestPaths.Repo(@".artifacts\rewritten-paint");
+            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.Windows.dll"), overwrite: true);
@@ -3614,7 +4221,7 @@ public sealed class RewriteTests
                 ["Analysis", "Color", "Composite", "Filter", "Photo", "Source", "Stylize", "Transform", "Transparency"],
                 literals);
 
-            string pdnDir = TestPaths.Repo(@".artifacts\rewritten-paint");
+            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.Windows.Framework.dll"), overwrite: true);
@@ -3654,7 +4261,7 @@ public sealed class RewriteTests
             var mr = (Mono.Cecil.MethodReference)gvodCall.Operand;
             Assert.True(mr.ReturnType.IsGenericParameter, "ReturnType must be generic parameter !0");
 
-            string pdnDir = TestPaths.Repo(@".artifacts\rewritten-paint");
+            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.Core.dll"), overwrite: true);
@@ -3669,7 +4276,7 @@ public sealed class RewriteTests
     [Fact]
     public void PresentationCore_ModuleInitializer_Is_Nooped()
     {
-        string corePath = TestPaths.Repo(@".artifacts\rewritten-paint\PresentationCore.dll");
+        string corePath = @"E:\tmp\rewritten-paint\PresentationCore.dll";
         if (File.Exists(corePath))
         {
             string tempCoreOut = Path.Combine(Path.GetTempPath(), $"PresentationCore_Test_{Guid.NewGuid()}.dll");
@@ -3708,7 +4315,7 @@ public sealed class RewriteTests
                 Assert.DoesNotContain(helper.Body.Instructions, i => i.Operand?.ToString()?.Contains("LoadCursor") == true);
             }
 
-            string pdnDir = TestPaths.Repo(@".artifacts\rewritten-paint");
+            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PresentationCore.dll"), overwrite: true);
@@ -3726,7 +4333,7 @@ public sealed class RewriteTests
         string fwPath = @"C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App\9.0.20\PresentationFramework.dll";
         if (!File.Exists(fwPath))
         {
-            fwPath = TestPaths.Repo(@".artifacts\rewritten-paint\PresentationFramework.dll");
+            fwPath = @"E:\tmp\rewritten-paint\PresentationFramework.dll";
             if (!File.Exists(fwPath)) return;
         }
 
@@ -3758,7 +4365,7 @@ public sealed class RewriteTests
                 Assert.DoesNotContain(getNcm.Body.Instructions, i => i.Operand?.ToString()?.Contains("SystemParametersInfo") == true);
             }
 
-            string pdnDir = TestPaths.Repo(@".artifacts\rewritten-paint");
+            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PresentationFramework.dll"), overwrite: true);
@@ -3801,7 +4408,7 @@ public sealed class RewriteTests
             var beginModalCore = uiHelpers.Methods.First(m => m.Name == "BeginModalUIFrameCore");
             Assert.Contains(beginModalCore.Body.Instructions, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Ret);
 
-            string pdnDir = TestPaths.Repo(@".artifacts\rewritten-paint");
+            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.SystemLayer.dll"), overwrite: true);
@@ -3838,7 +4445,7 @@ public sealed class RewriteTests
             var cctor = wic.Methods.First(m => m.Name == ".cctor");
             Assert.DoesNotContain(cctor.Body.Instructions, i => i.Operand?.ToString()?.Contains("windowscodecs") == true);
 
-            string pdnDir = TestPaths.Repo(@".artifacts\rewritten-paint");
+            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.Windows.dll"), overwrite: true);
@@ -3896,7 +4503,7 @@ public sealed class RewriteTests
             Assert.Single(trpcCctor.Body.Instructions);
             Assert.Equal(Mono.Cecil.Cil.OpCodes.Ret, trpcCctor.Body.Instructions[0].OpCode);
 
-            string pdnDir = TestPaths.Repo(@".artifacts\rewritten-paint");
+            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.Windows.Core.dll"), overwrite: true);
@@ -3937,7 +4544,7 @@ public sealed class RewriteTests
             var getBounds = geom.Methods.First(m => m.Name == "get_Bounds");
             Assert.Contains(getBounds.Body.Instructions, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Ret);
 
-            string pdnDir = TestPaths.Repo(@".artifacts\rewritten-paint");
+            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.UI.dll"), overwrite: true);
@@ -4000,7 +4607,7 @@ public sealed class RewriteTests
             var getScale = sp.Methods.First(m => m.Name == "GetCursorScale");
             Assert.Contains(getScale.Body.Instructions, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Ldc_R8);
 
-            string pdnDir = TestPaths.Repo(@".artifacts\rewritten-paint");
+            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.Windows.Framework.dll"), overwrite: true);
@@ -4049,7 +4656,7 @@ public sealed class RewriteTests
             var msi = bsbr.Methods.First(m => m.Name == "MeasureSpriteImage");
             Assert.DoesNotContain(msi.Body.Instructions, i => i.Operand?.ToString()?.Contains("DrawNull") == true);
 
-            string pdnDir = TestPaths.Repo(@".artifacts\rewritten-paint");
+            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "paintdotnet.dll"), overwrite: true);
@@ -4093,7 +4700,7 @@ public sealed class RewriteTests
             var ensureEnqueued = ct.Methods.First(m => m.Name == "EnsureEnqueued");
             Assert.Contains(ensureEnqueued.Body.Instructions, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Ldc_I4_0);
 
-            string pdnDir = TestPaths.Repo(@".artifacts\rewritten-paint");
+            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.Runtime.dll"), overwrite: true);
@@ -4136,7 +4743,7 @@ public sealed class RewriteTests
             Assert.Contains(cloneCore.Body.Instructions, i => i.Operand?.ToString()?.Contains("MemberwiseClone") == true);
             Assert.DoesNotContain(cloneCore.Body.Instructions, i => i.Operand?.ToString()?.Contains("BinaryFormatter") == true);
 
-            string pdnDir = TestPaths.Repo(@".artifacts\rewritten-paint");
+            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.Base.dll"), overwrite: true);
@@ -6036,6 +6643,89 @@ public sealed class RewriteTests
         {
             try { if (File.Exists(tempOut)) File.Delete(tempOut); } catch { }
         }
+    }
+
+    [Fact]
+    public void Rewrite_GetFolderPath_Retargets_To_WasmEnvironment()
+    {
+        // Stock WASM answers "" for every special folder, which kills
+        // Framework-era path builders (Telerik PDF FontsManager..cctor
+        // GetParents the System folder and throws on the empty path,
+        // surfacing as a ThreadExceptionDialog on RTE boot). Both
+        // GetFolderPath overloads retarget to the fork's virtual layout.
+        string input = Path.Combine(Path.GetTempPath(), "envfolder.input.dll");
+        using var image = new MemoryStream(File.ReadAllBytes(FixtureDll()));
+        using (var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(image))
+        {
+            var module = asm.MainModule;
+            asm.Name.Name = "EnvFolderProbe";
+            var corlib = module.AssemblyReferences.FirstOrDefault(r =>
+                r.Name == "System.Private.CoreLib" || r.Name == "mscorlib" || r.Name == "netstandard");
+            if (corlib is null)
+            {
+                corlib = new Mono.Cecil.AssemblyNameReference("System.Private.CoreLib", new Version(9, 0, 0, 0));
+                module.AssemblyReferences.Add(corlib);
+            }
+
+            var envRef = new Mono.Cecil.TypeReference("System", "Environment", module, corlib);
+            var folderRef = module.ImportReference(typeof(System.Environment.SpecialFolder));
+            var optionRef = module.ImportReference(typeof(System.Environment.SpecialFolderOption));
+            var gfp1 = new Mono.Cecil.MethodReference("GetFolderPath", module.TypeSystem.String, envRef)
+            {
+                HasThis = false,
+            };
+            gfp1.Parameters.Add(new Mono.Cecil.ParameterDefinition(folderRef));
+            var gfp2 = new Mono.Cecil.MethodReference("GetFolderPath", module.TypeSystem.String, envRef)
+            {
+                HasThis = false,
+            };
+            gfp2.Parameters.Add(new Mono.Cecil.ParameterDefinition(folderRef));
+            gfp2.Parameters.Add(new Mono.Cecil.ParameterDefinition(optionRef));
+            var probe = new Mono.Cecil.TypeDefinition("EnvProbe", "Probe",
+                Mono.Cecil.TypeAttributes.Public | Mono.Cecil.TypeAttributes.Abstract | Mono.Cecil.TypeAttributes.Sealed,
+                module.TypeSystem.Object);
+            module.Types.Add(probe);
+            var one = new Mono.Cecil.MethodDefinition("GetSystem",
+                Mono.Cecil.MethodAttributes.Public | Mono.Cecil.MethodAttributes.Static,
+                module.TypeSystem.String);
+            probe.Methods.Add(one);
+            var il1 = one.Body.GetILProcessor();
+            il1.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4, (int)System.Environment.SpecialFolder.System);
+            il1.Emit(Mono.Cecil.Cil.OpCodes.Call, gfp1);
+            il1.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+            var two = new Mono.Cecil.MethodDefinition("GetSystemCreate",
+                Mono.Cecil.MethodAttributes.Public | Mono.Cecil.MethodAttributes.Static,
+                module.TypeSystem.String);
+            probe.Methods.Add(two);
+            var il2 = two.Body.GetILProcessor();
+            il2.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4, (int)System.Environment.SpecialFolder.System);
+            il2.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4, (int)System.Environment.SpecialFolderOption.Create);
+            il2.Emit(Mono.Cecil.Cil.OpCodes.Call, gfp2);
+            il2.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+            asm.Write(input);
+        }
+
+        string output = Path.Combine(Path.GetTempPath(), "envfolder.rewritten.dll");
+        AssemblyRewriter.Rewrite(input, output, ShimMap());
+
+        using var rewritten = Mono.Cecil.AssemblyDefinition.ReadAssembly(output);
+        var methods = rewritten.MainModule.GetTypes()
+            .First(t => t.FullName == "EnvProbe.Probe").Methods;
+        foreach (var m in methods.Where(m => m.Name.StartsWith("GetSystem")))
+        {
+            var call = Assert.Single(m.Body.Instructions,
+                i => i.OpCode == Mono.Cecil.Cil.OpCodes.Call);
+            var mr = Assert.IsType<Mono.Cecil.MethodReference>(call.Operand);
+            Assert.Equal("GetFolderPath", mr.Name);
+            Assert.Equal("System.Windows.Forms.WasmEnvironment", mr.DeclaringType.FullName);
+            Assert.Equal("WfWasm.WinForms", mr.DeclaringType.Scope.Name);
+        }
+
+        Assert.DoesNotContain(
+            methods.SelectMany(m => m.Body.Instructions),
+            i => i.Operand is Mono.Cecil.MethodReference mr
+                && mr.Name == "GetFolderPath"
+                && mr.DeclaringType.FullName == "System.Environment");
     }
 
 }

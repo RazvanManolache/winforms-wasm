@@ -65,6 +65,25 @@ internal static partial class PInvokeCore
         return SetWindowLong(hWnd, nIndex, (nint)newValue.Handle.Value);
     }
 
+    // Handle creation seeds the emulated style longs from CreateParams
+    // (via CreateWindowEx's dwStyle/dwExStyle): GetWindowLong(GWL_STYLE)
+    // default-read 0 before, so chrome decisions (Telerik form behaviors,
+    // the canvas host's caption) had no truthful signal.
+    internal static void SeedWindowLongs(HWND hWnd, nint style, nint exStyle)
+    {
+        s_windowLongs[((nint)hWnd.Value, WINDOW_LONG_PTR_INDEX.GWL_STYLE)] = style;
+        s_windowLongs[((nint)hWnd.Value, WINDOW_LONG_PTR_INDEX.GWL_EXSTYLE)] = exStyle;
+    }
+
+    // Reads the seeded GWL_STYLE for a canvas-hosted handle (0 when the
+    // handle never came through CreateWindowEx). Used by the popup
+    // registry to log (and gate on) WS_CHILD vs WS_POPUP creation styles.
+    internal static nint GetStyleForHwnd(nint hwnd)
+    {
+        s_windowLongs.TryGetValue((hwnd, WINDOW_LONG_PTR_INDEX.GWL_STYLE), out var val);
+        return val;
+    }
+
     private static int s_procCounter = 100;
 
     public static nint SetWindowLong<T>(T hWnd, WINDOW_LONG_PTR_INDEX nIndex, WNDPROC dwNewLong)

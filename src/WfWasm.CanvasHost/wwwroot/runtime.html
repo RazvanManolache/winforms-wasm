@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <base href="/" /><script src="runtime-context.js"></script><link rel="stylesheet" href="css/shell.css" /><title>App Studio · WinForms</title>
+    <link rel="stylesheet" href="lib/bootstrap/dist/css/bootstrap.min.css" />
+    <link rel="stylesheet" href="css/app.css" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link href="WfWasm.CanvasHost.styles.css" rel="stylesheet" />
+</head>
+<body>
+    <div id="app">
+        <div class="boot-shell">
+            <div class="workspace-brand"><span class="brand-mark">w<span>f</span></span><span>App Studio<small>WINFORMS IN YOUR BROWSER</small></span></div>
+            <div class="boot-stats">
+                <div class="metric"><span>ELAPSED</span><strong id="metric-load">0.00 s</strong><small id="metric-phase">Loading browser runtime</small></div>
+                <div class="metric"><span>TRANSFERRED</span><strong id="metric-data">0.00 MB</strong><small>Measured network bytes</small></div>
+            </div>
+            <div class="boot-center"><div class="spinner"></div><h1>Opening your workspace</h1><p>Starting a fresh app session. Your app menu remains available.</p><div class="loading-progress"></div><div class="loading-progress-text"></div></div>
+        </div>
+    </div>
+    <div id="blazor-error-ui">The app encountered an error. <a href="." class="reload">Reload</a><span class="dismiss">×</span></div>
+    <script src="preview.js"></script>
+    <script src="canvas-bridge.js"></script>
+    <script src="lib/pixi/pixi.min.js"></script><script src="lib/pixi/pixi-filters.js"></script><script src="webgl-fx.js"></script><script src="gpu-bind.js"></script>
+    <script src="_framework/blazor.webassembly.js" autostart="false"></script>
+    <script>
+        try { window.wfwasm.installErrorReporting(); } catch (e) { }
+        Blazor.start().catch(error => {
+            console.error(error); window.wfwasm.reportRuntimeFailure(error);
+            const message = document.querySelector(".boot-center p");
+            if (message) message.textContent = "The browser runtime could not start. Reload to try again.";
+            window.preview.failed(error.message);
+            document.getElementById("blazor-error-ui").style.display = "block";
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <AssemblyName>WfWasm.IsolatedStorage</AssemblyName>
+    <RootNamespace>WfWasm.IsolatedStorage</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <SignAssembly>false</SignAssembly>
+    <Description>Headless System.IO.IsolatedStorage for the browser: per-assembly in-memory stores (no roaming disk exists on WASM). FileModes behave honestly over stored bytes so dictionary extract-then-read flows (Telerik spellchecker) work. The rewriter retargets System.IO.IsolatedStorage.* refs here. A localStorage-backed persistent tier can replace the static dictionaries later. (Assembly name is WfWasm.* on purpose: a System.IO.IsolatedStorage-named output is silently replaced by the framework copy at bundle time.)</Description>
+  </PropertyGroup>
+
+</Project>

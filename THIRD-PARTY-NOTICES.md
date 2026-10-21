@@ -23,4 +23,6 @@ The project files declare NuGet dependencies, including Mono.Cecil, .NET browser
 - Calculator: [albisnesstz/csharp-win-calculator](https://github.com/albisnesstz/csharp-win-calculator). Its source repository carries an MIT license; the screenshot shows a separately built local copy.
 - Photo Album: Telerik UI for WinForms demo application. Telerik/Progress names, components, photographs, and other artwork remain the property of their respective owners and are not covered by this project's MIT license.
 
+- Syncfusion WinForms demos: [syncfusion/winforms-demos](https://github.com/syncfusion/winforms-demos). Map Selection, Barcode and Diagram Nodes captures show separately obtained/built samples and their control libraries. Their names, interfaces and artwork remain subject to their owners' terms; no sample application, commercial control assembly or sample asset is distributed here.
+
 Screenshots document local interoperability experiments. They do not grant rights to redistribute the applications, their libraries, or their assets, and do not imply vendor affiliation or endorsement. No third-party application, executable, installer, converted assembly, or commercial demo library is included in this repository.

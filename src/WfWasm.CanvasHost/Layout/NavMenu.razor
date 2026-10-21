@@ -8,13 +8,13 @@
     @if (_filter.Length > 0) { <button aria-label="Clear search" @onclick="() => _filter = string.Empty">×</button> }
 </div>
 <div class="library-tabs" aria-label="Filter app library">
-    @foreach (var group in new[] { "All apps", "Everyday", "Telerik" })
+    @foreach (var group in new[] { "All apps", "Everyday", "Telerik", "Syncfusion" })
     {
         <button class="@(_group == group ? "selected" : "")" aria-pressed="@(_group == group)" @onclick="() => _group = group">@group</button>
     }
 </div>
 <nav class="app-list" aria-label="Apps">
-    @foreach (var category in new[] { "Everyday apps", "Telerik demos" })
+    @foreach (var category in new[] { "Everyday apps", "Telerik demos", "Syncfusion demos" })
     {
         var entries = Filtered.Where(e => Category(e) == category).ToList();
         if (entries.Count == 0) { continue; }
@@ -34,15 +34,16 @@
     private string _filter = "";
     private string _group = "All apps";
     private IEnumerable<SceneState.SceneEntry> Filtered => State.Entries.Where(e =>
-        (_group == "All apps" || (_group == "Telerik") == IsTelerik(e)) &&
+        (_group == "All apps" || _group == "Telerik" && IsTelerik(e) || _group == "Syncfusion" && IsSyncfusion(e) || _group == "Everyday" && !IsTelerik(e) && !IsSyncfusion(e)) &&
         _filter.Split(' ', StringSplitOptions.RemoveEmptyEntries).All(word =>
             (e.Label + " " + Description(e) + " " + e.SourceLabel).Contains(word, StringComparison.OrdinalIgnoreCase)));
     private static bool IsTelerik(SceneState.SceneEntry e) => e.AppFolder?.StartsWith("telerik-", StringComparison.Ordinal) == true;
-    private static string Category(SceneState.SceneEntry e) => IsTelerik(e) ? "Telerik demos" : "Everyday apps";
-    private static string Name(SceneState.SceneEntry e) => e.Label.Replace("Telerik: ", "");
+    private static bool IsSyncfusion(SceneState.SceneEntry e) => e.AppFolder?.StartsWith("syncfusion-", StringComparison.Ordinal) == true;
+    private static string Category(SceneState.SceneEntry e) => IsSyncfusion(e) ? "Syncfusion demos" : IsTelerik(e) ? "Telerik demos" : "Everyday apps";
+    private static string Name(SceneState.SceneEntry e) => e.Label.Replace("Telerik: ", "").Replace("Syncfusion: ", "");
     private static string IconClass(SceneState.SceneEntry e) => IsTelerik(e) ? "teal" : e.Scene == AppScene.Paint ? "violet" : "blue";
     private static string Icon(SceneState.SceneEntry e) => e.Scene switch { AppScene.Smoke => "▣", AppScene.Calendar => "▦", AppScene.Paint => "◒", AppScene.Calculator => "＋", AppScene.Todo => "✓", AppScene.TicTacToe => "#", AppScene.TelerikPhoto => "▧", AppScene.TelerikBookshelf => "▤", _ => Name(e)[..1] };
-    private static string Description(SceneState.SceneEntry e) => e.Scene switch {
+    private static string Description(SceneState.SceneEntry e) => IsSyncfusion(e) ? "Experimental compatibility test" : e.Scene switch {
         AppScene.Smoke => "Start here · basic controls", AppScene.Calendar => "Dates & schedules", AppScene.Paint => "Image editing & effects",
         AppScene.Calculator => "Numbers & operations", AppScene.Todo => "Tasks & checklists", AppScene.TicTacToe => "A classic board game",
         AppScene.TelerikPhoto => "Photos & drag interactions", AppScene.TelerikBookshelf => "Books & data browsing", _ => "WinForms component demo" };

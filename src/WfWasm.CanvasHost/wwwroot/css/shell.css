@@ -1,0 +1,6 @@
+[hidden]{display:none!important}
+.shell-stage{position:relative}.runtime-host{width:100%;height:100%;min-width:0;min-height:0}.app-runtime{display:block;width:100%;height:100%;border:0;background:#e9ede6}
+.recovery-actions{display:flex;gap:8px}.stage-overlay.busy{inset:auto 16px 16px;padding:18px;border:1px solid #e4cf9b;border-radius:9px;background:#fff9eb;box-shadow:0 4px 20px #24363218}.stage-overlay.busy .spinner,.stage-overlay.error .spinner{display:none}.stage-overlay.error{gap:16px}.shell-stage>.stage-overlay p{overflow-wrap:anywhere}
+.embedded-runtime .app-sidebar,.embedded-runtime .app-rail,.embedded-runtime .workspace-toolbar,.embedded-runtime .workspace-footer{display:none!important}
+.embedded-runtime .preview-shell{display:block;height:100dvh}.embedded-runtime .preview-main{height:100%;padding:0}.embedded-runtime .preview-content{height:100%;margin:0;border:0;border-radius:0;box-shadow:none}.embedded-runtime .stage-layout{height:100%}
+.shell-phase{max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.app-list[aria-busy=true]{opacity:.7}

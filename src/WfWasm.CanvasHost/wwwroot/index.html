@@ -1,38 +1,38 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
-    <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>App Studio · WinForms</title><base href="/" />
-    <link rel="stylesheet" href="lib/bootstrap/dist/css/bootstrap.min.css" />
-    <link rel="stylesheet" href="css/app.css" />
-    <link rel="icon" type="image/png" href="/favicon.png" />
-    <link href="WfWasm.CanvasHost.styles.css" rel="stylesheet" />
-</head>
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><base href="/"/><title>App Studio · WinForms</title><link rel="icon" href="/favicon.png"/><link rel="stylesheet" href="css/app.css"/><link rel="stylesheet" href="css/shell.css"/></head>
 <body>
-    <div id="app">
-        <div class="boot-shell">
-            <div class="workspace-brand"><span class="brand-mark">w<span>f</span></span><span>App Studio<small>WINFORMS IN YOUR BROWSER</small></span></div>
-            <div class="boot-stats">
-                <div class="metric"><span>ELAPSED</span><strong id="metric-load">0.00 s</strong><small id="metric-phase">Loading browser runtime</small></div>
-                <div class="metric"><span>TRANSFERRED</span><strong id="metric-data">0.00 MB</strong><small>Measured network bytes</small></div>
-            </div>
-            <div class="boot-center"><div class="spinner"></div><h1>Opening your workspace</h1><p>The browser runtime loads once. Apps and resources are reused on later visits.</p><div class="loading-progress"></div><div class="loading-progress-text"></div></div>
-        </div>
-    </div>
-    <div id="blazor-error-ui">The app encountered an error. <a href="." class="reload">Reload</a><span class="dismiss">×</span></div>
-    <script src="preview.js"></script>
-    <script src="canvas-bridge.js"></script>
-    <script src="lib/pixi/pixi.min.js"></script><script src="lib/pixi/pixi-filters.js"></script><script src="webgl-fx.js"></script>
-    <script src="_framework/blazor.webassembly.js" autostart="false"></script>
-    <script>
-        try { window.wfwasm.installErrorReporting(); } catch (e) { }
-        Blazor.start().catch(error => {
-            console.error(error);
-            const message = document.querySelector(".boot-center p");
-            if (message) message.textContent = "The browser runtime could not start. Reload to try again.";
-            window.preview.failed();
-            document.getElementById("blazor-error-ui").style.display = "block";
-        });
-    </script>
-</body>
-</html>
+<div id="app" class="preview-shell">
+  <aside class="app-sidebar" aria-label="App library">
+    <a class="workspace-brand" href="/"><span class="brand-mark">w<span>f</span></span><span>App Studio<small>WINFORMS IN YOUR BROWSER</small></span></a>
+    <div class="library-heading"><span class="eyebrow">YOUR LIBRARY</span><span id="app-count" class="count-badge">…</span></div>
+    <label class="search-box"><span aria-hidden="true">⌕</span><input id="app-search" type="search" placeholder="Find an app" aria-label="Search apps"/></label>
+    <div class="library-tabs" aria-label="Filter apps"><button data-group="all" class="selected" aria-pressed="true">All apps</button><button data-group="everyday" aria-pressed="false">Everyday</button><button data-group="telerik" aria-pressed="false">Telerik</button><button data-group="syncfusion" aria-pressed="false">Syncfusion</button></div>
+    <nav id="app-list" class="app-list" aria-label="Applications" aria-busy="true"></nav>
+    <div class="sidebar-note"><i class="status-dot"></i><span>Independent app sessions<small>Switch apps at any time, even during loading.</small></span></div>
+  </aside>
+  <main class="preview-main">
+    <div class="workspace-toolbar"><span class="toolbar-title"><i class="live-dot" aria-hidden="true"></i><h1 id="app-title">App Studio</h1></span><span id="app-source" class="source-label"></span><a id="source-link" hidden target="_blank" rel="noopener">View source ↗</a></div>
+    <article class="preview-content shell-stage" aria-label="App workspace">
+      <div id="runtime-host" class="runtime-host"></div>
+      <div id="session-status" class="stage-overlay" role="status"><div class="spinner"></div><h2 id="status-title">Opening your library</h2><p id="status-message">The app menu runs independently of your selected app.</p><div id="recovery-actions" class="recovery-actions" hidden><button id="retry-app" class="subtle-button">Restart app</button><button id="stop-app" class="subtle-button">Stop app</button></div></div>
+    </article>
+    <footer class="workspace-footer"><div class="foot-metrics" aria-label="Loading measurements">
+      <span class="foot-metric"><span>SESSION</span><strong id="shell-load">—</strong><small id="shell-phase" class="shell-phase">Starting</small></span>
+      <span class="foot-metric"><span>APP DATA</span><strong id="shell-data">0.00 MB</strong></span>
+      <span class="foot-metric"><span>NETWORK</span><strong id="shell-network">0.00 MB</strong><small>Entire session</small></span>
+      <span class="foot-metric"><span>CACHE</span><strong id="shell-cache">0 HTTP · 0 memory</strong></span>
+      <span class="foot-metric"><span>RUNTIME BOOT</span><strong id="shell-boot">—</strong></span>
+    </div><a id="error-link" href="/errors" target="_blank" rel="noopener">App errors ↗</a></footer>
+  </main>
+  <aside class="app-rail" aria-label="Workspace actions">
+    <button id="toggle-menu" class="icon-button rail-button menu-toggle" aria-label="Toggle app menu" title="Toggle app menu" aria-expanded="true">☰</button>
+    <button id="compare-app" class="icon-button rail-button" aria-label="Compare desktop" title="Compare with desktop screenshot">◫</button>
+    <button id="reload-app" class="icon-button rail-button" aria-label="Reload app" title="Restart in a fresh session">↻</button>
+    <button id="close-app" class="icon-button rail-button" aria-label="Stop app" title="Stop app">×</button>
+    <button id="snapshot-app" class="icon-button rail-button" aria-label="Save screenshot" title="Save browser screenshot">↓</button>
+    <a class="icon-button rail-button" href="/dashboard" aria-label="Evaluation dashboard" title="Evaluation dashboard">▤</a>
+  </aside>
+</div>
+<script type="module" src="shell-ui.mjs"></script>
+</body></html>

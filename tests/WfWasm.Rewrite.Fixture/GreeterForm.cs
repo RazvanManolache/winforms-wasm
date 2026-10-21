@@ -29,3 +29,28 @@ public sealed class GreeterForm : Form
         Controls.Add(_out);
     }
 }
+
+/// <summary>
+/// Attribute-blob fixture: TypeConverter carries a Type-valued ctor arg
+/// (typeof(SizeConverter)) encoded inline in the blob, mirroring Telerik's
+/// [Editor(..., typeof(UITypeEditor))] on RadImageShape. The rewrite must
+/// remap its scope to the fork.
+/// Regression: Telerik theme BackgroundShape null from a dangling blob
+/// scope (System.Drawing 4.0.0.0).
+/// </summary>
+[System.ComponentModel.TypeConverter(typeof(System.Drawing.SizeConverter))]
+public sealed class ConverterFixture
+{
+}
+
+/// <summary>
+/// BaseDirectory fixture: data loaders ask AppContext (static) or the
+/// current AppDomain (instance) where the exe lives; the browser answers
+/// null, so the rewrite points both getters at WasmAppIdentity.
+/// </summary>
+public static class BaseDirectoryFixture
+{
+    public static string ViaAppContext() => System.AppContext.BaseDirectory;
+
+    public static string ViaAppDomain() => System.AppDomain.CurrentDomain.BaseDirectory;
+}

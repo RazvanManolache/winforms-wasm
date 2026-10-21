@@ -43,3 +43,19 @@ Application data reports uncompressed payload bytes. Network transfer reports me
 ## Compatibility boundaries
 
 Rewriting a reference or providing a matching API signature does not reproduce all Windows behavior. Native services, synchronous UI assumptions, file persistence, accessibility, advanced controls, and graphics require their own behavior tests. Some implementations are partial or stubs. An app rendering successfully is one checkpoint in a longer compatibility investigation.
+
+## App shell and failure boundaries
+
+The outer library mounts a fresh runtime frame with app/session identity for each selection. Runtime messages carry that identity; late messages from disposed sessions must not overwrite the new app. Loopback development uses app-specific runtime origins. Site/renderer behavior needs browser testing: state-machine unit tests alone do not prove a blocked child leaves the menu interactive.
+
+## Retained rendering and WebGL work
+
+`WfWasm.Rendering` defines recorded drawing, surface/resource identity, retained scenes, presentation and CPU-access boundaries. `WfWasm.Rendering.Gles` implements a bounded device/compositor against an `IGlesContext` driver seam. `CanvasHost/GpuProbe.cs`, `wwwroot/gpu-bind.js` and the binding fixtures exercise the browser side. Normal app painting still uses managed CPU bitmaps. Probe/contract coverage is a foundation for integrating real application controls, not a claim that the whole UI is GPU accelerated.
+
+## Platform-service experiment
+
+`WfWasm.Platform.Server`, `.Browser` and `.Demo` are a separate service/demo path: explicit mounts and bounded file operations, session/app identity, virtual registry state, user file selection and print presentation. Existing WinForms file/registry/print adapters are not fully wired through this service. Multi-user production authentication, permission policy and complete application semantics remain separate work.
+
+## Validation boundaries
+
+Native tests, browser primitive pixels, real-app workflows, lifecycle/isolation, performance and hardware backend evidence are distinct checks. The gallery runner is an early selected-workflow harness; blocked model oracles and untested dimensions stay visible. See [testing](testing.md) and [this update's results](progress-2026-10.md).

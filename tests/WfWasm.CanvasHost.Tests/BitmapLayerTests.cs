@@ -41,6 +41,34 @@ public sealed class BitmapLayerTests
     }
 
     [Fact]
+    public void RecordBitmap_Counts_Hash_Verdicts_Per_Frame()
+    {
+        bool was = System.Windows.Forms.WasmFrameCounters.PerfEnabled;
+        System.Windows.Forms.WasmFrameCounters.PerfEnabled = true;
+        try
+        {
+            System.Windows.Forms.WasmFrameCounters.ResetFrame();
+            var recorder = new RecordingRenderer();
+            object key = new();
+            byte[] same = new byte[] { 1, 2, 3, 4 };
+            WinFormsAppHost.RecordBitmap(key, recorder, same, 1, 1, 0, 0, 1, 1);
+            WinFormsAppHost.RecordBitmap(key, recorder, same, 1, 1, 0, 0, 1, 1);
+            WinFormsAppHost.RecordBitmap(key, recorder, new byte[] { 5, 6, 7, 8 }, 1, 1, 0, 0, 1, 1);
+            // First Def is always a miss (no stored hash); the repeat
+            // hits; changed bytes miss. Caret frames that hash-hit
+            // changed zero pixels, which is what makes skipping their
+            // invoke pixel-identical.
+            Assert.Equal(1, System.Windows.Forms.WasmFrameCounters.NLayerHashHit);
+            Assert.Equal(2, System.Windows.Forms.WasmFrameCounters.NLayerHashMiss);
+        }
+        finally
+        {
+            System.Windows.Forms.WasmFrameCounters.PerfEnabled = was;
+            System.Windows.Forms.WasmFrameCounters.ResetFrame();
+        }
+    }
+
+    [Fact]
     public void RecordBitmap_SkipsDef_WhenBytesUnchanged()
     {
         var recorder = new RecordingRenderer();

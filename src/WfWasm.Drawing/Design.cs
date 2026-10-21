@@ -178,4 +178,158 @@ namespace System.Drawing.Design
 
         public int IndexOf(string? value) => InnerList.IndexOf(value);
     }
+
+    /// <summary>Editor invocation style (cf. System.Drawing.Design.UITypeEditorEditStyle).</summary>
+    public enum UITypeEditorEditStyle
+    {
+        None = 1,
+        Modal = 2,
+        DropDown = 3,
+    }
+
+    /// <summary>Paint-value context (cf. System.Drawing.Design.PaintValueEventArgs).</summary>
+    public class PaintValueEventArgs : EventArgs
+    {
+        public PaintValueEventArgs(ComponentModel.ITypeDescriptorContext? context, object? value, Graphics? graphics, Rectangle bounds)
+        {
+            Context = context;
+            Value = value;
+            Graphics = graphics;
+            Bounds = bounds;
+        }
+
+        public Rectangle Bounds { get; }
+
+        public ComponentModel.ITypeDescriptorContext? Context { get; }
+
+        public Graphics? Graphics { get; }
+
+        public object? Value { get; }
+    }
+
+    /// <summary>
+    /// Property-grid value editor base (cf. System.Drawing.Design.UITypeEditor).
+    /// Headless: no modal/drop-down UI exists in the browser, so the base
+    /// answers the desktop defaults (None / passthrough / no paint). The
+    /// full virtual shape is load-bearing — Telerik derives editors from
+    /// this type, and an override with no base virtual is itself a
+    /// TypeLoad. Regression: UITypeEditor TypeLoad &lt;- RadColorBoxElement.
+    /// </summary>
+    public abstract class UITypeEditor
+    {
+        protected UITypeEditor()
+        {
+        }
+
+        public virtual object? EditValue(IServiceProvider? provider, object? value) => value;
+
+        public virtual object? EditValue(ComponentModel.ITypeDescriptorContext? context, IServiceProvider? provider, object? value) => value;
+
+        public virtual UITypeEditorEditStyle GetEditStyle() => UITypeEditorEditStyle.None;
+
+        public virtual UITypeEditorEditStyle GetEditStyle(ComponentModel.ITypeDescriptorContext? context) => GetEditStyle();
+
+        public virtual bool GetPaintValueSupported() => false;
+
+        public virtual bool GetPaintValueSupported(ComponentModel.ITypeDescriptorContext? context) => GetPaintValueSupported();
+
+        public virtual void PaintValue(PaintValueEventArgs? e)
+        {
+        }
+
+        public virtual void PaintValue(object? value, Graphics? canvas, Rectangle rectangle)
+        {
+        }
+    }
+
+    /// <summary>Toolbox-item factory callback (cf. System.Drawing.Design.ToolboxItemCreatorCallback).</summary>
+    public delegate ToolboxItem? ToolboxItemCreatorCallback(object? serializedObject, string? format);
+
+    /// <summary>Toolbox service contract (cf. System.Drawing.Design.IToolboxService).</summary>
+    public interface IToolboxService
+    {
+        void AddCreator(ToolboxItemCreatorCallback? creator, string? format);
+
+        void AddCreator(ToolboxItemCreatorCallback? creator, string? format, ComponentModel.Design.IDesignerHost? host);
+
+        void AddLinkedToolboxItem(ToolboxItem? toolboxItem, ComponentModel.Design.IDesignerHost? host);
+
+        void AddLinkedToolboxItem(ToolboxItem? toolboxItem, string? category, ComponentModel.Design.IDesignerHost? host);
+
+        void AddToolboxItem(ToolboxItem? toolboxItem);
+
+        void AddToolboxItem(ToolboxItem? toolboxItem, ComponentModel.Design.IDesignerHost? host);
+
+        void AddToolboxItem(ToolboxItem? toolboxItem, string? category);
+
+        void AddToolboxItem(ToolboxItem? toolboxItem, string? category, ComponentModel.Design.IDesignerHost? host);
+
+        ToolboxItem? GetSelectedToolboxItem();
+
+        ToolboxItem? GetSelectedToolboxItem(ComponentModel.Design.IDesignerHost? host);
+
+        bool IsSupported(object? serializedObject, ComponentModel.Design.IDesignerHost? host);
+
+        bool IsSupported(object? serializedObject, ICollection? filterAttributes);
+
+        bool IsToolboxItem(object? serializedObject);
+
+        bool IsToolboxItem(object? serializedObject, ComponentModel.Design.IDesignerHost? host);
+
+        void Refresh();
+
+        void RemoveCreator(string? format);
+
+        void RemoveCreator(string? format, ComponentModel.Design.IDesignerHost? host);
+
+        void RemoveToolboxItem(ToolboxItem? toolboxItem);
+
+        void RemoveToolboxItem(ToolboxItem? toolboxItem, string? category);
+
+        string? SelectedCategory { get; set; }
+
+        bool SetCursor();
+
+        void SetSelectedToolboxItem(ToolboxItem? toolboxItem);
+
+        void SetSelectedToolboxItem(ToolboxItem? toolboxItem, ComponentModel.Design.IDesignerHost? host);
+    }
+
+    /// <summary>
+    /// Toolbox item (cf. System.Drawing.Design.ToolboxItem). Headless:
+    /// creation answers empty (no designer host in the browser); Bitmap
+    /// stays null per the codec-milestone rule at the top of this file.
+    /// </summary>
+    public class ToolboxItem
+    {
+        public ToolboxItem()
+        {
+        }
+
+        public ToolboxItem(Type? toolType)
+        {
+            Initialize(toolType);
+        }
+
+        public virtual Bitmap? Bitmap { get; set; }
+
+        public virtual string DisplayName { get; set; } = "";
+
+        public virtual string TypeName { get; set; } = "";
+
+        public virtual Version Version => new(0, 0);
+
+        public virtual ComponentModel.IComponent[] CreateComponents() => [];
+
+        public virtual ComponentModel.IComponent[] CreateComponents(ComponentModel.Design.IDesignerHost? host) => [];
+
+        public virtual void Initialize(Type? toolType)
+        {
+            if (toolType is not null)
+            {
+                TypeName = toolType.AssemblyQualifiedName ?? "";
+                DisplayName = toolType.Name;
+            }
+        }
+    }
 }

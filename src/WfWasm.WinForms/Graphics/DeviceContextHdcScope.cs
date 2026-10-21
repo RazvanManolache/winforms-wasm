@@ -1,4 +1,4 @@
-﻿// Licensed to the .NET Foundation under one or more agreements.
+// Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Diagnostics;
@@ -15,6 +15,13 @@ namespace System.Drawing
         Clipping = 0x0000_0001,
         TranslateTransform = 0x0000_0002,
         All = Clipping | TranslateTransform
+    }
+
+    // Fork: exposes the IDeviceContext wrapped by DeviceContextExtensions'
+    // adapter so the HDC scope can register the paint Graphics.
+    internal interface IDeviceContextSource
+    {
+        IDeviceContext DeviceContext { get; }
     }
 
     internal interface IGraphicsHdcProvider
@@ -47,6 +54,7 @@ namespace Windows.Win32.Graphics.Gdi
         public IHdcContext? DeviceContext { get; }
         public HDC HDC { get; }
         private readonly int _savedHdcState;
+        private readonly global::System.IDisposable? _fillScope;
 
         public DeviceContextHdcScope(
             IHdcContext deviceContext,
@@ -56,6 +64,19 @@ namespace Windows.Win32.Graphics.Gdi
             DeviceContext = deviceContext;
             _savedHdcState = 0;
             HDC = deviceContext?.GetHdc() ?? default;
+        // WASM bridges: HDCs are zero here, so register the Graphics behind
+        // this scope; FillRect/DrawTextEx then paint for real on it.
+        global::System.Drawing.Graphics? fillTarget = (deviceContext as IGraphics)?.Graphics
+            ?? (deviceContext as IGraphicsHdcProvider)?.GetGraphics(createIfNeeded: false)?.Graphics;
+        if (fillTarget is null && deviceContext is IDeviceContextSource source)
+        {
+            fillTarget = global::System.Windows.Forms.DeviceContextExtensions.TryGetGraphics(source.DeviceContext);
+        }
+
+        if (fillTarget is not null)
+        {
+            _fillScope = Windows.Win32.PInvoke.WasmFillBridge.TrackTarget(HDC, fillTarget);
+        }
         }
 
         public DeviceContextHdcScope(
@@ -88,6 +109,7 @@ namespace Windows.Win32.Graphics.Gdi
 
         public void Dispose()
         {
+            _fillScope?.Dispose();
             if (DeviceContext is not null && DeviceContext is not IGraphicsHdcProvider)
             {
                 DeviceContext.ReleaseHdc();

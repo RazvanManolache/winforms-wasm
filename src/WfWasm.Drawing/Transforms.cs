@@ -81,6 +81,17 @@ namespace System.Drawing.Drawing2D
         public bool IsIdentity => _m11 == 1f && _m12 == 0f && _m21 == 0f && _m22 == 1f && _dx == 0f && _dy == 0f;
         public bool IsInvertible => (_m11 * _m22 - _m12 * _m21) != 0f;
 
+        // Translation-only test for the ToDevice fast path (the TPF
+        // span pattern is translate-there/back around DrawString). No
+        // surface change (internal); exact float compare is the guard:
+        // a scaled/rotated matrix simply takes the slow path.
+        internal bool IsPureTranslation(out float tx, out float ty)
+        {
+            tx = _dx;
+            ty = _dy;
+            return _m11 == 1f && _m12 == 0f && _m21 == 0f && _m22 == 1f;
+        }
+
         public Matrix3x2 MatrixElements
         {
             get => new(_m11, _m12, _m21, _m22, _dx, _dy);
