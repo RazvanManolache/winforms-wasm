@@ -1,5 +1,21 @@
 # Live browser captures
 
+## 22 October 2026
+
+Fresh, unaltered JPEG captures at the browser's natural viewport: 2560×855 for external apps and 2560×911 for the source-only form. No screenshot editing, desktop references or generated images. The browser viewport changed naturally between captures; these are not fixed-size visual-regression baselines.
+
+| Capture | Actual action and observed result | Limit |
+| --- | --- | --- |
+| [Paint.NET stroke](paint-net-2026-10-22.jpg), [undo](paint-net-undo-2026-10-22.jpg), [redo](paint-net-redo-2026-10-22.jpg) | Drag `(800,360) → (1020,510)` once; press Ctrl+Z then Ctrl+Y. Stroke disappears and returns. Independent image analysis of `(790,350)–(1030,520)` finds 632, 0 and 632 dark pixels respectively. | One visible roundtrip. History labels, modified/saved semantics, persistence, memory bounds and arbitrary effects are not certified. |
+| [Paint.NET Levels](paint-net-levels-2026-10-22.jpg) | Open Adjustments → Levels. Its real dialog renders; close it with X. | Incomplete controls and no visible OK/Cancel actions; no non-default effect application claim. |
+| [MedicalApp registration](medical-registration-2026-10-22.jpg) | Click Register new patient; actual fields appear. | Attempted first-name input produced no visible text; no save/data-validation/persistence claim. |
+| [Map Selection](map-selection-2026-10-22.jpg) | Click Brazil at `(1160,506)`; its actual polygon becomes cyan. | The SelectedCountries area remains empty; list/data behavior unverified. |
+| [Source-only base](base-project-2026-10-22.jpg) | Build the public source snapshot; its library contains one form. Click its button; the counter shows `Clicks: 1 (Success!)`. | Base-build/input evidence, not external app compatibility. |
+
+External-app observations used the separately configured development host on port 5210. The source-only build used port 5391 with development static assets enabled. Their build/runtime configurations differ; the screenshots are not whole-repository reproducibility or performance receipts. Session counters show warm/cold states as encountered, not comparable load benchmarks.
+
+See the [dated implementation review](../review-2026-10-22.md) for test failures, remaining work, discarded automation evidence and publication boundaries. App binaries, converted assemblies and loose assets remain excluded; application UI/artwork retain their owners' rights.
+
 ## 21 October 2026
 
 These JPEGs are unaltered browser screenshots at the normal 1280×720 viewport. No desktop screenshots, generated mockups or image edits were used. Fixed-size desktop windows still exceed or crowd the available area in some cases; those limitations remain visible. The local development app corpus is separately supplied and excluded from this repository.

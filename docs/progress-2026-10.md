@@ -1,5 +1,7 @@
 # October 2026 source update
 
+**Latest follow-up: 22 October 2026.** See the [new implementation review and test results](review-2026-10-22.md). The dated results below describe the earlier 21 October snapshot.
+
 This snapshot expands runtime compatibility, the app-session shell, platform-service scaffolding and rendering/test infrastructure. The goal remains to use AI to adapt the platform around existing business logic, with explicit behavior tests rather than a risky wholesale rewrite.
 
 ## Included in the source update

@@ -11,3 +11,5 @@ This project is a work in progress. The goal is to use AI to help adapt the plat
 - Document deployment and isolation before considering a shared hosting service.
 
 There are no compatibility guarantees or release dates attached to this list. Small examples that expose a real behavior gap are especially useful contributions.
+
+The [22 October implementation review](review-2026-10-22.md#ordered-work-for-the-next-agent) orders the next work around real input/rendering correctness, text transforms, a production GPU-control pilot, platform persistence/dialogs, measured latency and reproducible acceptance.

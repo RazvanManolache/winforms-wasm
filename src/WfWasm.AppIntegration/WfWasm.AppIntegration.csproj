@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <!-- Optional integration seams only. No WinForms/Drawing/ASP.NET dependency;
+       not referenced by CanvasHost or enabled in the production app path. -->
+  <ItemGroup>
+    <ProjectReference Include="../WfWasm.Rendering/WfWasm.Rendering.csproj" />
+  </ItemGroup>
+</Project>

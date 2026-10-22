@@ -3693,12 +3693,27 @@ public sealed class WinFormsAppHost : IDisposable
 			}
 			else
 			{
-				bool flag5 = TryRenderSelfPainted(canvas, control, num, num2, width, height);
+				// D2D controls own their pixels through the CPU Direct2D
+			// bridge: GDI self-paint only runs GdiControl.OnPaint
+			// (background fill), which then shadows the D2D render
+			// below and leaves e.g. the color wheel permanently white.
+			// Route them straight to the D2D path; its failures stay
+			// contained and logged there, and the BackColor fill below
+			// still lays a base under the composited D2D output.
+			// (Former ColorWheelControl name blocklist in
+			// TryRenderD2DControl is already removed; this ordering is
+			// what actually reaches it.)
+			// Perf note: skipping the GDI bitmap round-trip for D2D
+			// controls also saves one alloc+invoke per paint.
+			bool flag5 = IsD2DControl(control) ? false : TryRenderSelfPainted(canvas, control, num, num2, width, height);
 				if (!flag5 && !control.BackColor.IsEmpty && control.BackColor != Color.Transparent)
 				{
 					canvas.FillRectangle(num, num2, width, height, ToRgba(control.BackColor, 4042322175u));
 				}
-				if (!flag5 && !string.IsNullOrEmpty(control.Text) && control.Controls.Count == 0)
+				// D2D surfaces own every pixel (swapchain on desktop): GDI
+			// never paints their Text (e.g. designer leftover Text on
+			// palette controls). Skip it like self-paint above.
+			if (!flag5 && !IsD2DControl(control) && !string.IsNullOrEmpty(control.Text) && control.Controls.Count == 0)
 				{
 					canvas.DrawTextAligned(control.Text, num + 4, num2 + 12, GetFontCss(control.Font), ToRgba(control.ForeColor, 255u), TextHAlign.Left, TextVAlign.Middle);
 				}
@@ -6992,14 +7007,10 @@ public sealed class WinFormsAppHost : IDisposable
 				return;
 			}
 		}
-		if (text.EndsWith("ColorWheelControl", StringComparison.Ordinal))
-		{
-			lock (s_d2dRenderFailed)
-			{
-				s_d2dRenderFailed.Add(text);
-				return;
-			}
-		}
+		// (Former ColorWheelControl blocklist removed: it predates the CPU
+		// Direct2D factory synthesis. The upload chain (reinterpret,
+		// counted clips, color-profile resources) is harness-pinned
+		// now; failures stay contained below with a [D2D] console line.)
 		try
 		{
 			lock (s_d2dRenderFailed)

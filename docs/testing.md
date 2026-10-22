@@ -6,6 +6,8 @@ Build with `./scripts/build.ps1` first. `./scripts/test-base.ps1` is the focused
 
 ```powershell
 ./scripts/test-base.ps1
+dotnet test tests/WfWasm.AppIntegration.Tests
+dotnet test tests/WfWasm.PdnCpu.Tests
 dotnet test tests/WfWasm.Rendering.Tests
 dotnet test tests/WfWasm.Rendering.Gles.Tests
 ./scripts/test-platform.ps1
@@ -32,3 +34,5 @@ Use a pinned server/client/runtime/rewriter generation and distinct run/app/sess
 Use actual input and independently observed output for latency, with repeated raw samples and p50/p95/max. RAF callbacks, managed completion, submission and readback are different milestones. Automation screenshots do not establish physical input-to-photon latency. Keep timing runs comparable and routine diagnostics off; record probe overhead and missing responses.
 
 The full test script retains failure status, including unresolved integration and GPU requirements. See [dated validation results](progress-2026-10.md) rather than assuming every included test or app is green.
+
+The [22 October review](review-2026-10-22.md#fresh-validation) records the new snapshot results, including the seven remaining external-input failures in the unfiltered rewriter suite. AppIntegration tests are seam contracts and do not prove production wiring.

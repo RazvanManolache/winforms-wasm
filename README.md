@@ -20,6 +20,14 @@ The idea is to **use AI to convert the “SAFE” part**: the runtime, drawing l
 
 This is an early experiment. Selected applications render and respond to input today. Compatibility is incomplete, and preserving behavior still requires testing each application's real workflows.
 
+## Latest update — 22 October 2026
+
+Paint.NET now has a fresh, visible **brush → undo → redo** roundtrip, a rendered color wheel, and more work on text, CPU effect tiles and history compatibility. Its editor is still incomplete; the new screenshots deliberately leave the remaining panel and dialog artifacts visible.
+
+This update also publishes an optional integration skeleton and its tests, with a concrete map for connecting retained rendering and platform services to real applications. **The normal UI still paints on the CPU, and ordinary apps still lack the complete registry/file/print integration.**
+
+See the [current review, validation results and ordered next tasks](docs/review-2026-10-22.md), [integration architecture](docs/integration-bridges.md), and [agent handoff](docs/integration-agent-prompt.md). The source-only build and focused checks passed; the unfiltered rewriter suite has 201 passes and seven failures requiring excluded external inputs. No hardware-GPU or performance acceptance is claimed.
+
 ## Recent progress — October 2026
 
 The experiment now covers more of the platform around a real desktop application:
@@ -35,25 +43,21 @@ See the [progress and validation notes](docs/progress-2026-10.md) for what was c
 
 ## See it running
 
-The following are **unaltered captures from the live local browser on 21 October 2026**, at its normal viewport. They show existing application code and its supported behavior, including visible limitations. They are not desktop reference images or full compatibility claims.
+These are **unaltered captures from the live local browser on 22 October 2026**. They show real applications and their current limitations. External app files are supplied separately and are not distributed here.
 
-![Paint.NET 5.1.12 in WebAssembly after four brush drags draw a W-shaped stroke; editor panels remain incomplete.](docs/screenshots/paint-net-2026-10.jpg)
+![Paint.NET 5.1.12 after a real brush stroke, with its color wheel rendered and incomplete panels still visible.](docs/screenshots/paint-net-2026-10-22.jpg)
 
-**Paint.NET 5.1.12 remains the most ambitious showcase.** The editor loads and real brush input changes the document and its modified state. It is still partially working: panels, rendering, editing commands, effects and file workflows need further compatibility work. This capture establishes basic drawing, not a complete image editor.
+**Paint.NET remains the most ambitious showcase.** A brush drag produces the diagonal stroke above. Ctrl+Z removes it and Ctrl+Y restores it; saved document-region pixels independently confirm the visible roundtrip. See [undo](docs/screenshots/paint-net-undo-2026-10-22.jpg), [redo](docs/screenshots/paint-net-redo-2026-10-22.jpg), and the [partially rendered Levels dialog](docs/screenshots/paint-net-levels-2026-10-22.jpg). Panel text, controls, modal workflows, effects, file operations and long-session behavior still need work. This is not a complete image editor.
 
-![Syncfusion Map Selection with Brazil highlighted after clicking its actual country polygon in the browser.](docs/screenshots/map-selection-2026-10.jpg)
+![Syncfusion Map Selection after Brazil is clicked and its actual polygon turns cyan.](docs/screenshots/map-selection-2026-10-22.jpg)
 
-*Map Selection: clicking Brazil highlights its actual polygon. This exercises shape rendering and hit testing; map zoom/pan and full data workflows were not certified.*
+*Map Selection: the real country polygon responds to a click. The selected-countries list remains empty, so this demonstrates shape rendering and hit testing while exposing a data/UI gap.*
 
-![Syncfusion Barcode after editing the input to /wasm and pressing UPDATE; the generated QR code independently decodes to /wasm.](docs/screenshots/barcode-update-2026-10.jpg)
+![Telerik MedicalApp after Register new patient opens its real form over the dashboard.](docs/screenshots/medical-registration-2026-10-22.jpg)
 
-*Barcode: real keyboard input and UPDATE regenerate the QR code. An independent image decoder reads the exact value `/wasm` from this capture.*
+*MedicalApp: a real button opens the registration form. Input rendering, validation and persistence are not established by this image; attempted first-name input did not produce visible text during this review. No record was saved.*
 
-![Syncfusion Diagram Nodes showing the real node toolbar, geometric shapes, rich-text node and property grid in the browser.](docs/screenshots/diagram-nodes-2026-10.jpg)
-
-*Diagram Nodes: the sample reaches its actual gallery, including geometric and rich-text nodes and a property grid. This image documents startup/rendering progress; drag/edit/serialization parity is not established by this capture.*
-
-[Capture details and earlier Calculator/Photo Album interactions](docs/screenshots/README.md) describe the exact actions and limits. The separately obtained application binaries, commercial libraries, loose assets and converted assemblies are **not included**. Names and artwork belong to their respective owners. The larger local library shown in these captures is not the content of a fresh checkout.
+[Capture provenance and the earlier QR-code, Diagram Nodes, Calculator and Photo Album checks](docs/screenshots/README.md) describe exact actions and limits. Application names and artwork belong to their owners. The larger local library in these captures is not included in a fresh checkout.
 
 ## How it works
 
@@ -77,9 +81,9 @@ dotnet workload restore src/WfWasm.CanvasHost/WfWasm.CanvasHost.csproj
 
 Open [http://127.0.0.1:5210](http://127.0.0.1:5210). The checkout starts with the built-in smoke form; external applications appear only when their files are available locally. No third-party application is required to build or open the base project.
 
-![The updated source-only base project running its built-in WinForms form without any external applications installed.](docs/screenshots/base-project-2026-10.jpg)
+![The updated source-only base project running its built-in WinForms form without any external applications installed.](docs/screenshots/base-project-2026-10-22.jpg)
 
-*What a source-only build includes: the base runtime and its built-in form. External app inputs are optional and remain local.*
+*Fresh source-only build: one built-in form, no external apps installed. Clicking its button shows `Clicks: 1 (Success!)`.*
 
 The script builds the fork and rewriter, generates the browser-compatible runtime under the ignored `.artifacts/` directory, and builds the host. See [build instructions](docs/building.md) for individual steps, tests, and locally supplied applications.
 

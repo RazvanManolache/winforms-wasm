@@ -1153,6 +1153,795 @@ public static unsafe class CpuPaint
         }
     }
 
+    // Browser-raster blit for the DrawTextLayout path: white-with-alpha
+    // RGBA (BrowserText convention) tinted by the ink color, straight-
+    // alpha source-over per pixel. Rotation is out of scope (panel
+    // text is axis-aligned); translation + axis scale apply like the
+    // brush stamps. Primitives only, like the rest of this contract.
+    public static void BlitRaster(
+        long ctx, byte[]? rgba, int w, int h, float x, float y,
+        float opacity, float r, float g, float b, float a)
+    {
+        if (ctx == 0 || rgba is null || rgba.Length < w * h * 4
+            || w <= 0 || h <= 0 || opacity <= 0f || a <= 0f)
+            return;
+        var t = FromHandle<Target>(ctx);
+        float ink = Math.Clamp(a, 0f, 1f) * opacity;
+        int dx0 = (int)MathF.Round(x * t.M11 + y * t.M21 + t.M31);
+        int dy0 = (int)MathF.Round(x * t.M12 + y * t.M22 + t.M32);
+        for (int sy = 0; sy < h; sy++)
+        {
+            for (int sx = 0; sx < w; sx++)
+            {
+                float sa = rgba[(sy * w + sx) * 4 + 3] / 255f;
+                if (sa <= 0f)
+                    continue;
+                BlendPixel(t, dx0 + sx, dy0 + sy, sa * ink, r, g, b);
+            }
+        }
+    }
+
+    // Effect OK-apply resume (Levels and friends): our ShowDialog
+    // returns None immediately (no nested pump on one thread), so
+    // EffectMenuBase.RunEffectImpl tears its preview pipeline down
+    // before the user ever clicks OK. The rewriter notes the menu
+    // for each config dialog (NoteEffectMenu) and routes FormClosed
+    // here; an OK settle reruns the product's own DoEffect with a
+    // fresh layer snapshot. Everything PDN-typed is reflection-only
+    // (names, never references), like the DrawText layout path.
+    // Answers false (no-op) on any shape mismatch; real failures
+    // still trip the first-chance inventory at their source.
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, object> s_effectMenus = new();
+
+
+    public static void NoteEffectMenu(object? dialog, object? menu)
+    {
+        try
+        {
+            if (dialog is null || menu is null)
+                return;
+            lock (s_effectMenus)
+            {
+                s_effectMenus.Remove(dialog);
+                s_effectMenus.Add(dialog, menu);
+            }
+            // The noted dialog is often a host wrapper
+            // (EffectConfigFormWrapper): FormClosed fires on the hosted
+            // inner form, so note it under the same menu. Field-shape
+            // only, fails silent.
+            try
+            {
+                System.Type? dt = dialog.GetType();
+                while (dt is not null)
+                {
+                    foreach (var f in dt.GetFields(
+                        System.Reflection.BindingFlags.Instance
+                        | System.Reflection.BindingFlags.Public
+                        | System.Reflection.BindingFlags.NonPublic
+                        | System.Reflection.BindingFlags.DeclaredOnly))
+                    {
+                        object? val;
+                        try { val = f.GetValue(dialog); }
+                        catch { continue; }
+                        if (val is null || ReferenceEquals(val, dialog) || ReferenceEquals(val, menu))
+                            continue;
+                        System.Type vt = val.GetType();
+                        bool isForm = vt.FullName?.Contains("IEffectConfigForm",
+                            System.StringComparison.Ordinal) == true;
+                        if (!isForm)
+                        {
+                            foreach (var it in vt.GetInterfaces())
+                            {
+                                if (it.Name.Contains("IEffectConfigForm",
+                                    System.StringComparison.Ordinal))
+                                { isForm = true; break; }
+                            }
+                        }
+                        if (!isForm)
+                            continue;
+                        lock (s_effectMenus)
+                        {
+                            s_effectMenus.Remove(val);
+                            s_effectMenus.Add(val, menu);
+                        }
+                    }
+                    dt = dt.BaseType;
+                }
+            }
+            catch
+            {
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    // FormClosed resume path: an OK settle reruns the product's own
+    // DoEffect with a fresh snapshot (ShowDialog settles immediately
+    // headless, so the normal post-dialog apply never runs). Result is
+    // logged ([FXAPPLY]) so live probes can tell OK-applied apart from
+    // the silent no-op without TEMP diagnostics.
+    public static bool ResumeEffectApply(object? dialog)
+    {
+        try
+        {
+            if (dialog is null)
+            {
+                System.Console.WriteLine("[FXAPPLY] no-dialog");
+                return false;
+            }
+            object? menu;
+            lock (s_effectMenus)
+            {
+                if (!s_effectMenus.TryGetValue(dialog, out menu) || menu is null)
+                {
+                    System.Console.WriteLine("[FXAPPLY] no-menu-note for "
+                        + dialog.GetType().Name);
+                    return false;
+                }
+                s_effectMenus.Remove(dialog);
+            }
+            // DialogResult.OK == 1; Cancel/X/None settle is a no-op.
+            var getResult = dialog.GetType().GetMethod("get_DialogResult", Type.EmptyTypes);
+            int dr = getResult is null ? -99 : Convert.ToInt32(getResult.Invoke(dialog, null));
+            if (getResult is null || dr != 1)
+            {
+                System.Console.WriteLine("[FXAPPLY] settle-result=" + dr);
+                return false;
+            }
+            var getEffect = dialog.GetType().GetMethod("get_Effect", Type.EmptyTypes);
+            var getToken = dialog.GetType().GetMethod("get_Token", Type.EmptyTypes);
+            if (getEffect is null || getToken is null)
+            {
+                System.Console.WriteLine("[FXAPPLY] no-effect-or-token-accessor");
+                return false;
+            }
+            object? effect = getEffect.Invoke(dialog, null);
+            object? token = getToken.Invoke(dialog, null);
+            if (effect is null || token is null)
+            {
+                System.Console.WriteLine("[FXAPPLY] null-effect-or-token");
+                return false;
+            }
+            object cloned = CloneEffectToken(token);
+            // The preview never rendered headless, so the live layer
+            // surface still holds pre-dialog pixels: snapshot it for
+            // the memento, then let DoEffect render into the layer.
+            object appWs = GetProp(menu, "get_AppWorkspace");
+            object dw = GetProp(appWs, "get_ActiveDocumentWorkspace");
+            object layer = GetProp(dw, "get_ActiveLayer");
+            object surface = GetProp(layer, "get_Surface");
+            var cloneSurface = surface.GetType().GetMethod("Clone", Type.EmptyTypes)
+                ?? throw new NotSupportedException("effect resume needs Surface.Clone");
+            object snapshot = cloneSurface.Invoke(surface, null)!;
+            // A second clone is the sacrificial render intermediate:
+            // DoEffect's copy phase renders into its `original` arg,
+            // so passing the pristine snapshot would contaminate the
+            // very bytes the undo memento must save (undo then
+            // restores post-effect pixels: a silent no-op). The
+            // snapshot below stays pristine for the tile stash and
+            // the replicated push; only renderOriginal is handed to
+            // DoEffect. Same pre-apply content either way, so render
+            // behavior (tile stash + copy target) is unchanged.
+            object renderOriginal = cloneSurface.Invoke(surface, null)!;
+            // Stash the pre-effect pixels for the CPU tile renderer
+            // (the product tile loop reads through our OnCopyPixels
+            // hook; see TryRenderGpuTileCpu). Best-effort: a miss falls
+            // back to the product D2D path as before.
+            NoteTileSource(effect, snapshot);
+            // Private base methods are invisible through a derived menu
+            // type: walk up (AdjustmentsMenu -> EffectMenuBase).
+            System.Reflection.MethodInfo? doEffect = null;
+            for (System.Type? mt = menu.GetType(); mt is not null; mt = mt.BaseType)
+            {
+                doEffect = mt.GetMethod("DoEffect",
+                    System.Reflection.BindingFlags.Instance
+                    | System.Reflection.BindingFlags.Public
+                    | System.Reflection.BindingFlags.NonPublic
+                    | System.Reflection.BindingFlags.DeclaredOnly);
+                if (doEffect is not null)
+                    break;
+            }
+            doEffect ??= menu.GetType().GetMethod("DoEffect",
+                System.Reflection.BindingFlags.Instance
+                | System.Reflection.BindingFlags.Public
+                | System.Reflection.BindingFlags.NonPublic);
+            if (doEffect is null)
+                throw new NotSupportedException("effect resume needs EffectMenuBase.DoEffect");
+            // DoEffect renders + copies + pushes the undo memento over the
+            // render-scan lists (lazy Results). The dialog preview owned
+            // those; the resume must supply its own: a full-surface scan
+            // (the layer still holds pre-dialog pixels headless, and the
+            // CPU tile path re-renders from the stashed snapshot). Nulls
+            // NRE inside the queued memento builder and the copy phase,
+            // which DoEffect absorbs: applied=True with no push and no
+            // pixels (rev120 probe).
+            object scans = BuildFullSurfaceScans(snapshot, out object scanList);
+            object?[] args = new object?[] { effect, cloned, scans, scans, renderOriginal, null };
+            object? applied = doEffect.Invoke(menu, args);
+            RefreshRepeatEffect(menu, effect, cloned);
+            bool ok = applied is true;
+            // DoEffect's own memento builder (b__0) runs on the work
+            // dispatcher, which never pumps headless: the render/copy
+            // phases complete but bitmapMemento stays null, so the push
+            // is skipped. Replicate the push here from the same inputs
+            // (pre-effect snapshot + full-surface scans): the memento
+            // saves pre-effect pixels, so undo restores correctly.
+            string rowName = "-";
+            string push = ok ? PushHistoryMemento(dw, effect, snapshot, scanList, out rowName) : "skipped";
+            System.Console.WriteLine("[FXAPPLY] doeffect-applied=" + ok + " push=" + push + " row=" + rowName);
+            return ok;
+        }
+        catch (System.Exception ex)
+        {
+            System.Console.WriteLine("[FXAPPLY] threw " + ex.GetType().Name
+                + ": " + (ex.Message ?? "").Split('\n')[0]);
+            return false;
+        }
+    }
+
+    // A successful Result<IReadOnlyList<RectInt32>> holding one
+    // full-surface scan, built reflection-only (names, never
+    // references): ResultValueImpl<T>(T) derives Result<T>, and
+    // List<RectInt32> answers IReadOnlyList<RectInt32>.
+    // Best-effort replica of DoEffect's dispatcher-built undo memento
+    // (see b__0): BitmapHistoryMemento(name, image, dw, layer, scans,
+    // original, null) pushed on dw.History. Returns a short status for
+    // the FXAPPLY log; unit-test fakes (no PDN history types) report
+    // "unavailable" without failing the apply.
+    private static string PushHistoryMemento(object dw,
+        object effect, object snapshot, object scanList, out string rowName)
+    {
+        rowName = effect.GetType().Name;
+        string iconDesc = "n/a";
+        try
+        {
+            Type dwType = dw.GetType();
+            object? history = dwType.GetMethod("get_History", Type.EmptyTypes)?.Invoke(dw, null);
+            object? layerIndexObj = dwType.GetMethod("get_ActiveLayerIndex", Type.EmptyTypes)?.Invoke(dw, null);
+            if (history is null || layerIndexObj is null)
+                return "unavailable-history";
+            int layerIndex = System.Convert.ToInt32(layerIndexObj);
+            string name = effect.GetType().Name;
+            rowName = name;
+            object? image = null;
+            try
+            {
+                // IEffect.EffectInfo is often explicit: the public
+                // lookup misses, so fall back to the interface map
+                // (desktop b__0 binds it statically and always sees it;
+                // without this the row shows the class name, e.g.
+                // "LevelsGpuEffect" instead of "Levels").
+                object? info = effect.GetType().GetMethod("get_EffectInfo",
+                    Type.EmptyTypes)?.Invoke(effect, null);
+                if (info is null)
+                {
+                    foreach (var iface in effect.GetType().GetInterfaces())
+                    {
+                        if (iface.FullName != "PaintDotNet.Effects.IEffect")
+                            continue;
+                        var getter = iface.GetMethod("get_EffectInfo", Type.EmptyTypes);
+                        if (getter is null)
+                            break;
+                        try { info = getter.Invoke(effect, null); }
+                        catch { info = null; }
+                        break;
+                    }
+                }
+                if (info is not null)
+                {
+                    object? n = info.GetType().GetMethod("get_Name", Type.EmptyTypes)?.Invoke(info, null);
+                    if (n is string s && s.Length > 0)
+                        name = s;
+                    // The row icon stays null even when the effect has one:
+                    // a non-null ImageResource blanks the whole history
+                    // row headless (band paints, icon+text do not, no
+                    // error). The 16x16 source Bitmap exists, but its
+                    // device image carries no pixels, so the row's
+                    // DrawImage is a silent no-op and the text never
+                    // lands. Text-only rows paint ("Levels" verified
+                    // live); icons wait on the device-image gap.
+                    iconDesc = "suppressed-row-paint-gap";
+                }
+            }
+            catch
+            {
+            }
+            Type? mementoType = null;
+            foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try { mementoType = asm.GetType("PaintDotNet.HistoryMementos.BitmapHistoryMemento"); }
+                catch { continue; }
+                if (mementoType is not null)
+                    break;
+            }
+            if (mementoType is null)
+                return "unavailable-memento-type";
+            System.Reflection.ConstructorInfo? mctor = null;
+            foreach (var c in mementoType.GetConstructors(
+                    System.Reflection.BindingFlags.Public
+                    | System.Reflection.BindingFlags.NonPublic
+                    | System.Reflection.BindingFlags.Instance))
+            {
+                var ps = c.GetParameters();
+                if (ps.Length == 7 && ps[0].ParameterType == typeof(string))
+                {
+                    mctor = c;
+                    break;
+                }
+            }
+            if (mctor is null)
+                return "unavailable-memento-ctor";
+            rowName = name;
+            object?[] margs = new object?[] { name, image, dw, layerIndex, scanList, snapshot, null };
+            object memento;
+            try
+            {
+                memento = mctor.Invoke(margs)!;
+            }
+            catch (System.Reflection.TargetInvocationException tie) when (tie.InnerException is not null)
+            {
+                return "ctor-threw-" + tie.InnerException.GetType().Name;
+            }
+            var push = history.GetType().GetMethod("PushNewMemento");
+            if (push is null)
+                return "unavailable-push";
+            push.Invoke(history, new[] { memento });
+            // Immediate read-back: distinguishes a memento that is
+            // born unreadable (wrong copy/ctor: get_Data dies here)
+            // from one that dies later (collected/disposed: get_Data
+            // dies only at undo). Also names the source assembly so
+            // a duplicate-type copy cannot hide.
+            string born = "born-unknown";
+            try
+            {
+                object? data = mementoType.GetMethod("get_Data",
+                    System.Reflection.BindingFlags.Public
+                    | System.Reflection.BindingFlags.NonPublic
+                    | System.Reflection.BindingFlags.Instance)?.Invoke(memento, null);
+                born = "born-" + (data is null ? "null" : "live");
+            }
+            catch (System.Reflection.TargetInvocationException tie)
+            {
+                born = "born-threw-" + (tie.InnerException?.GetType().Name ?? "null");
+            }
+            string asmName = "asm-unknown";
+            try { asmName = "asm-" + mementoType.Assembly.GetName().Name; }
+            catch { }
+            return "pushed icon=" + iconDesc + " " + born + " " + asmName;
+        }
+        catch (System.Exception ex)
+        {
+            return "threw-" + ex.GetType().Name;
+        }
+    }
+
+    private static object BuildFullSurfaceScans(object surface, out object scanList)
+    {
+        Type st = surface.GetType();
+        int w = System.Convert.ToInt32(st.GetMethod("get_Width",
+            Type.EmptyTypes)?.Invoke(surface, null));
+        int h = System.Convert.ToInt32(st.GetMethod("get_Height",
+            Type.EmptyTypes)?.Invoke(surface, null));
+        if (w <= 0 || h <= 0)
+            throw new NotSupportedException("effect resume needs a sized surface");
+        // Exact full-name match across loaded assemblies (live: the
+        // PDN assemblies; unit tests stand in with same-named fakes).
+        Type? rectType = null;
+        Type? implOpen = null;
+        foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
+        {
+            try { rectType ??= asm.GetType("PaintDotNet.Rendering.RectInt32"); }
+            catch { }
+            try { implOpen ??= asm.GetType("PaintDotNet.Functional.ResultValueImpl`1"); }
+            catch { }
+            if (rectType is not null && implOpen is not null)
+                break;
+        }
+        if (rectType is null || implOpen is null)
+            throw new NotSupportedException("effect resume needs RectInt32+ResultValueImpl");
+        object rect;
+        try
+        {
+            rect = System.Activator.CreateInstance(rectType, 0, 0, w, h)!;
+        }
+        catch (System.MissingMethodException)
+        {
+            throw new NotSupportedException("effect resume needs RectInt32(x,y,w,h)");
+        }
+        // Pin the (x, y, width, height) order: a swapped ctor would
+        // silently render the wrong region.
+        int rx = System.Convert.ToInt32(rectType.GetMethod("get_X",
+            Type.EmptyTypes)?.Invoke(rect, null));
+        int ry = System.Convert.ToInt32(rectType.GetMethod("get_Y",
+            Type.EmptyTypes)?.Invoke(rect, null));
+        int rw = System.Convert.ToInt32(rectType.GetMethod("get_Width",
+            Type.EmptyTypes)?.Invoke(rect, null));
+        int rh = System.Convert.ToInt32(rectType.GetMethod("get_Height",
+            Type.EmptyTypes)?.Invoke(rect, null));
+        if (rx != 0 || ry != 0 || rw != w || rh != h)
+            throw new NotSupportedException(
+                $"effect resume RectInt32 order mismatch ({rx},{ry},{rw},{rh}) vs (0,0,{w},{h})");
+        Type listType = typeof(System.Collections.Generic.List<>).MakeGenericType(rectType);
+        object list = System.Activator.CreateInstance(listType)!;
+        listType.GetMethod("Add")!.Invoke(list, new[] { rect });
+        scanList = list;
+        Type roType = typeof(System.Collections.Generic.IReadOnlyList<>).MakeGenericType(rectType);
+        Type impl = implOpen.MakeGenericType(roType);
+        // ResultValueImpl<T>..ctor(T) is internal live (public on the
+        // unit-test stand-in): take the single-arg ctor regardless of
+        // visibility instead of the public-only Activator path.
+        System.Reflection.ConstructorInfo? ctor = null;
+        foreach (var c in impl.GetConstructors(
+                System.Reflection.BindingFlags.Public
+                | System.Reflection.BindingFlags.NonPublic
+                | System.Reflection.BindingFlags.Instance))
+        {
+            if (c.GetParameters().Length == 1)
+            {
+                ctor = c;
+                break;
+            }
+        }
+        if (ctor is null)
+            throw new NotSupportedException("effect resume needs a ResultValueImpl value ctor");
+        return ctor.Invoke(new object[] { list })!;
+    }
+
+    // Abandoned kernel event handles finalize-crash the browser PAL
+    // (WaitSubsystem.DeleteHandle NRE is fatal on a finalizer thread:
+    // the tab dies at the first gen-2 GC once stroke/tile pressure
+    // trips a collection). The rewrite calls this right after every
+    // PDN `new ManualResetEvent/AutoResetEvent/EventWaitHandle`, so a
+    // handle that is never disposed leaks benignly instead of killing
+    // the session. Safe by construction: Dispose still runs
+    // ReleaseHandle normally (it suppresses the finalizer itself), and
+    // the headless single-threaded paths never wait on these events.
+    // Mutexes/semaphores are deliberately excluded (abandonment has
+    // ownership semantics; events are pure signaling).
+    public static void DefuseWaitHandle(object? handle)
+    {
+        try
+        {
+            if (handle is not System.Threading.WaitHandle wh)
+                return;
+            try
+            {
+                var h = wh.SafeWaitHandle;
+                if (h is not null)
+                    System.GC.SuppressFinalize(h);
+            }
+            catch
+            {
+            }
+            try
+            {
+                System.GC.SuppressFinalize(wh);
+            }
+            catch
+            {
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    private static object CloneEffectToken(object token)
+    {
+        // Instance CloneT first (test fakes); product tokens clone
+        // through the static CloneableExtensions.CloneT generic.
+        var inst = token.GetType().GetMethod("CloneT", Type.EmptyTypes);
+        if (inst is not null)
+            return inst.Invoke(token, null)!;
+        Type tokenType = token.GetType();
+        // The helper lives wherever the platform put it (Core/Base),
+        // not necessarily beside the token: scan loaded assemblies.
+        System.Type? ext = tokenType.Assembly.GetType("PaintDotNet.CloneableExtensions");
+        if (ext is null)
+        {
+            foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
+            {
+                if (asm.GetName().Name?.StartsWith("PaintDotNet",
+                    System.StringComparison.Ordinal) != true)
+                    continue;
+                try { ext = asm.GetType("PaintDotNet.CloneableExtensions"); }
+                catch { continue; }
+                if (ext is not null)
+                    break;
+            }
+        }
+        if (ext is null)
+            throw new NotSupportedException("effect resume needs CloneableExtensions");
+        var generic = ext.GetMethod("CloneT")
+            ?? throw new NotSupportedException("effect resume needs CloneT");
+        return generic.MakeGenericMethod(tokenType).Invoke(null, new object[] { token })!;
+    }
+
+    private static object GetProp(object target, string getter)
+    {
+        var m = target.GetType().GetMethod(getter, Type.EmptyTypes)
+            ?? throw new NotSupportedException("effect resume needs " + getter);
+        return m.Invoke(target, null)!;
+    }
+
+    // Repeat-effect (Ctrl+F) cache, best-effort after a real apply:
+    // mirrors RunEffectImpl's post-DoEffect bookkeeping.
+    private static void RefreshRepeatEffect(object menu, object effect, object clonedToken)
+    {
+        try
+        {
+            Type mt = menu.GetType();
+            var getEffect = effect.GetType().GetMethod("get_EffectInfo");
+            var populate = mt.GetMethod("PopulateMenu",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (populate is null)
+                return;
+            var infoField = mt.GetField("lastEffectInfo",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            var tokenField = mt.GetField("lastEffectToken",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (infoField is null || tokenField is null || getEffect is null)
+                return;
+            infoField.SetValue(menu, getEffect.Invoke(effect, null));
+            tokenField.SetValue(menu, CloneEffectToken(clonedToken));
+            populate.Invoke(menu, null);
+        }
+        catch
+        {
+        }
+    }
+
+    // CPU tile renderer for GPU effects (Levels first): the product
+    // tile loop reads rendered tiles through Renderer.OnCopyPixels,
+    // which our rewriter routes here. We answer Levels tiles from the
+    // stashed pre-effect surface through the effect token's transfer
+    // function; anything else returns false and the product D2D path
+    // runs as before. All PDN-typed access is reflection-only.
+    private sealed class TileSource
+    {
+        public byte[] Pixels = System.Array.Empty<byte>();
+        public int Width;
+        public int Height;
+        public int Stride;
+    }
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, TileSource> s_tileSources = new();
+
+    public static void NoteTileSource(object? effect, object? surface)
+    {
+        try
+        {
+            if (effect is null || surface is null)
+                return;
+            System.Type st = surface.GetType();
+            int w = System.Convert.ToInt32(st.GetProperty("Width")?.GetValue(surface));
+            int h = System.Convert.ToInt32(st.GetProperty("Height")?.GetValue(surface));
+            int stride = System.Convert.ToInt32(st.GetProperty("Stride")?.GetValue(surface));
+            if (w <= 0 || h <= 0 || stride < w * 4)
+                return;
+            var addr = st.GetMethod("GetPointAddress", new[] { typeof(int), typeof(int) });
+            if (addr is null)
+                return;
+            IntPtr scan0 = UnboxPointer(addr.Invoke(surface, new object[] { 0, 0 }));
+            if (scan0 == IntPtr.Zero)
+                return;
+            byte[] pixels = new byte[stride * h];
+            System.Runtime.InteropServices.Marshal.Copy(scan0, pixels, 0, pixels.Length);
+            NoteTileSourceBytes(effect, pixels, w, h, stride);
+        }
+        catch
+        {
+        }
+    }
+
+    public static void NoteTileSourceBytes(object effect, byte[] pixels, int w, int h, int stride)
+    {
+        lock (s_tileSources)
+        {
+            s_tileSources.Remove(effect);
+            s_tileSources.Add(effect, new TileSource { Pixels = pixels, Width = w, Height = h, Stride = stride });
+        }
+    }
+
+    public static double SrgbByteToLinear(int c)
+    {
+        double s = c / 255.0;
+        return s <= 0.04045 ? s / 12.92 : System.Math.Pow((s + 0.055) / 1.055, 2.4);
+    }
+
+    public static byte LinearToSrgbByte(double l)
+    {
+        double s = l <= 0.0031308 ? 12.92 * l : 1.055 * System.Math.Pow(l, 1.0 / 2.4) - 0.055;
+        int b = (int)System.Math.Round(s * 255.0);
+        return (byte)(b < 0 ? 0 : b > 255 ? 255 : b);
+    }
+
+    public static double SrgbFloatToLinear(double s)
+    {
+        return s <= 0.04045 ? s / 12.92 : System.Math.Pow((s + 0.055) / 1.055, 2.4);
+    }
+
+    // One transfer-function channel. Conventions (v2, documented):
+    // ApplyLevelsChannel itself works in linear-light 0..1, but the
+    // LevelsParameters token floats are sRGB 0..1 (exactly what the
+    // dialog shows): the tile renderer linearizes the black/white
+    // points at the boundary below. v1 wrongly fed the sRGB token
+    // values as linear divisors (live oracle: white=100 mapped 85 to
+    // 132 instead of 220). Gamma applies as pow(t, 1/gamma) so higher
+    // brightens (Photoshop-compatible); out-of-range clamps;
+    // degenerate input range maps below-low to 0, at-or-above to 1.
+    public static byte ApplyLevelsChannel(double linear, double inBlack, double inWhite, double gamma, double outBlack, double outWhite)
+    {
+        double t = inWhite > inBlack ? (linear - inBlack) / (inWhite - inBlack) : (linear < inBlack ? 0.0 : 1.0);
+        if (t < 0.0) t = 0.0;
+        else if (t > 1.0) t = 1.0;
+        double g = gamma > 0.0 ? 1.0 / gamma : 1.0;
+        double o = outBlack + (outWhite - outBlack) * System.Math.Pow(t, g);
+        return LinearToSrgbByte(o);
+    }
+
+    private static double FloatProp(object target, string name)
+    {
+        object? v = target.GetType().GetProperty(name)?.GetValue(target);
+        return System.Convert.ToDouble(v);
+    }
+
+    private static double ChannelOf(object rgb, int c)
+    {
+        return FloatProp(rgb, c == 0 ? "R" : c == 1 ? "G" : "B");
+    }
+
+    // CPU tile renderer for GPU effects: renders the product renderer's
+    // tile through the effect LUT from the stashed pre-effect surface.
+    public static bool TryRenderGpuTileCpu(object? renderer, object? dst, object? src)
+    {
+        try
+        {
+            if (renderer is null || dst is null || src is null)
+                return false;
+            string? rn = renderer.GetType().FullName;
+            if (rn is null || !rn.Contains("GpuEffect")
+                || (!rn.EndsWith("+Renderer", System.StringComparison.Ordinal)
+                    && !rn.EndsWith("/Renderer", System.StringComparison.Ordinal)))
+                return false;
+            object? owner = null;
+            for (System.Type? ot = renderer.GetType(); ot is not null; ot = ot.BaseType)
+            {
+                var f = ot.GetField("owner",
+                    System.Reflection.BindingFlags.Instance
+                    | System.Reflection.BindingFlags.Public
+                    | System.Reflection.BindingFlags.NonPublic
+                    | System.Reflection.BindingFlags.DeclaredOnly);
+                if (f is not null) { owner = f.GetValue(renderer); break; }
+            }
+            if (owner is null)
+                return false;
+            if (!owner.GetType().Name.Contains("LevelsGpuEffect", System.StringComparison.Ordinal))
+                return false;
+            object? token = null;
+            try
+            {
+                // EffectBase.Token is protected, and GpuEffect<TToken>
+                // shadows it with new: a flat lookup is ambiguous, so
+                // walk most-derived first (the generic token wins).
+                for (System.Type? tt = owner.GetType(); tt is not null; tt = tt.BaseType)
+                {
+                    var tp = tt.GetProperty("Token",
+                        System.Reflection.BindingFlags.Instance
+                        | System.Reflection.BindingFlags.Public
+                        | System.Reflection.BindingFlags.NonPublic
+                        | System.Reflection.BindingFlags.DeclaredOnly);
+                    if (tp is not null) { token = tp.GetValue(owner); break; }
+                }
+            }
+            catch
+            {
+                return false;
+            }
+            if (token is null)
+                return false;
+            object? levels = null;
+            try
+            {
+                levels = token.GetType().GetProperty("Levels")?.GetValue(token);
+            }
+            catch
+            {
+                return false;
+            }
+            if (levels is null)
+                return false;
+            double[] inB = new double[3];
+            double[] inW = new double[3];
+            double[] gam = new double[3];
+            double[] outB = new double[3];
+            double[] outW = new double[3];
+            object? ib = levels.GetType().GetProperty("InputBlackPoint")?.GetValue(levels);
+            object? iw = levels.GetType().GetProperty("InputWhitePoint")?.GetValue(levels);
+            object? gm = levels.GetType().GetProperty("Gamma")?.GetValue(levels);
+            object? ob = levels.GetType().GetProperty("OutputBlackPoint")?.GetValue(levels);
+            object? ow = levels.GetType().GetProperty("OutputWhitePoint")?.GetValue(levels);
+            if (ib is null || iw is null || gm is null || ob is null || ow is null)
+                return false;
+            for (int c = 0; c < 3; c++)
+            {
+                // Token points are sRGB 0..1 (dialog values); the
+                // channel math below is linear-light. Gamma is a
+                // power, encoding-agnostic.
+                inB[c] = SrgbFloatToLinear(ChannelOf(ib, c));
+                inW[c] = SrgbFloatToLinear(ChannelOf(iw, c));
+                gam[c] = ChannelOf(gm, c);
+                outB[c] = SrgbFloatToLinear(ChannelOf(ob, c));
+                outW[c] = SrgbFloatToLinear(ChannelOf(ow, c));
+            }
+            TileSource? ts;
+            lock (s_tileSources)
+            {
+                if (!s_tileSources.TryGetValue(owner, out ts) || ts is null)
+                    return false;
+            }
+            System.Type dt = dst.GetType();
+            int tw = System.Convert.ToInt32(dt.GetProperty("Width")?.GetValue(dst));
+            int th = System.Convert.ToInt32(dt.GetProperty("Height")?.GetValue(dst));
+            int tstride = System.Convert.ToInt32(dt.GetProperty("Stride")?.GetValue(dst));
+            IntPtr dptr = UnboxPointer(dt.GetProperty("Ptr")?.GetValue(dst));
+            System.Type pt = src.GetType();
+            int tx = System.Convert.ToInt32(pt.GetProperty("X")?.GetValue(src));
+            int ty = System.Convert.ToInt32(pt.GetProperty("Y")?.GetValue(src));
+            if (tw <= 0 || th <= 0 || tstride <= 0 || dptr == IntPtr.Zero)
+                return false;
+            if (tx < 0 || ty < 0 || tx + tw > ts.Width || ty + th > ts.Height)
+                return false;
+            byte[] srow = new byte[tw * 4];
+            unsafe
+            {
+                byte* dp = (byte*)dptr.ToPointer();
+                for (int y = 0; y < th; y++)
+                {
+                    System.Buffer.BlockCopy(ts.Pixels, (ty + y) * ts.Stride + tx * 4, srow, 0, srow.Length);
+                    byte* row = dp + (nint)y * (nint)tstride;
+                    for (int x = 0; x < tw; x++)
+                    {
+                        int so = x * 4;
+                        byte b = srow[so];
+                        byte g = srow[so + 1];
+                        byte r = srow[so + 2];
+                        byte a = srow[so + 3];
+                        byte ob2;
+                        byte og;
+                        byte or;
+                        if (a == 0)
+                        {
+                            // Matches the graph's ReplaceTransparent prep:
+                            // void pixels take the output floor.
+                            ob2 = LinearToSrgbByte(outB[0]);
+                            og = LinearToSrgbByte(outB[1]);
+                            or = LinearToSrgbByte(outB[2]);
+                        }
+                        else
+                        {
+                            ob2 = ApplyLevelsChannel(SrgbByteToLinear(b), inB[0], inW[0], gam[0], outB[0], outW[0]);
+                            og = ApplyLevelsChannel(SrgbByteToLinear(g), inB[1], inW[1], gam[1], outB[1], outW[1]);
+                            or = ApplyLevelsChannel(SrgbByteToLinear(r), inB[2], inW[2], gam[2], outB[2], outW[2]);
+                        }
+                        row[so] = ob2;
+                        row[so + 1] = og;
+                        row[so + 2] = or;
+                        row[so + 3] = a;
+                    }
+                }
+            }
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static readonly Dictionary<char, string[]> Font5x7 = new()
     {
         ['A'] = [".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"],

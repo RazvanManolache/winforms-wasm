@@ -295,6 +295,30 @@ public static class AssemblyRewriter
         }
         if (assembly.Name.Name == "paintdotnet")
         {
+            // Effect rendering is single-threaded headless
+            // (Thread.Start is neutered): driver spawn+WaitOne can
+            // never complete, so effect preview/apply silently do
+            // nothing. Run the worker inline (see method).
+            try { EnsureEffectDriverInline(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // ShowDialog returns None immediately headless, so the
+            // run-effect pipeline tears down before OK: note the menu
+            // for the dialog (FormClosed resume applies it; see method).
+            try { EnsureEffectApplyResume(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // Update checks cannot install anything in a browser,
+            // and their abandoned state-machine events (3 per boot)
+            // finalize-crash the browser PAL at the first gen-2 GC
+            // (stroke-allocated pressure trips it ~4 moves in: 3x
+            // WaitSubsystem.DeleteHandle fatals). Skip them (see method).
+            try { EnsureUpdatesDisabled(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
             // Session-prefetch Wait kills history undo headless (see method).
             try { NeutralizeSessionPrefetchWait(module); }
             catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
@@ -325,6 +349,13 @@ public static class AssemblyRewriter
             // PdnCheckBox measure throws inside layout/show and aborts
             // dialog presentation: measure on the CPU instead (see method).
             try { RedirectPdnCheckBoxMeasure(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // The GPU tile reader dies in its .ctor on the null headless
+            // factory: skip just the device span so the CPU tile hook can
+            // serve pixels instead (see method).
+            try { EnsureBitmapSourceCpuTolerant(module); }
             catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
             {
             }
@@ -419,6 +450,20 @@ public static class AssemblyRewriter
             // per-format info (null factory headless): see
             // EnsureCpuVerifyOutputPixelFormat for the CPU-table port.
             try { EnsureCpuVerifyOutputPixelFormat(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+
+            // The OK settle lands after ShowDialog already returned
+            // (immediate None headless): hook FormClosed so the noted
+            // menu reruns the product DoEffect then (see method).
+            try { EnsureEffectDialogResume(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // GPU effect tiles materialize in OnCopyPixels: serve Levels
+            // tiles from the CPU renderer first (see method).
+            try { EnsureGpuTileCpuRender(module, cpuPaintPath); }
             catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
             {
             } }
@@ -516,6 +561,50 @@ public static class AssemblyRewriter
             // registry factories answer null (skipped, no throw) instead
             // of faulting discovery per dialog.
             try { EnsureBundledPluginFactoryNull(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // Undo data must land synchronously headless (see method):
+            // the async persist task never completes without a pump.
+            try { EnsureHistoryPersistSynchronous(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // Pushed mementos are flushed immediately (see method):
+            // headless that eviction loses the only copy (disk persist
+            // is stubbed), so every undo IOEs at get_Object.
+            try { EnsureHistoryFlushRetained(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+        }
+        if (assembly.Name.Name == "PaintDotNet.Runtime")
+        {
+            // Undo reads its memento data through PersistedObject<T>,
+            // whose in-memory side is a SoftReference<T> (strong only
+            // until the first gen-2 GC, weak after) with a gutted disk
+            // fallback (PersistToDisk is a stubbed ret: BinaryFormatter
+            // has no headless backend). Once the target promotes, every
+            // undo dies at get_Object (IOE "current state"). Pin the
+            // target strongly headless (see method): history data then
+            // lives exactly as long as its memento on the undo stack.
+            try { EnsureHistorySoftReferenceStrong(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+        }
+
+        // Runs LAST among the shape-sensitive rules: it only appends
+        // dup + DefuseWaitHandle after event-handle constructions, but
+        // the exact-tail pins above (driver spawn, dialog resume) match
+        // instruction adjacency and must see pristine code first.
+        if (assembly.Name.Name.StartsWith("PaintDotNet", System.StringComparison.OrdinalIgnoreCase)
+            || assembly.Name.Name == "paintdotnet")
+        {
+            // Abandoned kernel event handles finalize-crash the
+            // browser PAL at the first gen-2 GC (see method): defuse
+            // every event-handle construction in every PDN module.
+            try { EnsureWaitHandlesDefused(module, cpuPaintPath); }
             catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
             {
             }
@@ -4010,10 +4099,15 @@ public static class AssemblyRewriter
                         && method.HasBody)
                     {
                         // Icon lettering renders through DirectWrite,
-                        // which is absent headless: short strings draw
-                        // in CpuPaint's embedded 5x7 font (the doubles
-                        // overload delegates here, so one rule covers
-                        // both; draw options stay unresolved).
+                        // which is absent headless: the layout is first
+                        // rasterized through the browser text engine
+                        // (TextLayoutRaster reads the layout's own font
+                        // by name, so no PDN bind), tinted and blitted
+                        // by CpuPaint. Only when no raster comes back
+                        // do short strings fall to the embedded 5x7
+                        // font (the doubles overload delegates here, so
+                        // one rule covers both; draw options stay
+                        // unresolved).
                         var fil = method.Body.GetILProcessor();
                         MethodReference? brushCache = null;
                         foreach (var ins in method.Body.Instructions)
@@ -4044,6 +4138,28 @@ public static class AssemblyRewriter
                         var handleRef = new MethodReference(
                             "GetCpuTargetHandle", module.TypeSystem.Int64, cpuCtxRef) { HasThis = true };
                         MethodReference cpuText = ImportCpuPaintMethod(module, cpuPaintPath, "DrawText", 9);
+                        MethodReference cpuBlit = ImportCpuPaintMethod(module, cpuPaintPath, "BlitRaster", 11);
+                        AssemblyNameReference? textDrawingScope = null;
+                        foreach (var tdr in module.AssemblyReferences)
+                        {
+                            if (tdr.Name == "WfWasm.Drawing" || tdr.Name == "System.Drawing" || tdr.Name == "System.Drawing.Common")
+                            { textDrawingScope = tdr; break; }
+                        }
+                        if (textDrawingScope is null)
+                            throw new InvalidOperationException(
+                                "CpuFill: DrawTextLayout drawing scope missing");
+                        var layoutRasterRef = new TypeReference(
+                            "System.Drawing", "LayoutRaster", module, textDrawingScope);
+                        var textRasterRef = new TypeReference(
+                            "System.Drawing", "TextLayoutRaster", module, textDrawingScope);
+                        var tryRaster = new MethodReference(
+                            "TryRasterLayout", layoutRasterRef, textRasterRef) { HasThis = false };
+                        tryRaster.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
+                        tryRaster.Parameters.Add(new ParameterDefinition(module.TypeSystem.Single));
+                        tryRaster.Parameters.Add(new ParameterDefinition(module.TypeSystem.Int32));
+                        var rasterWidthFld = new FieldReference("Width", module.TypeSystem.Int32, layoutRasterRef);
+                        var rasterHeightFld = new FieldReference("Height", module.TypeSystem.Int32, layoutRasterRef);
+                        var rasterRgbaFld = new FieldReference("Rgba", new ArrayType(module.TypeSystem.Byte), layoutRasterRef);
                         MethodReference nseCtor = module.ImportReference(
                             typeof(NotSupportedException).GetConstructor([typeof(string)])!);
                         var brushLoc = new VariableDefinition(method.Parameters[3].ParameterType);
@@ -4059,7 +4175,8 @@ public static class AssemblyRewriter
                         var yLoc = new VariableDefinition(module.TypeSystem.Single);
                         var cpuLoc = new VariableDefinition(cpuCtxRef);
                         var handleLoc = new VariableDefinition(module.TypeSystem.Int64);
-                        foreach (var v in new[] { brushLoc, solidLoc, colorLoc, opLoc, rLoc, gLoc, bLoc, aLoc, xLoc, yLoc, cpuLoc, handleLoc })
+                        var rasterLoc = new VariableDefinition(layoutRasterRef);
+                        foreach (var v in new[] { brushLoc, solidLoc, colorLoc, opLoc, rLoc, gLoc, bLoc, aLoc, xLoc, yLoc, cpuLoc, handleLoc, rasterLoc })
                             method.Body.Variables.Add(v);
                         method.Body.InitLocals = true;
                         method.Body.ExceptionHandlers.Clear();
@@ -4109,6 +4226,31 @@ public static class AssemblyRewriter
                         fil.Emit(OpCodes.Ldloc, cpuLoc);
                         fil.Emit(OpCodes.Callvirt, handleRef);
                         fil.Emit(OpCodes.Stloc, handleLoc);
+                        var useCpuText = fil.Create(OpCodes.Nop);
+                        fil.Emit(OpCodes.Ldarg_2);
+                        fil.Emit(OpCodes.Ldc_R4, 96f);
+                        fil.Emit(OpCodes.Ldc_I4, 2048);
+                        fil.Emit(OpCodes.Call, tryRaster);
+                        fil.Emit(OpCodes.Stloc, rasterLoc);
+                        fil.Emit(OpCodes.Ldloc, rasterLoc);
+                        fil.Emit(OpCodes.Brfalse, useCpuText);
+                        fil.Emit(OpCodes.Ldloc, handleLoc);
+                        fil.Emit(OpCodes.Ldloc, rasterLoc);
+                        fil.Emit(OpCodes.Ldfld, rasterRgbaFld);
+                        fil.Emit(OpCodes.Ldloc, rasterLoc);
+                        fil.Emit(OpCodes.Ldfld, rasterWidthFld);
+                        fil.Emit(OpCodes.Ldloc, rasterLoc);
+                        fil.Emit(OpCodes.Ldfld, rasterHeightFld);
+                        fil.Emit(OpCodes.Ldloc, xLoc);
+                        fil.Emit(OpCodes.Ldloc, yLoc);
+                        fil.Emit(OpCodes.Ldloc, opLoc);
+                        fil.Emit(OpCodes.Ldloc, rLoc);
+                        fil.Emit(OpCodes.Ldloc, gLoc);
+                        fil.Emit(OpCodes.Ldloc, bLoc);
+                        fil.Emit(OpCodes.Ldloc, aLoc);
+                        fil.Emit(OpCodes.Call, cpuBlit);
+                        fil.Emit(OpCodes.Ret);
+                        fil.Append(useCpuText);
                         fil.Emit(OpCodes.Ldloc, handleLoc);
                         fil.Emit(OpCodes.Ldarg_2);
                         fil.Emit(OpCodes.Ldloc, xLoc);
@@ -5923,6 +6065,13 @@ public static class AssemblyRewriter
             impl.Body.MaxStackSize = 32;
             type.Methods.Add(impl);
         }
+        // IObjectRef answers: EffectInputAccessor.Set routes every crop
+        // input through SetInput -> CreateRef(IObjectRef), which throws
+        // ObjectDisposed when TryCreateRef answers null (observed live:
+        // ColorGradient/Rectangle/PaletteCommandList inputs died with ODE
+        // although nothing was ever disposed). Every sibling stand-in
+        // answers itself here; the list was the only one missing it.
+        AddCpuObjectRef(type, module);
         module.Types.Add(type);
         return type;
     }
@@ -6697,7 +6846,7 @@ public static class AssemblyRewriter
     // the DeviceEffect wrapper); value Set/Get are inert no-ops (the
     // CPU stamp paths use classic defaults, never the device bag);
     // property metadata answers empty; factory/COM members stay loud.
-    private static TypeDefinition SynthesizeCpuDeviceEffect(ModuleDefinition module)
+    private static TypeDefinition SynthesizeCpuDeviceEffect(ModuleDefinition module, string? cpuPaintPath)
     {
         TypeReference iface = LocalOrOwnedCpuRef(module, "PaintDotNet.Direct2D1.IDeviceEffect");
         TypeDefinition ifaceDef = ResolveCpuDef(iface);
@@ -6716,6 +6865,7 @@ public static class AssemblyRewriter
             module.TypeSystem.Object);
         type.Interfaces.Add(new InterfaceImplementation(iface));
         var inputsField = new FieldDefinition("_inputs", FieldAttributes.Private, htRef);
+        var keptField = new FieldDefinition("_kept", FieldAttributes.Private, htRef);
         var inputCountField = new FieldDefinition("_inputCount", FieldAttributes.Private, module.TypeSystem.Int32);
         // No disposed flag: ByRefHandle<T>.Dispose releases a borrowed
         // grant on every accessor Set/Get, so a destroyed flag would
@@ -6723,6 +6873,7 @@ public static class AssemblyRewriter
         // only (GC reclaims); Dispose is a silent no-op like the color
         // context below.
         type.Fields.Add(inputsField);
+        type.Fields.Add(keptField);
         type.Fields.Add(inputCountField);
         MethodReference objectCtor =
             module.ImportReference(typeof(object).GetConstructor(Type.EmptyTypes)!);
@@ -6737,6 +6888,9 @@ public static class AssemblyRewriter
         ccil.Emit(OpCodes.Ldarg_0);
         ccil.Emit(OpCodes.Newobj, htCtor);
         ccil.Emit(OpCodes.Stfld, inputsField);
+        ccil.Emit(OpCodes.Ldarg_0);
+        ccil.Emit(OpCodes.Newobj, htCtor);
+        ccil.Emit(OpCodes.Stfld, keptField);
         ccil.Emit(OpCodes.Ret);
         ctor.Body.MaxStackSize = 32;
         type.Methods.Add(ctor);
@@ -6793,12 +6947,67 @@ public static class AssemblyRewriter
             }
             else if (contract.Name == "SetInput" && contract.Parameters.Count == 3)
             {
+                // Ownership: the effect retains its inputs (desktop D2D
+                // AddRefs through COM). Without this, CreateImpl's tile
+                // loop frees the shared bitmap while the processed
+                // effect still references it (blank wheel: render ran,
+                // upload had a zero handle, only the nub painted).
+                // The grant lives in _kept; _inputs keeps the ORIGINAL
+                // (GetInput callers may dispose what it returns, so it
+                // must stay identity-stable). Grants are ours alone:
+                // each pairs with exactly one overwrite-release, so PDN
+                // disposing the original can never double-release.
+                // Dispose stays a no-op: grants held past the effect's
+                // managed death leak one bitmap per effect lifetime
+                // (bounded: effects die on resource invalidation).
+                TypeDefinition orExtDef = ResolveExternalDef(module, "PaintDotNet.ComponentModel", "PaintDotNet.ComponentModel.ObjectRefExtensions");
+                MethodDefinition createRefDef = orExtDef.Methods.First(mm => mm.Name == "CreateRef" && !mm.HasGenericParameters && mm.Parameters.Count == 1 && mm.Parameters[0].ParameterType.FullName == "PaintDotNet.ComponentModel.IObjectRef");
+                MethodReference createRef = module.ImportReference(createRefDef);
+                MethodReference dispDispose = module.ImportReference(typeof(IDisposable).GetMethod("Dispose", Type.EmptyTypes)!);
+                TypeReference dispRef = module.ImportReference(typeof(IDisposable));
+                var oldLoc = new VariableDefinition(module.TypeSystem.Object);
+                var newLoc = new VariableDefinition(module.TypeSystem.Object);
+                impl.Body.Variables.Add(oldLoc);
+                impl.Body.Variables.Add(newLoc);
+                impl.Body.InitLocals = true;
+                var noRetain = body.Create(OpCodes.Nop);
+                var stored = body.Create(OpCodes.Nop);
+                var released = body.Create(OpCodes.Nop);
+                body.Emit(OpCodes.Ldarg_0);
+                body.Emit(OpCodes.Ldfld, keptField);
+                body.Emit(OpCodes.Ldarg_1);
+                body.Emit(OpCodes.Box, module.TypeSystem.Int32);
+                body.Emit(OpCodes.Callvirt, htGet);
+                body.Emit(OpCodes.Stloc, oldLoc);
+                body.Emit(OpCodes.Ldarg_2);
+                body.Emit(OpCodes.Brfalse, noRetain);
+                body.Emit(OpCodes.Ldarg_2);
+                body.Emit(OpCodes.Call, createRef);
+                body.Emit(OpCodes.Stloc, newLoc);
+                body.Emit(OpCodes.Br, stored);
+                body.Append(noRetain);
+                body.Emit(OpCodes.Ldnull);
+                body.Emit(OpCodes.Stloc, newLoc);
+                body.Append(stored);
+                body.Emit(OpCodes.Ldarg_0);
+                body.Emit(OpCodes.Ldfld, keptField);
+                body.Emit(OpCodes.Ldarg_1);
+                body.Emit(OpCodes.Box, module.TypeSystem.Int32);
+                body.Emit(OpCodes.Ldloc, newLoc);
+                body.Emit(OpCodes.Callvirt, htSet);
                 body.Emit(OpCodes.Ldarg_0);
                 body.Emit(OpCodes.Ldfld, inputsField);
                 body.Emit(OpCodes.Ldarg_1);
                 body.Emit(OpCodes.Box, module.TypeSystem.Int32);
                 body.Emit(OpCodes.Ldarg_2);
                 body.Emit(OpCodes.Callvirt, htSet);
+                body.Emit(OpCodes.Ldloc, oldLoc);
+                body.Emit(OpCodes.Isinst, dispRef);
+                body.Emit(OpCodes.Brfalse, released);
+                body.Emit(OpCodes.Ldloc, oldLoc);
+                body.Emit(OpCodes.Isinst, dispRef);
+                body.Emit(OpCodes.Callvirt, dispDispose);
+                body.Append(released);
                 body.Emit(OpCodes.Ret);
             }
             else if (contract.Name == "get_PropertyCount" && contract.Parameters.Count == 0)
@@ -7322,20 +7531,36 @@ public static class AssemblyRewriter
 
     // WIC imaging shortcuts: the factory instance is null headless,
     // so every terminal clip/transform answers its source bitmap.
-    // Refcounted custody keeps the shared instance alive; color work
-    // is identity without a device. Only exact-signature matches are
-    // touched; anything else keeps its body (and its exception).
+    // The answer is a COUNTED ref (CreateRef): callers own the
+    // returned clip and dispose it (CreateImpl tile loop, using
+    // blocks, RefHandles). A bare alias lets one Dispose pool-return
+    // a live bitmap (source-kill) or free a wrapper its own pipeline
+    // still reads (use-after-free NRE in ReinterpretedBitmapSource).
+    // Color work is identity without a device. Only exact-signature
+    // matches are touched; anything else keeps its body (and its
+    // exception).
     private static void EnsureCpuImagingShortcuts(ModuleDefinition module)
     {
         TypeDefinition Bse(string asm, string type) => ResolveExternalDef(module, asm, type);
-        void Identity(MethodDefinition m, int sourceIndex, bool castToReturn)
+        // Lazy: fixtures renamed to a PDN assembly name (Friends test)
+        // carry no ComponentModel reference, and they never reach a
+        // matching method, so resolve only on first actual use.
+        Mono.Cecil.MethodReference? openRefImp = null;
+        void Identity(MethodDefinition m, int sourceIndex)
         {
             m.Body.ExceptionHandlers.Clear();
             m.Body.Instructions.Clear();
+            if (openRefImp is null)
+            {
+                TypeDefinition orExt = ResolveExternalDef(module, "PaintDotNet.ComponentModel", "PaintDotNet.ComponentModel.ObjectRefExtensions");
+                MethodDefinition openRef = orExt.Methods.First(mm => mm.Name == "CreateRef" && mm.HasGenericParameters && mm.Parameters.Count == 1);
+                openRefImp = module.ImportReference(openRef);
+            }
+            var gim = new Mono.Cecil.GenericInstanceMethod(openRefImp);
+            gim.GenericArguments.Add(module.ImportReference(m.ReturnType));
             var il = m.Body.GetILProcessor();
             il.Emit(sourceIndex == 0 ? OpCodes.Ldarg_0 : OpCodes.Ldarg_1);
-            if (castToReturn)
-                il.Emit(OpCodes.Castclass, m.ReturnType);
+            il.Emit(OpCodes.Call, gim);
             il.Emit(OpCodes.Ret);
             if (m.Body.MaxStackSize < 8)
                 m.Body.MaxStackSize = 8;
@@ -7346,9 +7571,9 @@ public static class AssemblyRewriter
         foreach (var m in bse.Methods)
         {
             if (m.Name == "CreateClipper" && Sig(m, "PaintDotNet.Imaging.IBitmapSource", 2))
-                Identity(m, 0, false);
+                Identity(m, 0);
             if (m.Name == "CreateColorTransformer" && Sig(m, "PaintDotNet.Imaging.IBitmapSource", 4))
-                Identity(m, 0, false);
+                Identity(m, 0);
         }
         TypeDefinition ife = module.GetType("PaintDotNet.Imaging.ImagingFactoryExtensions") ?? throw new InvalidOperationException("CpuPaint: ImagingFactoryExtensions missing");
         foreach (var m in ife.Methods)
@@ -7356,21 +7581,21 @@ public static class AssemblyRewriter
             if (m.Name == "CreateBitmapClipper"
                 && m.Parameters.Count == 3
                 && m.Parameters[0].ParameterType.FullName == "PaintDotNet.Imaging.IImagingFactory")
-                Identity(m, 1, false);
+                Identity(m, 1);
             if (m.Name == "CreateColorTransformedBitmap"
                 && m.Parameters.Count == 5
                 && m.Parameters[0].ParameterType.FullName == "PaintDotNet.Imaging.IImagingFactory")
-                Identity(m, 1, false);
+                Identity(m, 1);
             if (m.Name == "CreateColorTransformedBitmap"
                 && m.Parameters.Count == 4
                 && m.Parameters[0].ParameterType.FullName == "PaintDotNet.Imaging.IImagingFactory"
                 && m.Parameters[2].ParameterType.FullName == "PaintDotNet.Imaging.IColorContext")
-                Identity(m, 1, true);
+                Identity(m, 1);
             if (m.Name == "CreateColorTransformedBitmap"
                 && m.Parameters.Count == 4
                 && m.Parameters[0].ParameterType.FullName == "PaintDotNet.Imaging.IImagingFactory"
                 && m.Parameters[2].ParameterType.FullName == "PaintDotNet.Imaging.IColorProfile")
-                Identity(m, 1, true);
+                Identity(m, 1);
         }
     }
     // PaintDotNet's environment-inventory diagnostics (DiagnosticsGenerator.
@@ -8679,73 +8904,6 @@ public static class AssemblyRewriter
         if (target.Body.MaxStackSize < 8)
             target.Body.MaxStackSize = 8;
     }
-    // BitmapImage.CreateReinterpretedBitmap answers the source: see
-    // the Windows.Framework gate above for why the wrapper is skipped.
-    private static void EnsureCpuReinterpretIdentity(ModuleDefinition module)
-    {
-        TypeDefinition img = module.GetType("PaintDotNet.Direct2D1.BitmapImage")
-            ?? throw new InvalidOperationException("CpuPaint: BitmapImage missing");
-        foreach (var m in img.Methods)
-        {
-            if (m.Name != "CreateReinterpretedBitmap" || !m.HasBody)
-                continue;
-            if (m.Parameters.Count != 2
-                || m.ReturnType.FullName != "PaintDotNet.Imaging.IBitmapSource")
-                continue;
-            m.Body.ExceptionHandlers.Clear();
-            m.Body.Variables.Clear();
-            m.Body.Instructions.Clear();
-            var il = m.Body.GetILProcessor();
-            il.Emit(OpCodes.Ldarg_0);
-            il.Emit(OpCodes.Ret);
-            if (m.Body.MaxStackSize < 8)
-                m.Body.MaxStackSize = 8;
-        }
-    }
-    // CreateImpl wraps the reinterpreted tile source in
-    // RefHandle<IBitmapSource>(ownsRef: true) and disposes it after
-    // tiling. That custody is only sound for a fresh wrapper; the
-    // identity above answers the caller-owned bitmap, so the dispose
-    // pool-returns a live source and every later tile lock reads
-    // empty (large uploads fail while small ones survive on spare
-    // refs). The sibling branches already wrap the source with
-    // ownsRef: false, so the single ownsRef: true site is flipped
-    // to match. Any other site count aborts loudly.
-    private static void EnsureCpuReinterpretCustody(ModuleDefinition module)
-    {
-        TypeDefinition img = module.GetType("PaintDotNet.Direct2D1.BitmapImage")
-            ?? throw new InvalidOperationException("CpuPaint: BitmapImage missing");
-        var matches = new System.Collections.Generic.List<MethodDefinition>();
-        foreach (var m in img.Methods)
-        {
-            if (m.Name != "CreateImpl" || !m.HasBody)
-                continue;
-            if (m.Parameters.Count != 5
-                || m.ReturnType.FullName != "PaintDotNet.Direct2D1.BitmapImage")
-                continue;
-            matches.Add(m);
-        }
-        if (matches.Count != 1)
-            throw new InvalidOperationException("CpuPaint: BitmapImage.CreateImpl x" + matches.Count);
-        int flipped = 0;
-        var insns = matches[0].Body.Instructions;
-        for (int i = 1; i < insns.Count; i++)
-        {
-            if (insns[i].OpCode != OpCodes.Newobj)
-                continue;
-            if (insns[i].Operand is not MethodReference ctor || ctor.Name != ".ctor")
-                continue;
-            if (!ctor.DeclaringType.FullName.StartsWith("PaintDotNet.ComponentModel.RefHandle`1", System.StringComparison.Ordinal))
-                continue;
-            if (insns[i - 1].OpCode == OpCodes.Ldc_I4_1)
-            {
-                insns[i - 1].OpCode = OpCodes.Ldc_I4_0;
-                flipped++;
-            }
-        }
-        if (flipped != 1)
-            throw new InvalidOperationException("CpuPaint: CreateImpl RefHandle custody sites=" + flipped);
-    }
     // BitmapImage.PostProcessImage answers its image: the tail is an
     // EnsurePrecision + PremultiplyEffect device chain whose factory
     // (CpuDrawingContext.CreateEffect) has no headless backend, so no
@@ -8753,6 +8911,685 @@ public static class AssemblyRewriter
     // device concerns; CPU bitmaps upload as-is (same identity
     // rationale as the clipper/transform shortcuts). Blending fidelity
     // of unpremultiplied sources is revisited once pixels flow.
+    // Effect rendering is single-threaded headless (Thread.Start is
+    // neutered): EffectDriver.Start's spawn+WaitOne handshake can never
+    // complete, so effect preview and apply silently do nothing (Levels
+    // OK closes the dialog with zero canvas change, zero errors). Run
+    // the worker inline on the caller thread instead, and run the tile
+    // pool Enqueue inline with its Joins popped (each tile finishes
+    // before Enqueue returns, so the waits are vacuous). One generic
+    // base patch covers Classic and Bitmap drivers.
+    private static bool IsBranchOp(OpCode op)
+    {
+        switch (op.Code.ToString())
+        {
+            case "Br": case "Br_S":
+            case "Brfalse": case "Brfalse_S":
+            case "Brtrue": case "Brtrue_S":
+            case "Beq": case "Beq_S":
+            case "Bge": case "Bge_S": case "Bge_Un": case "Bge_Un_S":
+            case "Bgt": case "Bgt_S": case "Bgt_Un": case "Bgt_Un_S":
+            case "Ble": case "Ble_S": case "Ble_Un": case "Ble_Un_S":
+            case "Blt": case "Blt_S": case "Blt_Un": case "Blt_Un_S":
+            case "Bne_Un": case "Bne_Un_S":
+            case "Leave": case "Leave_S":
+            case "Jmp": case "Switch":
+            case "Throw": case "Rethrow":
+            case "Endfilter": case "Endfinally":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // The GPU tile reader builds a device-backed buffer in its .ctor and
+    // dies headless on the null factory (CreateRef(null) in
+    // BufferedDeviceContext..ctor). Guard just the device span: with a
+    // null factory the field stays null and construction succeeds; the
+    // CPU tile hook below serves pixels instead, and Dispose frees null
+    // safely. The span is straight-line (asserted): ldarg.0, ldarg.1,
+    // ... newobj BufferedDeviceContext, stfld.
+    private static void EnsureBitmapSourceCpuTolerant(ModuleDefinition module)
+    {
+        TypeDefinition src = module.GetType("PaintDotNet.Direct2D1.Direct2DBitmapSourceBgra32")
+            ?? throw new InvalidOperationException("CpuFx: Direct2DBitmapSourceBgra32 missing");
+        MethodDefinition ctor = src.Methods
+            .FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 5 && m.HasBody)
+            ?? throw new InvalidOperationException("CpuFx: bitmap source .ctor missing");
+        var sins = ctor.Body.Instructions;
+        int jni = -1;
+        for (int k = 0; k < sins.Count; k++)
+        {
+            if (sins[k].OpCode == OpCodes.Newobj
+                && sins[k].Operand is MethodReference nmr
+                && nmr.DeclaringType.FullName == "PaintDotNet.Direct2D1.BufferedDeviceContext")
+            { jni = k; break; }
+        }
+        if (jni < 0 || jni + 1 >= sins.Count)
+            throw new InvalidOperationException("CpuFx: buffered context creation missing");
+        if (!(sins[jni + 1].Operand is FieldReference sfr) || sfr.Name != "bufferedDeviceContext")
+            throw new InvalidOperationException("CpuFx: buffered context store missing");
+        int span = jni;
+        while (span > 0 && sins[span - 1].OpCode != OpCodes.Pop)
+            span--;
+        if (span + 1 >= jni || sins[span].OpCode != OpCodes.Ldarg_0 || sins[span + 1].OpCode != OpCodes.Ldarg_1)
+            throw new InvalidOperationException("CpuFx: bitmap source device span shape changed");
+        for (int k = span; k <= jni + 1; k++)
+        {
+            if (IsBranchOp(sins[k].OpCode))
+                throw new InvalidOperationException("CpuFx: bitmap source device span not straight-line");
+        }
+        foreach (var h in ctor.Body.ExceptionHandlers)
+        {
+            foreach (var edge in new[] { h.TryStart, h.TryEnd, h.HandlerStart, h.HandlerEnd, h.FilterStart })
+            {
+                if (edge is null)
+                    continue;
+                for (int k = span; k <= jni + 1; k++)
+                {
+                    if (edge == sins[k])
+                        throw new InvalidOperationException("CpuFx: handler edge inside device span");
+                }
+            }
+        }
+        Instruction skip = sins[jni + 2];
+        var sil = ctor.Body.GetILProcessor();
+        Instruction anchor = sins[span];
+        sil.InsertBefore(anchor, sil.Create(OpCodes.Ldarg_1));
+        sil.InsertBefore(anchor, sil.Create(OpCodes.Brfalse_S, skip));
+        if (ctor.Body.MaxStackSize < 2)
+            ctor.Body.MaxStackSize = 2;
+    }
+
+    // GPU effect tiles materialize as CPU pixels in OnCopyPixels. Route
+    // them through the CPU tile renderer first (Levels today, others
+    // fall back to the product path): ldarg.0/1/2, box the value-type
+    // tile args, call, brfalse into the original body, ret on handled.
+    // The prefix sits before the handler-protected body (branching into
+    // a try is legal; the prefix itself is outside every handler).
+    private static void EnsureGpuTileCpuRender(ModuleDefinition module, string? cpuPaintPath)
+    {
+        TypeDefinition renderer = module.GetType("PaintDotNet.Effects.Gpu.GpuEffect/Renderer")
+            ?? throw new InvalidOperationException("CpuFx: GpuEffect Renderer missing");
+        MethodDefinition copy = renderer.Methods
+            .FirstOrDefault(m => m.Name == "OnCopyPixels" && m.Parameters.Count == 2 && m.HasBody)
+            ?? throw new InvalidOperationException("CpuFx: Renderer.OnCopyPixels missing");
+        if (!copy.Parameters[0].ParameterType.FullName.Contains("RegionPtr")
+            || !copy.Parameters[1].ParameterType.FullName.Contains("Point2Int32"))
+            throw new InvalidOperationException("CpuFx: Renderer.OnCopyPixels shape changed");
+        MethodReference render = ImportCpuPaintMethod(module, cpuPaintPath, "TryRenderGpuTileCpu", 3);
+        var sil = copy.Body.GetILProcessor();
+        Instruction anchor = copy.Body.Instructions[0];
+        sil.InsertBefore(anchor, sil.Create(OpCodes.Ldarg_0));
+        sil.InsertBefore(anchor, sil.Create(OpCodes.Ldarg_1));
+        sil.InsertBefore(anchor, sil.Create(OpCodes.Box, copy.Parameters[0].ParameterType));
+        sil.InsertBefore(anchor, sil.Create(OpCodes.Ldarg_2));
+        sil.InsertBefore(anchor, sil.Create(OpCodes.Box, copy.Parameters[1].ParameterType));
+        sil.InsertBefore(anchor, sil.Create(OpCodes.Call, render));
+        sil.InsertBefore(anchor, sil.Create(OpCodes.Brfalse_S, anchor));
+        sil.InsertBefore(anchor, sil.Create(OpCodes.Ret));
+        if (copy.Body.MaxStackSize < 4)
+            copy.Body.MaxStackSize = 4;
+    }
+
+    private static void EnsureEffectDriverInline(ModuleDefinition module)
+    {
+        TypeDefinition driver = module.GetType("PaintDotNet.Effects.EffectDriver`1")
+            ?? throw new InvalidOperationException("CpuFx: EffectDriver`1 missing");
+        MethodDefinition start = driver.Methods
+            .FirstOrDefault(m => m.Name == "Start" && m.Parameters.Count == 1 && m.HasBody)
+            ?? throw new InvalidOperationException("CpuFx: EffectDriver.Start missing");
+        var sins = start.Body.Instructions;
+        int startCall = -1;
+        for (int k = 0; k < sins.Count; k++)
+        {
+            if (sins[k].OpCode == OpCodes.Callvirt
+                && sins[k].Operand is MethodReference smr
+                && smr.DeclaringType.FullName == "System.Threading.Thread"
+                && smr.Name == "Start")
+                startCall = k;
+        }
+        if (startCall < 0)
+            throw new InvalidOperationException("CpuFx: EffectDriver.Start spawn missing");
+        // Pristine tail shape: ldarg.0, ldarg.0, ldftn ThreadFunction,
+        // newobj ThreadStart, newobj Thread, stfld thread, ldarg.0,
+        // ldfld thread, ldstr, callvirt set_Name, ldarg.0, ldc.i4.0,
+        // newobj ManualResetEvent, stfld threadInitialized, ldarg.0,
+        // ldfld thread, callvirt Start, ldarg.0, ldfld threadInitialized,
+        // callvirt WaitOne, pop (the Close/null/ret after stays: the
+        // event still exists for it). The doomed range MUST include the
+        // Thread construction: leaving newobj Thread behind leaves two
+        // values on the stack at ret (InvalidProgram in Start, observed
+        // live as the Levels DoEffect Shown-handler death).
+        int tail = startCall - 11;
+        if (tail < 5)
+            throw new InvalidOperationException("CpuFx: EffectDriver.Start shape short");
+        if (sins[tail - 5].OpCode != OpCodes.Ldarg_0
+            || sins[tail - 4].OpCode != OpCodes.Ldarg_0)
+            throw new InvalidOperationException("CpuFx: EffectDriver.Start spawn/delegate object missing");
+        if (sins[tail - 3].OpCode != OpCodes.Ldftn
+            || !(sins[tail - 3].Operand is MethodReference fnRef)
+            || fnRef.Name != "ThreadFunction")
+            throw new InvalidOperationException("CpuFx: EffectDriver.Start threadfn missing");
+        foreach (int ni in new[] { tail - 2, tail - 1 })
+        {
+            if (sins[ni].OpCode != OpCodes.Newobj
+                || !(sins[ni].Operand is MethodReference nctor))
+                throw new InvalidOperationException("CpuFx: EffectDriver.Start thread construction missing");
+        }
+        AssertFxOp(sins[tail], OpCodes.Stfld, "thread");
+        AssertFxOp(sins[tail + 4], OpCodes.Callvirt, "set_Name");
+        if (sins[tail + 7].OpCode != OpCodes.Newobj
+            || !(sins[tail + 7].Operand is MethodReference mreCtor)
+            || mreCtor.DeclaringType.FullName != "System.Threading.ManualResetEvent")
+            throw new InvalidOperationException("CpuFx: EffectDriver.Start event missing");
+        AssertFxOp(sins[tail + 8], OpCodes.Stfld, "threadInitialized");
+        AssertFxOp(sins[startCall + 3], OpCodes.Callvirt, "WaitOne");
+        if (sins[startCall + 4].OpCode != OpCodes.Pop)
+            throw new InvalidOperationException("CpuFx: EffectDriver.Start wait-pop missing");
+        Instruction firstDoomed = sins[tail - 5];
+        Instruction lastDoomed = sins[startCall + 4];
+        AssertFxRangeFree(start, firstDoomed, lastDoomed);
+        MethodReference? onStarting = null;
+        foreach (var ins in sins)
+        {
+            if ((ins.OpCode == OpCodes.Call || ins.OpCode == OpCodes.Callvirt)
+                && ins.Operand is MethodReference omr
+                && omr.Name == "OnStartingRendering")
+                onStarting = omr;
+        }
+        if (onStarting is null)
+            throw new InvalidOperationException("CpuFx: EffectDriver.OnStartingRendering missing");
+        var threadFn = new MethodReference(
+            "ThreadFunction", module.TypeSystem.Void, onStarting.DeclaringType) { HasThis = true };
+        var sil = start.Body.GetILProcessor();
+        var n1 = sil.Create(OpCodes.Ldarg_0);
+        var n2 = sil.Create(OpCodes.Ldc_I4_0);
+        var n3 = sil.Create(OpCodes.Newobj, mreCtor);
+        var n4 = sil.Create(OpCodes.Stfld, (FieldReference)sins[tail + 8].Operand);
+        var n5 = sil.Create(OpCodes.Ldarg_0);
+        var n6 = sil.Create(OpCodes.Call, threadFn);
+        sil.InsertBefore(firstDoomed, n1);
+        sil.InsertBefore(firstDoomed, n2);
+        sil.InsertBefore(firstDoomed, n3);
+        sil.InsertBefore(firstDoomed, n4);
+        sil.InsertBefore(firstDoomed, n5);
+        sil.InsertBefore(firstDoomed, n6);
+        var doomed = new System.Collections.Generic.List<Instruction>();
+        bool inRange = false;
+        foreach (var ins in sins)
+        {
+            if (ins == firstDoomed)
+                inRange = true;
+            if (inRange)
+                doomed.Add(ins);
+            if (ins == lastDoomed)
+                break;
+        }
+        foreach (var d in doomed)
+            sil.Remove(d);
+        if (start.Body.MaxStackSize < 8)
+            start.Body.MaxStackSize = 8;
+        // ThreadFunction pool Joins are vacuous once Enqueue runs inline.
+        MethodDefinition worker = driver.Methods
+            .FirstOrDefault(m => m.Name == "ThreadFunction" && m.HasBody)
+            ?? throw new InvalidOperationException("CpuFx: EffectDriver.ThreadFunction missing");
+        var joins = new System.Collections.Generic.List<Instruction>();
+        foreach (var ins in worker.Body.Instructions)
+        {
+            if (ins.OpCode == OpCodes.Callvirt
+                && ins.Operand is MethodReference jmr
+                && jmr.Name == "Join"
+                && jmr.DeclaringType.FullName == "PaintDotNet.Effects.EffectRendererWorkItemQueue")
+                joins.Add(ins);
+        }
+        if (joins.Count != 3)
+            throw new InvalidOperationException($"CpuFx: ThreadFunction joins changed ({joins.Count})");
+        var wil = worker.Body.GetILProcessor();
+        foreach (var j in joins)
+            wil.Replace(j, wil.Create(OpCodes.Pop));
+        // Tile Enqueue runs the tile synchronously on the caller.
+        TypeDefinition queue = module.GetType("PaintDotNet.Effects.EffectRendererWorkItemQueue")
+            ?? throw new InvalidOperationException("CpuFx: EffectRendererWorkItemQueue missing");
+        MethodDefinition enqueue = queue.Methods
+            .FirstOrDefault(m => m.Name == "Enqueue" && m.Parameters.Count == 1 && m.HasBody)
+            ?? throw new InvalidOperationException("CpuFx: tile Enqueue missing");
+        bool sawValidate = false;
+        TypeReference? actionScope = null;
+        bool sawNotify = false;
+        foreach (var ins in enqueue.Body.Instructions)
+        {
+            if (ins.Operand is MethodReference emr)
+            {
+                if (emr.Name == "IsNotNull")
+                    sawValidate = true;
+                if (emr.DeclaringType is GenericInstanceType queueGit
+                    && queueGit.ElementType.FullName == "System.Collections.Concurrent.ConcurrentQueue`1"
+                    && emr.Name == "Enqueue"
+                    && queueGit.GenericArguments.Count == 1)
+                    actionScope = queueGit.GenericArguments[0];
+                if (emr.Name == "UpdateNotifyWorkItemsQueued")
+                    sawNotify = true;
+            }
+        }
+        if (!sawValidate || actionScope is null || !sawNotify)
+            throw new InvalidOperationException("CpuFx: tile Enqueue shape changed");
+        // System.Action arrives via the queue's own generic argument
+        // (System.Runtime forwarders on modern targets, mscorlib on
+        // netfx): reuse that exact scope instead of guessing one.
+        var invokeRef = new MethodReference("Invoke", module.TypeSystem.Void, actionScope) { HasThis = true };
+        enqueue.Body.ExceptionHandlers.Clear();
+        enqueue.Body.Variables.Clear();
+        enqueue.Body.Instructions.Clear();
+        var eil = enqueue.Body.GetILProcessor();
+        eil.Emit(OpCodes.Ldarg_1);
+        eil.Emit(OpCodes.Callvirt, invokeRef);
+        eil.Emit(OpCodes.Ret);
+        if (enqueue.Body.MaxStackSize < 8)
+            enqueue.Body.MaxStackSize = 8;
+    }
+
+    // Cecil keeps short/long loads distinct (ldloc.s != ldloc):
+    // shape matches must accept both.
+    private static bool IsLdlocOp(OpCode op) => op == OpCodes.Ldloc || op == OpCodes.Ldloc_S;
+
+    private static void AssertFxOp(Instruction ins, OpCode op, string member)
+    {
+        if (ins.OpCode != op)
+            throw new InvalidOperationException($"CpuFx: expected {op}, saw {ins.OpCode}");
+        string name = (ins.Operand as MemberReference)?.Name ?? string.Empty;
+        if (name != member)
+            throw new InvalidOperationException($"CpuFx: expected {member}, saw {name}");
+    }
+
+    private static void AssertFxRangeFree(MethodDefinition method, Instruction first, Instruction last)
+    {
+        bool inRange = false;
+        var doomed = new System.Collections.Generic.HashSet<Instruction>();
+        foreach (var ins in method.Body.Instructions)
+        {
+            if (ins == first)
+                inRange = true;
+            if (inRange)
+                doomed.Add(ins);
+            if (ins == last)
+                break;
+        }
+        foreach (var ins in method.Body.Instructions)
+        {
+            if (ins.Operand is Instruction target && doomed.Contains(target) && !doomed.Contains(ins))
+                throw new InvalidOperationException($"CpuFx: branch into patched range at {ins.OpCode}");
+        }
+        foreach (var h in method.Body.ExceptionHandlers)
+        {
+            foreach (var edge in new[] { h.TryStart, h.TryEnd, h.HandlerStart, h.HandlerEnd, h.FilterStart })
+            {
+                if (edge is not null && doomed.Contains(edge) && edge != last.Next)
+                    throw new InvalidOperationException("CpuFx: handler edge inside patched range");
+            }
+        }
+    }
+
+    // ShowDialog returns None immediately headless, so RunEffectImpl's
+    // post-dialog pipeline (DoEffect apply) tears down before the user
+    // settles the dialog. Note the owning menu on the dialog here; the
+    // FormClosed hook (EnsureEffectDialogResume) resumes the product
+    // DoEffect then. Inserted after the SetEffect call: stack-neutral,
+    // idempotent, safe under any branch shape.
+    private static void EnsureEffectApplyResume(ModuleDefinition module, string? cpuPaintPath)
+    {
+        TypeDefinition menu = module.GetType("PaintDotNet.Menus.EffectMenuBase")
+            ?? throw new InvalidOperationException("CpuFx: EffectMenuBase missing");
+        MethodDefinition run = menu.Methods
+            .FirstOrDefault(m => m.Name == "RunEffectImpl" && m.Parameters.Count == 1 && m.HasBody)
+            ?? throw new InvalidOperationException("CpuFx: RunEffectImpl missing");
+        int at = -1;
+        var seq = run.Body.Instructions;
+        for (int k = 3; k < seq.Count; k++)
+        {
+            if (seq[k].OpCode == OpCodes.Callvirt
+                && seq[k].Operand is MethodReference smr
+                && smr.Name == "SetEffect"
+                && IsLdlocOp(seq[k - 3].OpCode)
+                && seq[k - 2].OpCode == OpCodes.Ldfld
+                && seq[k - 2].Operand is FieldReference sfr
+                && sfr.Name == "configDialog"
+                && IsLdlocOp(seq[k - 1].OpCode))
+            { at = k; break; }
+        }
+        if (at < 0)
+            throw new InvalidOperationException("CpuFx: RunEffectImpl SetEffect site missing");
+        MethodReference note = ImportCpuPaintMethod(module, cpuPaintPath, "NoteEffectMenu", 2);
+        var ril = run.Body.GetILProcessor();
+        // Anchor once: InsertBefore mutates the live collection, so
+        // re-reading seq[at+1] per insert chains onto the just-inserted
+        // instruction and emits the sequence REVERSED (call on an empty
+        // stack: InvalidProgram in RunEffectImpl, observed live when
+        // opening Adjustments/Levels).
+        var anchorFx = seq[at + 1];
+        ril.InsertBefore(anchorFx, ril.Create(OpCodes.Ldloc, (VariableDefinition)seq[at - 3].Operand));
+        ril.InsertBefore(anchorFx, ril.Create(OpCodes.Ldfld, (FieldReference)seq[at - 2].Operand));
+        ril.InsertBefore(anchorFx, ril.Create(OpCodes.Ldarg_0));
+        ril.InsertBefore(anchorFx, ril.Create(OpCodes.Call, note));
+        if (run.Body.MaxStackSize < 8)
+            run.Body.MaxStackSize = 8;
+    }
+
+    // The OK settle lands after ShowDialog already returned (immediate
+    // None headless): subscribe FormClosed to a synthesized adapter that
+    // routes the noted dialog through CpuPaint.ResumeEffectApply. The
+    // adapter lives on EffectConfigForm so the delegate binds in-module;
+    // the CpuPaint call itself is an exact import (like DrawText).
+    private static void EnsureEffectDialogResume(ModuleDefinition module, string? cpuPaintPath)
+    {
+        TypeDefinition form = module.GetType("PaintDotNet.Effects.EffectConfigForm")
+            ?? throw new InvalidOperationException("CpuFx: EffectConfigForm missing");
+        // GPU effect dialogs (Levels and friends) do NOT inherit the base
+        // body: EffectConfigForm<T,E> overrides IEffectConfigForm.ShowDialog
+        // with its own Form.ShowDialog call, so the hook must land on both
+        // bodies or GPU OK settles never resume DoEffect.
+        TypeDefinition generic = module.GetType("PaintDotNet.Effects.EffectConfigForm`2")
+            ?? throw new InvalidOperationException("CpuFx: EffectConfigForm<T> missing");
+        var shows = new[]
+        {
+            form.Methods.FirstOrDefault(m => m.Name.EndsWith(".ShowDialog") && m.Parameters.Count == 1 && m.HasBody)
+                ?? throw new InvalidOperationException("CpuFx: IEffectConfigForm.ShowDialog missing"),
+            generic.Methods.FirstOrDefault(m => m.Name.EndsWith(".ShowDialog") && m.Parameters.Count == 1 && m.HasBody)
+                ?? throw new InvalidOperationException("CpuFx: generic IEffectConfigForm.ShowDialog missing"),
+        };
+        AssemblyNameReference? swfScope = null;
+        foreach (var r in module.AssemblyReferences)
+        {
+            if (r.Name == "System.Windows.Forms" || r.Name == "WfWasm.WinForms")
+            { swfScope = r; break; }
+        }
+        if (swfScope is null)
+            throw new InvalidOperationException("CpuFx: dialog resume forms scope missing");
+        var fceaRef = new TypeReference("System.Windows.Forms", "FormClosedEventArgs", module, swfScope);
+        var adapter = new MethodDefinition(
+            "ResumeEffectApplyAdap",
+            MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig,
+            module.TypeSystem.Void);
+        adapter.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
+        adapter.Parameters.Add(new ParameterDefinition(fceaRef));
+        form.Methods.Add(adapter);
+        MethodReference resume = ImportCpuPaintMethod(module, cpuPaintPath, "ResumeEffectApply", 1);
+        var ail = adapter.Body.GetILProcessor();
+        ail.Emit(OpCodes.Ldarg_0);
+        ail.Emit(OpCodes.Call, resume);
+        ail.Emit(OpCodes.Pop);
+        ail.Emit(OpCodes.Ret);
+        var fcehRef = new TypeReference("System.Windows.Forms", "FormClosedEventHandler", module, swfScope);
+        var fcehCtor = new MethodReference(".ctor", module.TypeSystem.Void, fcehRef) { HasThis = true };
+        fcehCtor.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
+        fcehCtor.Parameters.Add(new ParameterDefinition(module.TypeSystem.IntPtr));
+        var formRef = new TypeReference("System.Windows.Forms", "Form", module, swfScope);
+        var addClosed = new MethodReference("add_FormClosed", module.TypeSystem.Void, formRef) { HasThis = true };
+        addClosed.Parameters.Add(new ParameterDefinition(fcehRef));
+        foreach (MethodDefinition show in shows)
+        {
+            var sseq = show.Body.Instructions;
+            if (sseq.Count != 4
+                || sseq[0].OpCode != OpCodes.Ldarg_0
+                || sseq[1].OpCode != OpCodes.Ldarg_1
+                || sseq[2].OpCode != OpCodes.Call
+                || !(sseq[2].Operand is MethodReference baseShow)
+                || baseShow.Name != "ShowDialog"
+                || sseq[3].OpCode != OpCodes.Ret)
+                throw new InvalidOperationException("CpuFx: IEffectConfigForm.ShowDialog shape changed");
+            show.Body.Instructions.Clear();
+            var sil2 = show.Body.GetILProcessor();
+            sil2.Emit(OpCodes.Ldarg_0);
+            sil2.Emit(OpCodes.Dup);
+            sil2.Emit(OpCodes.Ldftn, adapter);
+            sil2.Emit(OpCodes.Newobj, fcehCtor);
+            sil2.Emit(OpCodes.Callvirt, addClosed);
+            sil2.Emit(OpCodes.Ldarg_0);
+            sil2.Emit(OpCodes.Ldarg_1);
+            sil2.Emit(OpCodes.Call, baseShow);
+            sil2.Emit(OpCodes.Ret);
+            if (show.Body.MaxStackSize < 8)
+                show.Body.MaxStackSize = 8;
+        }
+    }
+
+    // Every abandoned kernel event handle finalize-crashes the browser
+    // PAL (WaitSubsystem.DeleteHandle NRE is fatal on a finalizer
+    // thread): per-render driver gates, dispatcher gates, pool rents,
+    // and the update state machines all abandon theirs, so the tab
+    // dies at the first gen-2 GC once stroke/tile pressure trips a
+    // collection (~4 stroke-moves in). Suppress the SafeHandle
+    // finalizer right after every PDN event-handle construction via
+    // CpuPaint.DefuseWaitHandle (dup; call: stack-neutral, verifiable;
+    // MaxStackSize bumped). Safe by construction (see helper): Dispose
+    // still releases normally, and nothing waits on these headless.
+    // Mutexes/semaphores excluded (ownership semantics); event-handle
+    // Slims allocate lazily inside CoreLib and are covered only if
+    // their paths never block (verified live, see rev123).
+    private static void EnsureWaitHandlesDefused(ModuleDefinition module, string? cpuPaintPath)
+    {
+        MethodReference defuse = ImportCpuPaintMethod(module, cpuPaintPath, "DefuseWaitHandle", 1);
+        int sites = 0;
+        foreach (var type in module.Types)
+            sites += DefuseInType(type, defuse);
+        Console.WriteLine($"CpuFx: defused {sites} wait-handle sites in {module.Name}");
+    }
+
+    private static int DefuseInType(TypeDefinition type, MethodReference defuse)
+    {
+        int n = 0;
+        foreach (var m in type.Methods)
+        {
+            if (!m.HasBody)
+                continue;
+            var news = new System.Collections.Generic.List<Instruction>();
+            foreach (var ins in m.Body.Instructions)
+            {
+                if (ins.OpCode == OpCodes.Newobj
+                    && ins.Operand is MethodReference mr
+                    && (mr.DeclaringType.FullName == "System.Threading.ManualResetEvent"
+                        || mr.DeclaringType.FullName == "System.Threading.AutoResetEvent"
+                        || mr.DeclaringType.FullName == "System.Threading.EventWaitHandle"))
+                    news.Add(ins);
+            }
+            if (news.Count == 0)
+                continue;
+            var il = m.Body.GetILProcessor();
+            foreach (var nw in news)
+            {
+                var dup = il.Create(OpCodes.Dup);
+                il.InsertAfter(nw, dup);
+                il.InsertAfter(dup, il.Create(OpCodes.Call, defuse));
+                n++;
+            }
+            m.Body.MaxStackSize = m.Body.MaxStackSize + 1;
+        }
+        foreach (var nt in type.NestedTypes)
+            n += DefuseInType(nt, defuse);
+        return n;
+    }
+
+    // History undo data never lands headless: BitmapHistoryMemento's
+    // ctor persists via SetData(data, async: true), and the
+    // TaskFactory.StartNew save never completes without a thread pump,
+    // so get_Object hits an unwritten write-once file (IOE "current
+    // state") on every undo, for product and replicated mementos
+    // alike. Persist synchronously instead (one ldc flip at the single
+    // async call site): the save runs inline in the ctor, the task is
+    // born completed, and get_Object reads from disk (or the live
+    // soft ref). Small canvases make the block negligible; exact-tail
+    // pins are unaffected (no stack change).
+    private static void EnsureHistoryPersistSynchronous(ModuleDefinition module)
+    {
+        var memento = module.GetType("PaintDotNet.HistoryMementos.BitmapHistoryMemento");
+        if (memento is null)
+            throw new InvalidOperationException("history persist needs BitmapHistoryMemento");
+        int flips = 0;
+        foreach (var m in memento.Methods)
+        {
+            if (m.Name != ".ctor" || !m.HasBody)
+                continue;
+            var list = new System.Collections.Generic.List<Instruction>(m.Body.Instructions);
+            for (int k = 2; k < list.Count; k++)
+            {
+                if ((list[k].OpCode != OpCodes.Call && list[k].OpCode != OpCodes.Callvirt)
+                    || list[k].Operand is not MethodReference mr
+                    || mr.FullName != "System.Void PaintDotNet.HistoryMementos.HistoryMemento::SetData(PaintDotNet.HistoryMementos.HistoryMementoData,System.Boolean)")
+                    continue;
+                if (list[k - 1].OpCode != OpCodes.Ldc_I4_1)
+                    throw new InvalidOperationException("history persist bool already flipped?");
+                var il = m.Body.GetILProcessor();
+                il.Replace(list[k - 1], il.Create(OpCodes.Ldc_I4_0));
+                flips++;
+            }
+        }
+        if (flips == 0)
+            throw new InvalidOperationException("history persist found no async SetData site");
+        Console.WriteLine($"CpuFx: history persist synchronous ({flips} site(s))");
+    }
+
+    // SoftReference<T> keeps its target strongly only while it is
+    // young (GC generation 0): after the first gen-2 GC the strong
+    // slot is cleared and only the WeakReference remains. Headless
+    // that demotion is fatal for undo: PersistedObject<T>.get_Object
+    // falls through to the session-file read, and PersistToDisk is a
+    // stubbed ret (BinaryFormatter has no headless backend), so the
+    // file path was never set and OpenForReading throws IOE "current
+    // state" on every stroke/effect undo. The rewrite pins the target
+    // in a spare strong slot: the data then lives exactly as long as
+    // the SoftReference holder (the memento on the history stack),
+    // which is the bound the stack depth already enforces. Only the
+    // ctor and get_Target are touched: the slot is object-typed with
+    // box/unbox at the boundary, the exact shapes the pristine
+    // forwarding methods already used, so the browser interpreter
+    // transforms nothing it has never seen. The TryGetTarget
+    // overloads stay pristine on purpose: routing them through the
+    // slot needs stobj/stind on the generic parameter, and that
+    // combination throws InvalidCastException at runtime even on the
+    // desktop CLR (plus risks the interpreter path). Nobody on the
+    // undo path calls them (get_Object uses get_Target only). The
+    // slot is public: the browser runtime's generic visibility check
+    // rejects an added private field even from the type's own ctor
+    // (FieldAccessException live). Post-dispose reads can observe a
+    // stale target instead of null; PDN never reads disposed
+    // mementos off-stack, so this is accepted.
+    private static void EnsureHistorySoftReferenceStrong(ModuleDefinition module)
+    {
+        var soft = module.GetType("PaintDotNet.Runtime.SoftReference`1")
+            ?? throw new InvalidOperationException("strong softref needs SoftReference<T>");
+        if (soft.GenericParameters.Count != 1)
+            throw new InvalidOperationException("strong softref generic arity changed");
+        var gp = soft.GenericParameters[0];
+        var objType = module.TypeSystem.Object;
+        var fld = soft.Fields.FirstOrDefault(f => f.Name == "headlessStrongTarget");
+        if (fld is null)
+        {
+            fld = new FieldDefinition("headlessStrongTarget", FieldAttributes.Public, objType);
+            soft.Fields.Add(fld);
+        }
+        var getter = soft.Methods.FirstOrDefault(m => m.Name == "get_Target" && m.Parameters.Count == 0)
+            ?? throw new InvalidOperationException("strong softref getter missing");
+        int fixed_ = 0;
+        foreach (var m in soft.Methods)
+        {
+            if (!m.HasBody)
+                continue;
+            if (m.Name == ".ctor" && m.Parameters.Count == 1)
+            {
+                var ins = m.Body.Instructions;
+                if (ins.Count == 0 || ins[ins.Count - 1].OpCode != OpCodes.Ret)
+                    throw new InvalidOperationException("strong softref ctor tail changed");
+                var il = m.Body.GetILProcessor();
+                var ret = ins[ins.Count - 1];
+                il.InsertBefore(ret, il.Create(OpCodes.Ldarg_0));
+                il.InsertBefore(ret, il.Create(OpCodes.Ldarg_1));
+                il.InsertBefore(ret, il.Create(OpCodes.Box, gp));
+                il.InsertBefore(ret, il.Create(OpCodes.Stfld, fld));
+                m.Body.MaxStackSize = System.Math.Max(m.Body.MaxStackSize, 2);
+                fixed_++;
+            }
+            else if (m == getter)
+            {
+                m.Body.ExceptionHandlers.Clear();
+                m.Body.Variables.Clear();
+                m.Body.Instructions.Clear();
+                var il = m.Body.GetILProcessor();
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldfld, fld);
+                il.Emit(OpCodes.Unbox_Any, gp);
+                il.Emit(OpCodes.Ret);
+                m.Body.MaxStackSize = System.Math.Max(m.Body.MaxStackSize, 1);
+                fixed_++;
+            }
+        }
+        if (fixed_ != 2)
+            throw new InvalidOperationException($"strong softref shape changed ({fixed_})");
+        Console.WriteLine("CpuFx: SoftReference<T> pinned strongly headless");
+    }
+
+    // HistoryStack.PushNewMemento calls HistoryMemento.Flush right
+    // after pushing, and PersistedObject<T>.Flush waits for the disk
+    // save then nulls softObjectRef to free memory: on desktop the
+    // data is safely on disk and get_Object re-reads it on undo.
+    // Headless the save is a stubbed ret (BinaryFormatter has no
+    // backend), so the flush evicts the ONLY copy seconds after the
+    // push: our replicated Levels memento is born unreadable
+    // (get_Data IOEs immediately at push time, "born-threw", and at
+    // every undo). With the SoftReference pin (see above) the memory
+    // is already bounded by the history stack depth, so retaining it
+    // is safe: Flush reduces to ret and the data lives as long as
+    // its memento on the stack.
+    private static void EnsureHistoryFlushRetained(ModuleDefinition module)
+    {
+        var persisted = module.GetType("PaintDotNet.Runtime.PersistedObject`1")
+            ?? throw new InvalidOperationException("history flush needs PersistedObject<T>");
+        var flush = persisted.Methods.FirstOrDefault(m => m.Name == "Flush" && m.Parameters.Count == 0 && m.HasBody)
+            ?? throw new InvalidOperationException("history flush method missing");
+        bool evicts = flush.Body.Instructions.Any(i =>
+            i.OpCode == OpCodes.Stfld && i.Operand is FieldReference fr
+            && fr.Name == "softObjectRef" && fr.DeclaringType.FullName.Contains("PersistedObject"));
+        if (!evicts)
+            throw new InvalidOperationException("history flush eviction shape changed");
+        flush.Body.ExceptionHandlers.Clear();
+        flush.Body.Variables.Clear();
+        flush.Body.Instructions.Clear();
+        flush.Body.GetILProcessor().Emit(OpCodes.Ret);
+        Console.WriteLine("CpuFx: PersistedObject<T>.Flush retained (no headless eviction)");
+    }
+
+    // Update checks cannot install anything headless, and the boot
+    // update flow abandons its state-machine ManualResetEvents (3 per
+    // boot in StateMachineExecutor, 2 more in CheckingState): with no
+    // Dispose they die at the first gen-2 GC, and the browser PAL
+    // NREs in WaitSubsystem.DeleteHandle once per handle (fatal in a
+    // finalizer, so the tab dies ~4 stroke-moves in when stroke
+    // allocations trip the collection). Neuter the flow at its roots:
+    // InitializeUpdates (boot trigger) and PerformUpdateCheck (manual
+    // menu trigger) both reduce to Ret. Journal/expiry logic reads
+    // flags, never the machine, so nothing else depends on it.
+    private static void EnsureUpdatesDisabled(ModuleDefinition module)
+    {
+        TypeDefinition svc = module.GetType("PaintDotNet.Updates.UpdatesService")
+            ?? throw new InvalidOperationException("CpuFx: UpdatesService missing");
+        int neutered = 0;
+        foreach (var m in svc.Methods)
+        {
+            if ((m.Name == "InitializeUpdates" || m.Name == "PerformUpdateCheck")
+                && m.Parameters.Count == 0
+                && m.HasBody)
+            {
+                m.Body.ExceptionHandlers.Clear();
+                m.Body.Variables.Clear();
+                m.Body.Instructions.Clear();
+                var il = m.Body.GetILProcessor();
+                il.Emit(OpCodes.Ret);
+                neutered++;
+            }
+        }
+        if (neutered != 2)
+            throw new InvalidOperationException($"CpuFx: update roots changed ({neutered})");
+    }
+
     private static void EnsureCpuPostProcessIdentity(ModuleDefinition module)
     {
         TypeDefinition img = module.GetType("PaintDotNet.Direct2D1.BitmapImage")
@@ -10216,7 +11053,7 @@ public static class AssemblyRewriter
         TypeDefinition cpuTextLayout = SynthesizeCpuTextLayout(module);
         MethodDefinition textLayoutCtor = cpuTextLayout.Methods.First(m => m.Name == ".ctor");
         TypeDefinition cpuColorCtx = SynthesizeCpuDeviceColorContext(module);
-        TypeDefinition cpuEffect = SynthesizeCpuDeviceEffect(module);
+        TypeDefinition cpuEffect = SynthesizeCpuDeviceEffect(module, cpuPaintPath);
         MethodDefinition cpuEffectCtor = cpuEffect.Methods.First(m => m.Name == ".ctor");
         MethodDefinition cpuGradientCtor = cpuGradient.Methods.First(m => m.Name == ".ctor");
 
@@ -11224,12 +12061,27 @@ public static class AssemblyRewriter
             // context token carrying the profile's space. The
             // description names the stock profile (scRGB vs sRGB);
             // anything else (or a missing getter) defaults to sRGB.
+            // Stock singletons answer their concrete class
+            // (PaintDotNet.Imaging.ColorProfile), not the proxy
+            // interface, so every known profile carrier matches.
             il.Append(tryProfile);
+            var gotProfile = il.Create(OpCodes.Nop);
             il.Emit(OpCodes.Ldloc, provTypeLoc);
             il.Emit(OpCodes.Callvirt, typeFullName);
             il.Emit(OpCodes.Ldstr, "PaintDotNet.Imaging.Proxies.IColorProfileProxy");
             il.Emit(OpCodes.Call, strEq);
+            il.Emit(OpCodes.Brtrue, gotProfile);
+            il.Emit(OpCodes.Ldloc, provTypeLoc);
+            il.Emit(OpCodes.Callvirt, typeFullName);
+            il.Emit(OpCodes.Ldstr, "PaintDotNet.Imaging.ColorProfile");
+            il.Emit(OpCodes.Call, strEq);
+            il.Emit(OpCodes.Brtrue, gotProfile);
+            il.Emit(OpCodes.Ldloc, provTypeLoc);
+            il.Emit(OpCodes.Callvirt, typeFullName);
+            il.Emit(OpCodes.Ldstr, "PaintDotNet.Direct2D1.SimpleColorProfile");
+            il.Emit(OpCodes.Call, strEq);
             il.Emit(OpCodes.Brfalse, tryGradient);
+            il.Append(gotProfile);
             il.Emit(OpCodes.Ldc_I4_1);
             il.Emit(OpCodes.Stloc, gSpaceLoc);
             il.Emit(OpCodes.Ldloc, provTypeLoc);

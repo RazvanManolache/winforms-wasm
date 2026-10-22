@@ -1790,6 +1790,54 @@ public sealed class RewriteTests
     }
 
     [Fact]
+    public void Rewrite_CommandList_Answers_IObjectRef()
+    {
+        // Colors-panel crop inputs are CpuCommandList tokens: SetInput
+        // routes every input through CreateRef(IObjectRef), which throws
+        // ObjectDisposed when TryCreateRef answers null. Live, the three
+        // Colors renders (gradient/rectangle/palette) died exactly there
+        // although nothing was ever disposed: the list was the only CPU
+        // stand-in without the IObjectRef answers. Load the transformed
+        // core for real and demand the ref to itself.
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
+        if (!File.Exists(input)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        string tempOut = Path.Combine(Path.GetTempPath(), $"CmdList_Ref_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(input, tempOut,
+                new Dictionary<string, string>(StringComparer.Ordinal),
+                new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal),
+                cpuDll);
+            var alc = new System.Runtime.Loader.AssemblyLoadContext($"CmdListRef_{Guid.NewGuid()}", true);
+            try
+            {
+                alc.Resolving += (ctx, name) =>
+                {
+                    string probe = Path.Combine(paintDir, (name.Name ?? "") + ".dll");
+                    return File.Exists(probe) ? ctx.LoadFromAssemblyPath(probe) : null;
+                };
+                var loaded = alc.LoadFromAssemblyPath(tempOut);
+                var listType = loaded.GetType("PaintDotNet.Direct2D1.CpuCommandList");
+                Assert.NotNull(listType);
+                var ioRef = listType.GetInterfaces().First(t => t.Name == "IObjectRef");
+                var tcr = listType.GetMethod("TryCreateRef")!;
+                var inst = Activator.CreateInstance(listType);
+                Assert.NotNull(inst);
+                var args = new object?[] { ioRef, null };
+                Assert.True((bool?)tcr.Invoke(inst, args) == true);
+                Assert.Same(inst, args[1]);
+            }
+            finally { alc.Unload(); }
+        }
+        finally
+        {
+            try { GC.Collect(); GC.WaitForPendingFinalizers(); if (File.Exists(tempOut)) File.Delete(tempOut); } catch { }
+        }
+    }
+
+    [Fact]
     public void CreateSpriteImage_Uses_CpuSprite()
     {
         // The brush-tip sprite effect chain (SrgbToLinear/GaussianBlur/
@@ -1855,7 +1903,17 @@ public sealed class RewriteTests
         string coreInput = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(coreInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
-        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        string drawingDll = ShimBinDll("WfWasm.Drawing");
+        // Production-faithful framework map: the DrawTextLayout
+        // raster call scopes System.Drawing, which production
+        // renames to the fork (AppTransform assemblyMap), so the
+        // fixture must map it too for callees to resolve.
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["System.Drawing"] = drawingDll,
+            ["System.Drawing.Common"] = drawingDll,
+            ["System.Drawing.Primitives"] = drawingDll,
+        };
         var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
         string tempOut = Path.Combine(Path.GetTempPath(), $"WindowsCore_Fill_{Guid.NewGuid()}.dll");
         try
@@ -1863,6 +1921,7 @@ public sealed class RewriteTests
             AssemblyRewriter.Rewrite(coreInput, tempOut, emptyMap, emptyTypes, cpuDll);
             var resolver = new Mono.Cecil.DefaultAssemblyResolver();
             resolver.AddSearchDirectory(paintDir);
+            resolver.AddSearchDirectory(Path.GetDirectoryName(drawingDll)!);
             using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
                 new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
             var ext = asm.MainModule.GetType("PaintDotNet.Direct2D1.DrawingContextExtensions");
@@ -1943,6 +2002,20 @@ public sealed class RewriteTests
                 && i.Operand is Mono.Cecil.MethodReference mr
                 && mr.DeclaringType.FullName == "WfWasm.PdnCpu.CpuPaint"
                 && mr.Name == "DrawText");
+            // Raster-first: the layout goes through the browser text
+            // engine with the 5x7 DrawText kept as the null fallback.
+            Assert.Contains(drawText.Body.Instructions, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Call
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.DeclaringType.FullName == "System.Drawing.TextLayoutRaster"
+                && mr.Name == "TryRasterLayout");
+            Assert.Contains(drawText.Body.Instructions, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Call
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.DeclaringType.FullName == "WfWasm.PdnCpu.CpuPaint"
+                && mr.Name == "BlitRaster");
+            Assert.Contains(drawText.Body.Instructions, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Brfalse);
             Assert.DoesNotContain(drawText.Body.Instructions, i =>
                 i.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt
                 && i.Operand is Mono.Cecil.MethodReference mr
@@ -1963,6 +2036,652 @@ public sealed class RewriteTests
                 i.Operand is Mono.Cecil.MethodReference mr
                 && mr.Name == "GetTextRenderingParameters");
             AssertCalleesResolve(asm.MainModule, scopeCtor);
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
+
+    [Fact]
+    public void EffectDriver_Start_Runs_Inline()
+    {
+        // Effect rendering is single-threaded headless (Thread.Start is
+        // neutered): the driver spawn+WaitOne handshake can never
+        // complete, so Levels OK-apply silently renders nothing. Start
+        // runs the worker inline; the tile pool Enqueue runs each tile
+        // synchronously and its Joins pop; RunEffectImpl notes the menu
+        // for the dialog so FormClosed can resume the product DoEffect.
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
+        if (!File.Exists(pdnInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"pdn_EffectInline_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(pdnInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var driver = asm.MainModule.GetType("PaintDotNet.Effects.EffectDriver`1");
+            Assert.NotNull(driver);
+            var start = Assert.Single(driver.Methods,
+                m => m.Name == "Start" && m.Parameters.Count == 1);
+            Assert.Contains(start.Body.Instructions, i =>
+                (i.OpCode == Mono.Cecil.Cil.OpCodes.Call || i.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt)
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.Name == "ThreadFunction");
+            Assert.DoesNotContain(start.Body.Instructions, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.DeclaringType.FullName == "System.Threading.Thread"
+                && mr.Name == "Start");
+            // Stack pin: the patched tail after OnStartingRendering must
+            // be exactly the balanced inline sequence. Leftover Thread
+            // construction leaves values on the stack at ret: the method
+            // is InvalidProgram at JIT, observed live as the Levels
+            // DoEffect Shown-handler death (Start itself never appears in
+            // the interpreted stack; the caller takes the blame).
+            var sins = start.Body.Instructions.ToList();
+            int lastAnchor = -1;
+            for (int k = 0; k < sins.Count; k++)
+            {
+                if ((sins[k].OpCode == Mono.Cecil.Cil.OpCodes.Call
+                        || sins[k].OpCode == Mono.Cecil.Cil.OpCodes.Callvirt)
+                    && sins[k].Operand is Mono.Cecil.MethodReference omr
+                    && omr.Name == "OnStartingRendering")
+                    lastAnchor = k;
+            }
+            Assert.True(lastAnchor >= 0);
+            var tail = sins.Skip(lastAnchor + 1).ToList();
+            // No Thread construction may survive after the inline point:
+            // leftovers unbalance the stack at ret (InvalidProgram).
+            Assert.DoesNotContain(tail, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Newobj
+                && i.Operand is Mono.Cecil.MethodReference nmr
+                && (nmr.DeclaringType.FullName == "System.Threading.Thread"
+                    || nmr.DeclaringType.FullName == "System.Threading.ThreadStart"));
+            // The inline worker call must be there, followed only by the
+            // event-close/null/ret epilogue (the wait census may add its
+            // own neutral triple before the event newobj: match loosely).
+            int tfCall = tail.FindIndex(i =>
+                (i.OpCode == Mono.Cecil.Cil.OpCodes.Call
+                    || i.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt)
+                && i.Operand is Mono.Cecil.MethodReference tmr
+                && tmr.Name == "ThreadFunction");
+            Assert.True(tfCall >= 0);
+            Mono.Cecil.Cil.OpCode[] epilogue = new[]
+            {
+                Mono.Cecil.Cil.OpCodes.Ldarg_0, Mono.Cecil.Cil.OpCodes.Ldfld,
+                Mono.Cecil.Cil.OpCodes.Callvirt, Mono.Cecil.Cil.OpCodes.Ldarg_0,
+                Mono.Cecil.Cil.OpCodes.Ldnull, Mono.Cecil.Cil.OpCodes.Stfld,
+                Mono.Cecil.Cil.OpCodes.Ret,
+            };
+            Assert.True(tail.Count >= epilogue.Length);
+            var epi = tail.Skip(tail.Count - epilogue.Length).ToList();
+            for (int k = 0; k < epilogue.Length; k++)
+                Assert.Equal(epilogue[k], epi[k].OpCode);
+            var worker = Assert.Single(driver.Methods,
+                m => m.Name == "ThreadFunction" && m.Parameters.Count == 0);
+            Assert.DoesNotContain(worker.Body.Instructions, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.Name == "Join"
+                && mr.DeclaringType.FullName == "PaintDotNet.Effects.EffectRendererWorkItemQueue");
+            var queue = asm.MainModule.GetType("PaintDotNet.Effects.EffectRendererWorkItemQueue");
+            Assert.NotNull(queue);
+            var enqueue = Assert.Single(queue.Methods,
+                m => m.Name == "Enqueue" && m.Parameters.Count == 1);
+            Assert.Contains(enqueue.Body.Instructions, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.DeclaringType.FullName == "System.Action"
+                && mr.Name == "Invoke");
+            Assert.DoesNotContain(enqueue.Body.Instructions, i =>
+                i.Operand is Mono.Cecil.MethodReference mr
+                && mr.DeclaringType.FullName.StartsWith("System.Collections.Concurrent.ConcurrentQueue", StringComparison.Ordinal));
+            var menu = asm.MainModule.GetType("PaintDotNet.Menus.EffectMenuBase");
+            Assert.NotNull(menu);
+            var run = Assert.Single(menu.Methods,
+                m => m.Name == "RunEffectImpl" && m.Parameters.Count == 1);
+            Assert.Contains(run.Body.Instructions, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Call
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.DeclaringType.FullName == "WfWasm.PdnCpu.CpuPaint"
+                && mr.Name == "NoteEffectMenu");
+            // Order matters, not just presence: the note args must load
+            // BEFORE the call. A reversed insert (call on an empty stack)
+            // is metadata-clean but InvalidProgram at JIT, observed live
+            // when opening Adjustments/Levels.
+            var ops = run.Body.Instructions.ToList();
+            int setFx = -1;
+            for (int k = 0; k < ops.Count; k++)
+            {
+                if (ops[k].OpCode == Mono.Cecil.Cil.OpCodes.Callvirt
+                    && ops[k].Operand is Mono.Cecil.MethodReference smr
+                    && smr.Name == "SetEffect")
+                { setFx = k; break; }
+            }
+            Assert.True(setFx >= 0 && setFx + 4 < ops.Count);
+            Assert.StartsWith("Ldloc", ops[setFx + 1].OpCode.Code.ToString(), StringComparison.Ordinal);
+            Assert.Equal(Mono.Cecil.Cil.OpCodes.Ldfld, ops[setFx + 2].OpCode);
+            Assert.Equal(Mono.Cecil.Cil.OpCodes.Ldarg_0, ops[setFx + 3].OpCode);
+            Assert.True(ops[setFx + 4].OpCode == Mono.Cecil.Cil.OpCodes.Call
+                && ops[setFx + 4].Operand is Mono.Cecil.MethodReference nmr
+                && nmr.Name == "NoteEffectMenu");
+            AssertCalleesResolve(asm.MainModule, start);
+            AssertCalleesResolve(asm.MainModule, worker);
+            AssertCalleesResolve(asm.MainModule, enqueue);
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
+
+    [Fact]
+    public void WaitHandles_Defused_At_Every_Construction_Site()
+    {
+        // Abandoned kernel event handles finalize-crash the browser PAL
+        // at the first gen-2 GC (WaitSubsystem.DeleteHandle NRE, fatal
+        // on a finalizer thread): every PDN `new ManualResetEvent /
+        // AutoResetEvent / EventWaitHandle` must be followed by
+        // dup + CpuPaint.DefuseWaitHandle, so an undisposed handle
+        // leaks benignly instead of killing the tab. Order matters:
+        // the dup must sit directly after the newobj (stack-neutral).
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
+        if (!File.Exists(pdnInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"pdn_WaitDefuse_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(pdnInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            int sites = 0;
+            foreach (var type in asm.MainModule.Types)
+                sites += AssertDefused(type);
+            // Real sites exist (driver gate, dispatcher, pool rents):
+            // zero means the rule silently did nothing.
+            Assert.True(sites > 0);
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
+
+    private static int AssertDefused(Mono.Cecil.TypeDefinition type)
+    {
+        int n = 0;
+        foreach (var m in type.Methods)
+        {
+            if (!m.HasBody)
+                continue;
+            var ins = m.Body.Instructions.ToList();
+            for (int k = 0; k + 2 < ins.Count; k++)
+            {
+                if (ins[k].OpCode != Mono.Cecil.Cil.OpCodes.Newobj
+                    || ins[k].Operand is not Mono.Cecil.MethodReference mr)
+                    continue;
+                string dn = mr.DeclaringType.FullName;
+                if (dn != "System.Threading.ManualResetEvent"
+                    && dn != "System.Threading.AutoResetEvent"
+                    && dn != "System.Threading.EventWaitHandle")
+                    continue;
+                Assert.Equal(Mono.Cecil.Cil.OpCodes.Dup, ins[k + 1].OpCode);
+                Assert.True((ins[k + 2].OpCode == Mono.Cecil.Cil.OpCodes.Call
+                        || ins[k + 2].OpCode == Mono.Cecil.Cil.OpCodes.Callvirt)
+                    && ins[k + 2].Operand is Mono.Cecil.MethodReference cmr
+                    && cmr.DeclaringType.FullName == "WfWasm.PdnCpu.CpuPaint"
+                    && cmr.Name == "DefuseWaitHandle");
+                n++;
+            }
+        }
+        foreach (var nt in type.NestedTypes)
+            n += AssertDefused(nt);
+        return n;
+    }
+
+    [Fact]
+    public void HistoryPersist_Is_Synchronous()
+    {
+        // Undo data never lands headless: BitmapHistoryMemento's ctor
+        // persists via SetData(data, async: true), and the save task
+        // never completes without a thread pump, so every undo dies at
+        // get_Object (IOE "current state"). The rewrite flips that one
+        // bool to synchronous; the save then runs inline in the ctor.
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
+        if (!File.Exists(pdnInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"pdn_HistSync_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(pdnInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var memento = asm.MainModule.GetType("PaintDotNet.HistoryMementos.BitmapHistoryMemento");
+            Assert.NotNull(memento);
+            int syncSites = 0;
+            foreach (var m in memento.Methods)
+            {
+                if (m.Name != ".ctor" || !m.HasBody)
+                    continue;
+                var ins = m.Body.Instructions.ToList();
+                for (int k = 1; k < ins.Count; k++)
+                {
+                    if ((ins[k].OpCode != Mono.Cecil.Cil.OpCodes.Call && ins[k].OpCode != Mono.Cecil.Cil.OpCodes.Callvirt)
+                        || ins[k].Operand is not Mono.Cecil.MethodReference mr
+                        || mr.FullName != "System.Void PaintDotNet.HistoryMementos.HistoryMemento::SetData(PaintDotNet.HistoryMementos.HistoryMementoData,System.Boolean)")
+                        continue;
+                    Assert.Equal(Mono.Cecil.Cil.OpCodes.Ldc_I4_0, ins[k - 1].OpCode);
+                    syncSites++;
+                }
+            }
+            Assert.Equal(1, syncSites);
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
+
+    [Fact]
+    public void SoftReference_Pinned_Strongly_Headless()
+    {
+        // PersistedObject<T>.get_Object serves the in-memory target
+        // while the SoftReference<T> still holds it, and only falls
+        // through to the session-file read once the target demotes.
+        // Headless that fallback is dead (PersistToDisk is a stubbed
+        // ret: BinaryFormatter has no backend), so every undo IOEs at
+        // get_Object once the target promotes past gen 0. The rewrite
+        // pins the target in a private strong field: the ctor stores
+        // it, get_Target and both TryGetTarget overloads answer it.
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string runtimeInput = Path.Combine(paintDir, "PaintDotNet.Runtime.dll");
+        if (!File.Exists(runtimeInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"pdn_SoftStrong_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(runtimeInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var soft = asm.MainModule.GetType("PaintDotNet.Runtime.SoftReference`1");
+            Assert.NotNull(soft);
+            var fld = Assert.Single(soft.Fields, f => f.Name == "headlessStrongTarget");
+            // Object-typed box/unbox slot (never a raw-T field or
+            // stobj: the browser interpreter chokes transforming
+            // those), and public (its generic visibility check
+            // rejects an added private field from the type's own
+            // ctor with FieldAccessException live).
+            Assert.Equal("System.Object", fld.FieldType.FullName);
+            Assert.True(fld.IsPublic);
+            var ctor = Assert.Single(soft.Methods, m => m.Name == ".ctor" && m.Parameters.Count == 1);
+            var cins = ctor.Body.Instructions.ToList();
+            Assert.True(cins.Count >= 5 && cins[cins.Count - 1].OpCode == Mono.Cecil.Cil.OpCodes.Ret);
+            Assert.Equal(Mono.Cecil.Cil.OpCodes.Box, cins[cins.Count - 3].OpCode);
+            Assert.Equal(Mono.Cecil.Cil.OpCodes.Stfld, cins[cins.Count - 2].OpCode);
+            Assert.Equal("headlessStrongTarget", Assert.IsAssignableFrom<Mono.Cecil.FieldReference>(cins[cins.Count - 2].Operand).Name);
+            var getter = Assert.Single(soft.Methods, m => m.Name == "get_Target" && m.Parameters.Count == 0);
+            var gins = getter.Body.Instructions.ToList();
+            Assert.Equal(4, gins.Count);
+            Assert.Equal(Mono.Cecil.Cil.OpCodes.Ldarg_0, gins[0].OpCode);
+            Assert.Equal(Mono.Cecil.Cil.OpCodes.Ldfld, gins[1].OpCode);
+            Assert.Equal("headlessStrongTarget", Assert.IsAssignableFrom<Mono.Cecil.FieldReference>(gins[1].Operand).Name);
+            Assert.Equal(Mono.Cecil.Cil.OpCodes.Unbox_Any, gins[2].OpCode);
+            Assert.Equal(Mono.Cecil.Cil.OpCodes.Ret, gins[3].OpCode);
+            // Both TryGetTarget overloads stay pristine: routing them
+            // through the slot needs stobj/stind on the generic
+            // parameter, which throws InvalidCastException at runtime
+            // even on the desktop CLR. Guard that neither references
+            // the slot.
+            foreach (var m in soft.Methods)
+            {
+                if (m.Name != "TryGetTarget" || !m.HasBody)
+                    continue;
+                foreach (var ins in m.Body.Instructions)
+                {
+                    var fr = ins.Operand as Mono.Cecil.FieldReference;
+                    Assert.True(fr is null || fr.Name != "headlessStrongTarget");
+                }
+            }
+            Assert.Equal(2, soft.Methods.Count(m => m.Name == "TryGetTarget"));
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
+
+    [Fact]
+    public void HistoryFlush_Is_Retained_Headless()
+    {
+        // HistoryStack.PushNewMemento flushes the memento at push,
+        // and PersistedObject<T>.Flush waits for the disk save then
+        // nulls softObjectRef: on desktop the data is safe on disk,
+        // but headless the save is a stubbed ret, so the flush
+        // evicts the only copy and the memento is born unreadable
+        // (get_Data IOEs immediately, "born-threw", and at undo).
+        // The rewrite reduces Flush to ret; the pinned target then
+        // lives as long as its memento on the stack.
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
+        if (!File.Exists(pdnInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"pdn_FlushRetain_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(pdnInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var persisted = asm.MainModule.GetType("PaintDotNet.Runtime.PersistedObject`1");
+            Assert.NotNull(persisted);
+            var flush = Assert.Single(persisted.Methods, m => m.Name == "Flush" && m.Parameters.Count == 0);
+            Assert.True(flush.HasBody);
+            var ins = flush.Body.Instructions.ToList();
+            var single = Assert.Single(ins);
+            Assert.Equal(Mono.Cecil.Cil.OpCodes.Ret, single.OpCode);
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
+
+    [Fact]
+    public void SoftReference_Pinned_Target_RoundTrips_At_Runtime()
+    {
+        // The rewritten SoftReference<T> must not only read well as
+        // IL: the desktop CLR has to JIT and run it (InvalidProgram
+        // here means the emitted shape is wrong, not just unusual).
+        // The pinned target round-trips through the ctor and
+        // get_Target, and survives a full collection.
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string runtimeInput = Path.Combine(paintDir, "PaintDotNet.Runtime.dll");
+        if (!File.Exists(runtimeInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"pdn_SoftRun_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(runtimeInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var alc = new System.Runtime.Loader.AssemblyLoadContext("softref-pin", true);
+            try
+            {
+                alc.Resolving += (ctx, name) =>
+                {
+                    string cand = Path.Combine(paintDir, name.Name + ".dll");
+                    return File.Exists(cand) ? ctx.LoadFromAssemblyPath(cand) : null;
+                };
+                var asm = alc.LoadFromAssemblyPath(tempOut);
+                var softOpen = asm.GetType("PaintDotNet.Runtime.SoftReference`1");
+                Assert.NotNull(softOpen);
+                var softStr = softOpen.MakeGenericType(typeof(string));
+                var inst = System.Activator.CreateInstance(softStr, new object[] { "hello" });
+                Assert.NotNull(inst);
+                // DeclaredOnly: the base SoftReference declares its own
+                // object-typed Target that the generic one shadows.
+                var targetProp = softStr.GetProperty("Target",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.DeclaredOnly);
+                Assert.NotNull(targetProp);
+                Assert.Equal("hello", targetProp.GetValue(inst));
+                // The pristine parameterless TryGetTarget still answers
+                // ("hello" is interned, so the weak side stays alive).
+                var tryPlain = softStr.GetMethod("TryGetTarget", System.Type.EmptyTypes);
+                Assert.NotNull(tryPlain);
+                Assert.Equal("hello", tryPlain.Invoke(inst, null));
+                // A live target must survive a full collection.
+                System.GC.Collect();
+                System.GC.WaitForPendingFinalizers();
+                System.GC.Collect();
+                Assert.Equal("hello", targetProp.GetValue(inst));
+            }
+            finally
+            {
+                alc.Unload();
+            }
+        }
+        finally
+        {
+            // Best-effort: the collectible load context releases the
+            // file lock asynchronously, so a prompt delete can race it.
+            try { if (File.Exists(tempOut)) File.Delete(tempOut); } catch (System.UnauthorizedAccessException) { } catch (System.IO.IOException) { }
+        }
+    }
+
+    [Fact]
+    public void EffectDialog_ShowDialog_Hooks_FormClosed()
+    {
+        // The OK settle lands after ShowDialog already returned
+        // (immediate None headless): the rewritten body subscribes a
+        // synthesized adapter that routes the noted dialog through
+        // CpuPaint.ResumeEffectApply, then shows as before.
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string coreInput = Path.Combine(paintDir, "PaintDotNet.Effects.Core.dll");
+        if (!File.Exists(coreInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"fxcore_DialogResume_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(coreInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var form = asm.MainModule.GetType("PaintDotNet.Effects.EffectConfigForm");
+            Assert.NotNull(form);
+            var adapter = Assert.Single(form.Methods, m => m.Name == "ResumeEffectApplyAdap");
+            Assert.True(adapter.IsStatic);
+            Assert.Equal(2, adapter.Parameters.Count);
+            // Cross-class ldftn: the generic EffectConfigForm<T,E> body
+            // binds this delegate, so private visibility dies live with
+            // MethodAccessException when a GPU dialog shows.
+            Assert.True(adapter.IsPublic);
+            Assert.Contains(adapter.Body.Instructions, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Call
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.DeclaringType.FullName == "WfWasm.PdnCpu.CpuPaint"
+                && mr.Name == "ResumeEffectApply");
+            var show = Assert.Single(form.Methods,
+                m => m.Name.EndsWith(".ShowDialog") && m.Parameters.Count == 1);
+            Assert.Contains(show.Body.Instructions, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.Name == "add_FormClosed");
+            Assert.Contains(show.Body.Instructions, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Ldftn
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.Name == "ResumeEffectApplyAdap");
+            Assert.Contains(show.Body.Instructions, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Call
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.Name == "ShowDialog");
+            // GPU effect dialogs (Levels and friends) do NOT inherit this
+            // body: EffectConfigForm<T,E> overrides IEffectConfigForm
+            // .ShowDialog with its own Form.ShowDialog call. Without the
+            // same hook their OK settle never resumes DoEffect (observed
+            // live: Levels dialog opened and closed with no apply).
+            var generic = asm.MainModule.GetType("PaintDotNet.Effects.EffectConfigForm`2");
+            Assert.NotNull(generic);
+            var genericShow = Assert.Single(generic.Methods,
+                m => m.Name.EndsWith(".ShowDialog") && m.Parameters.Count == 1);
+            Assert.Contains(genericShow.Body.Instructions, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.Name == "add_FormClosed");
+            Assert.Contains(genericShow.Body.Instructions, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Ldftn
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.Name == "ResumeEffectApplyAdap");
+            AssertCalleesResolve(asm.MainModule, adapter);
+            AssertCalleesResolve(asm.MainModule, show);
+            AssertCalleesResolve(asm.MainModule, genericShow);
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
+
+    [Fact]
+    public void Rewrite_BitmapSource_Skips_Device_When_Factory_Null()
+    {
+        // The 5-arg tile-reader .ctor dies headless on the null factory
+        // (BufferedDeviceContext CreateRef(null)). The guard skips just
+        // the device span: [ldarg.1, brfalse SKIP] before the span, SKIP
+        // right after the buffered-context store. Order matters (a call
+        // on an empty stack is InvalidProgram: the rev103 lesson).
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string fwInput = Path.Combine(paintDir, "PaintDotNet.Framework.dll");
+        if (!File.Exists(fwInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"fw_BitmapSource_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(fwInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var src = asm.MainModule.GetType("PaintDotNet.Direct2D1.Direct2DBitmapSourceBgra32");
+            Assert.NotNull(src);
+            var ctor = Assert.Single(src.Methods, m => m.Name == ".ctor" && m.Parameters.Count == 5);
+            var sins = ctor.Body.Instructions.ToList();
+            int guard = -1;
+            for (int k = 0; k + 3 < sins.Count; k++)
+            {
+                if (sins[k].OpCode == Mono.Cecil.Cil.OpCodes.Ldarg_1
+                    && sins[k + 1].OpCode == Mono.Cecil.Cil.OpCodes.Brfalse_S
+                    && sins[k + 2].OpCode == Mono.Cecil.Cil.OpCodes.Ldarg_0
+                    && sins[k + 3].OpCode == Mono.Cecil.Cil.OpCodes.Ldarg_1)
+                { guard = k; break; }
+            }
+            Assert.True(guard >= 0);
+            int store = -1;
+            for (int k = 0; k < sins.Count; k++)
+            {
+                if ((sins[k].OpCode == Mono.Cecil.Cil.OpCodes.Stfld)
+                    && sins[k].Operand is Mono.Cecil.FieldReference fr
+                    && fr.Name == "bufferedDeviceContext")
+                { store = k; break; }
+            }
+            Assert.True(store > guard);
+            Assert.Same(sins[store + 1], sins[guard + 1].Operand);
+            AssertCalleesResolve(asm.MainModule, ctor);
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
+
+    [Fact]
+    public void Rewrite_GpuTile_Renders_Cpu_First()
+    {
+        // Tiles materialize in Renderer.OnCopyPixels: the CPU renderer
+        // gets first refusal (boxed value-type args), product path on
+        // false. The dispatch must LEAD (order pin) and must box (a raw
+        // value type on an object parameter is unverifiable IL).
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string coreInput = Path.Combine(paintDir, "PaintDotNet.Effects.Core.dll");
+        if (!File.Exists(coreInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"fxcore_GpuTile_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(coreInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var renderer = asm.MainModule.GetType("PaintDotNet.Effects.Gpu.GpuEffect/Renderer");
+            Assert.NotNull(renderer);
+            var copy = Assert.Single(renderer.Methods, m => m.Name == "OnCopyPixels" && m.Parameters.Count == 2);
+            var sins = copy.Body.Instructions.ToList();
+            Assert.True(sins.Count > 8);
+            Mono.Cecil.Cil.OpCode[] head = new[]
+            {
+                Mono.Cecil.Cil.OpCodes.Ldarg_0, Mono.Cecil.Cil.OpCodes.Ldarg_1,
+                Mono.Cecil.Cil.OpCodes.Box, Mono.Cecil.Cil.OpCodes.Ldarg_2,
+                Mono.Cecil.Cil.OpCodes.Box, Mono.Cecil.Cil.OpCodes.Call,
+                Mono.Cecil.Cil.OpCodes.Brfalse_S, Mono.Cecil.Cil.OpCodes.Ret,
+            };
+            for (int k = 0; k < head.Length; k++)
+                Assert.Equal(head[k], sins[k].OpCode);
+            Assert.True(sins[2].Operand is Mono.Cecil.TypeReference boxDst
+                && boxDst.FullName.Contains("RegionPtr"));
+            Assert.True(sins[4].Operand is Mono.Cecil.TypeReference boxSrc
+                && boxSrc.FullName.Contains("Point2Int32"));
+            Assert.True(sins[5].Operand is Mono.Cecil.MethodReference mr
+                && mr.Name == "TryRenderGpuTileCpu");
+            Assert.Same(sins[8], sins[6].Operand);
+            AssertCalleesResolve(asm.MainModule, copy);
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
+
+    [Fact]
+    public void UpdatesService_Checks_Are_Headless_Noops()
+    {
+        // Update checks cannot install anything in a browser, and the
+        // boot flow abandons state-machine events that finalize-crash
+        // the browser PAL at the first gen-2 GC (stroke trips it).
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
+        if (!File.Exists(pdnInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"pdn_NoUpdates_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(pdnInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var svc = asm.MainModule.GetType("PaintDotNet.Updates.UpdatesService");
+            Assert.NotNull(svc);
+            foreach (string name in new[] { "InitializeUpdates", "PerformUpdateCheck" })
+            {
+                var m = Assert.Single(svc.Methods,
+                    x => x.Name == name && x.Parameters.Count == 0);
+                Assert.True(m.HasBody);
+                Assert.Single(m.Body.Instructions);
+                Assert.Equal(Mono.Cecil.Cil.OpCodes.Ret, m.Body.Instructions[0].OpCode);
+            }
         }
         finally
         {
@@ -5769,6 +6488,383 @@ public sealed class RewriteTests
                 Assert.NotNull(big);
                 object? bigImg = cibM.Invoke(null, new object?[] { ctx, big, null, Enum.ToObject(imgOptsT, 0) });
                 Assert.NotNull(bigImg);
+                // Source custody: uploading must not consume the caller's
+                // bitmap. The tile loop disposes its clips; with uncounted
+                // identity clips that Dispose pool-returned a live single-ref
+                // source (0x0 afterwards) or freed a wrapper the pipeline
+                // still read (NRE). Both sources must still report size.
+                var bigSize = srcIface.GetProperty("Size")!.GetValue(big);
+                Assert.NotNull(bigSize);
+                Assert.Equal(300, (int)sizeT.GetProperty("Width")!.GetValue(bigSize)!);
+                Assert.Equal(300, (int)sizeT.GetProperty("Height")!.GetValue(bigSize)!);
+                var lockedSize = srcIface.GetProperty("Size")!.GetValue(locked);
+                Assert.NotNull(lockedSize);
+                Assert.Equal(8, (int)sizeT.GetProperty("Width")!.GetValue(lockedSize)!);
+                // Ownership hygiene: dispose every refcounted creation
+                // before unload. Otherwise their finalizers run after
+                // the ALC unloads (on a later test's clock) and execute
+                // dead ALC code on the finalizer thread, crashing the
+                // host (FileLoad 0x80131509 / <Module> cctor TIE).
+                foreach (object? d in new object?[] { bigImg, img, rHandle, handle, big, locked, reinterpreted, wrapped })
+                    (d as IDisposable)?.Dispose();
+                (ctx as IDisposable)?.Dispose();
+            }
+            finally { alc.Unload(); }
+        }
+        finally
+        {
+            try { GC.Collect(); GC.WaitForPendingFinalizers(); Directory.Delete(work, true); } catch { }
+        }
+    }
+    [Fact]
+    public void Rewrite_WheelColorProfile_ResourceCache()
+    {
+        // The color wheel paints through dc.GetCachedOrCreateResource
+        // (ambient sRGB profile and ScRgb -> IDeviceColorContext) before
+        // its DrawImage. Headless that call must answer a CPU device
+        // color context; an NSE here blanks the wheel with no paint
+        // ever reaching the DrawImage core. Regression anchor for
+        // NotSupported | GetCachedOrCreateResource (blank Colors wheel).
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string forkDll = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
+        string drawingDll = ShimBinDll("WfWasm.Drawing");
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        string handmap = TestPaths.Repo(@"src\WfWasm.Rewrite.Tool\handmap.paint.net.txt");
+        string[] closure = new[] { "PaintDotNet.Primitives.dll", "PaintDotNet.ComponentModel.dll", "PaintDotNet.Windows.Core.dll", "PaintDotNet.Windows.dll", "PaintDotNet.Windows.Framework.dll" };
+        foreach (string f in closure.Concat(new[] { forkDll, drawingDll, cpuDll, handmap }))
+            if (!File.Exists(f.StartsWith("PaintDotNet") ? Path.Combine(paintDir, f) : f)) return;
+        string work = Path.Combine(Path.GetTempPath(), "WheelProfile_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(work);
+        try
+        {
+            var assemblyMap = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["System.Windows.Forms"] = forkDll,
+                ["System.Windows.Forms.Primitives"] = forkDll,
+                ["System.Drawing"] = drawingDll,
+                ["System.Drawing.Common"] = drawingDll,
+                ["System.Drawing.Primitives"] = drawingDll,
+            };
+            foreach (string f in closure)
+            {
+                string input = Path.Combine(paintDir, f);
+                var typeMap = WfWasm.Rewrite.GapAnalyzer.AutoMap(input, assemblyMap);
+                foreach (string line in File.ReadAllLines(handmap))
+                {
+                    string trimmed = line.Trim();
+                    if (trimmed.Length == 0 || trimmed.StartsWith('#'))
+                        continue;
+                    string[] sides = trimmed.Split('=', 2);
+                    if (sides.Length != 2)
+                        continue;
+                    string[] target = sides[1].Split(':', 2);
+                    if (target.Length != 2)
+                        continue;
+                    typeMap[sides[0]] = (target[0], target[1]);
+                }
+                AssemblyRewriter.Rewrite(input, Path.Combine(work, f), assemblyMap, typeMap, cpuDll);
+            }
+            var alc = new System.Runtime.Loader.AssemblyLoadContext($"WheelProfile_{Guid.NewGuid()}", true);
+            try
+            {
+                string[] dirs = new[] { work, paintDir, Path.GetDirectoryName(forkDll)!, Path.GetDirectoryName(drawingDll)!, Path.GetDirectoryName(cpuDll)! };
+                alc.Resolving += (ctx2, name) =>
+                {
+                    foreach (string d in dirs)
+                    {
+                        string probe = Path.Combine(d, (name.Name ?? "") + ".dll");
+                        if (File.Exists(probe))
+                            return ctx2.LoadFromAssemblyPath(probe);
+                    }
+                    return null;
+                };
+                var core = alc.LoadFromAssemblyPath(Path.Combine(work, "PaintDotNet.Windows.Core.dll"));
+                var wins = alc.LoadFromAssemblyPath(Path.Combine(work, "PaintDotNet.Windows.dll"));
+                var objModel = alc.LoadFromAssemblyPath(Path.Combine(paintDir, "PaintDotNet.ObjectModel.dll"));
+                // Bind-order: ColorProfile.Create pulls PaintDotNet.Runtime
+                // on first touch. Resolving it lazily after sibling
+                // heavyweight contexts have run aborts the host
+                // (FileLoad 0x80131509), so bind every PDN dependency
+                // of the rewritten closure up front, outside Resolving.
+                foreach (string dep in new[] { "PaintDotNet.Runtime.dll", "PaintDotNet.Fundamentals.dll", "PaintDotNet.Systrace.dll", "PaintDotNet.Collections.dll", "PaintDotNet.Primitives.dll" })
+                {
+                    string depPath = Path.Combine(paintDir, dep);
+                    if (File.Exists(depPath))
+                        alc.LoadFromAssemblyPath(depPath);
+                }
+                var profilesT = core.GetType("PaintDotNet.Imaging.ColorProfiles");
+                Assert.NotNull(profilesT);
+                object? srgb = profilesT.GetProperty("Srgb")!.GetValue(null);
+                Assert.NotNull(srgb);
+                object? scrgb = profilesT.GetProperty("ScRgb")!.GetValue(null);
+                Assert.NotNull(scrgb);
+                var ctxT = core.GetType("PaintDotNet.Direct2D1.CpuDrawingContext");
+                Assert.NotNull(ctxT);
+                object? ctx = Activator.CreateInstance(ctxT, new object?[] { 0L });
+                Assert.NotNull(ctx);
+                var cacheT = objModel.GetType("PaintDotNet.ObjectModel.IResourceCache");
+                Assert.NotNull(cacheT);
+                Assert.True(cacheT.IsInstanceOfType(ctx));
+                var dccT = wins.GetType("PaintDotNet.Direct2D1.IDeviceColorContext");
+                Assert.NotNull(dccT);
+                var getRes = cacheT.GetMethod("GetCachedOrCreateResource")!;
+                object? srgbCtx = getRes.Invoke(ctx, new object?[] { srgb, dccT });
+                Assert.NotNull(srgbCtx);
+                Assert.True(dccT.IsInstanceOfType(srgbCtx));
+                object? scrgbCtx = getRes.Invoke(ctx, new object?[] { scrgb, dccT });
+                Assert.NotNull(scrgbCtx);
+                Assert.True(dccT.IsInstanceOfType(scrgbCtx));
+                // Ownership hygiene (see Chain test): results and ctx
+                // are refcounted; finalizers must not outlive unload.
+                (srgbCtx as IDisposable)?.Dispose();
+                (scrgbCtx as IDisposable)?.Dispose();
+                (ctx as IDisposable)?.Dispose();
+            }
+            finally { alc.Unload(); }
+        }
+        finally
+        {
+            try { GC.Collect(); GC.WaitForPendingFinalizers(); Directory.Delete(work, true); } catch { }
+        }
+    }
+    [Fact]
+    public unsafe void Rewrite_WheelUpload_PixelContent()
+    {
+        // The wheel uploads with BufferPrecision.Float16 + DisableColor
+        // SpaceConversion and the bridge blits the result. Size-only
+        // asserts pass on an empty upload, so this fills a solid source,
+        // uploads exactly like EnsureWheelResourcesCreated, reads the
+        // device pixels back, and requires them to survive. Regression
+        // anchor for the live blank wheel (render ran, ~200/88804 bytes
+        // nonzero: image blit empty, only the selector nub painted).
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string forkDll = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
+        string drawingDll = ShimBinDll("WfWasm.Drawing");
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        string handmap = TestPaths.Repo(@"src\WfWasm.Rewrite.Tool\handmap.paint.net.txt");
+        string[] closure = new[] { "PaintDotNet.Primitives.dll", "PaintDotNet.ComponentModel.dll", "PaintDotNet.Windows.Core.dll", "PaintDotNet.Windows.dll", "PaintDotNet.Windows.Framework.dll" };
+        foreach (string f in closure.Concat(new[] { forkDll, drawingDll, cpuDll, handmap }))
+            if (!File.Exists(f.StartsWith("PaintDotNet") ? Path.Combine(paintDir, f) : f)) return;
+        string work = Path.Combine(Path.GetTempPath(), "WheelPixels_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(work);
+        try
+        {
+            var assemblyMap = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["System.Windows.Forms"] = forkDll,
+                ["System.Windows.Forms.Primitives"] = forkDll,
+                ["System.Drawing"] = drawingDll,
+                ["System.Drawing.Common"] = drawingDll,
+                ["System.Drawing.Primitives"] = drawingDll,
+            };
+            foreach (string f in closure)
+            {
+                string input = Path.Combine(paintDir, f);
+                var typeMap = WfWasm.Rewrite.GapAnalyzer.AutoMap(input, assemblyMap);
+                foreach (string line in File.ReadAllLines(handmap))
+                {
+                    string trimmed = line.Trim();
+                    if (trimmed.Length == 0 || trimmed.StartsWith('#'))
+                        continue;
+                    string[] sides = trimmed.Split('=', 2);
+                    if (sides.Length != 2)
+                        continue;
+                    string[] target = sides[1].Split(':', 2);
+                    if (target.Length != 2)
+                        continue;
+                    typeMap[sides[0]] = (target[0], target[1]);
+                }
+                AssemblyRewriter.Rewrite(input, Path.Combine(work, f), assemblyMap, typeMap, cpuDll);
+            }
+            var alc = new System.Runtime.Loader.AssemblyLoadContext($"WheelPixels_{Guid.NewGuid()}", true);
+            try
+            {
+                string[] dirs = new[] { work, paintDir, Path.GetDirectoryName(forkDll)!, Path.GetDirectoryName(drawingDll)!, Path.GetDirectoryName(cpuDll)! };
+                alc.Resolving += (ctx2, name) =>
+                {
+                    foreach (string d in dirs)
+                    {
+                        string probe = Path.Combine(d, (name.Name ?? "") + ".dll");
+                        if (File.Exists(probe))
+                            return ctx2.LoadFromAssemblyPath(probe);
+                    }
+                    return null;
+                };
+                var core = alc.LoadFromAssemblyPath(Path.Combine(work, "PaintDotNet.Windows.Core.dll"));
+                var wins = alc.LoadFromAssemblyPath(Path.Combine(work, "PaintDotNet.Windows.dll"));
+                var prims = alc.LoadFromAssemblyPath(Path.Combine(work, "PaintDotNet.Primitives.dll"));
+                var fw = alc.LoadFromAssemblyPath(Path.Combine(work, "PaintDotNet.Windows.Framework.dll"));
+                var bgraT = prims.GetType("PaintDotNet.Imaging.ColorBgra32");
+                Assert.NotNull(bgraT);
+                var sizeT = prims.GetType("PaintDotNet.Rendering.SizeInt32") ?? core.GetType("PaintDotNet.Rendering.SizeInt32");
+                Assert.NotNull(sizeT);
+                var sizeCtor = sizeT.GetConstructor(new[] { typeof(int), typeof(int) });
+                Assert.NotNull(sizeCtor);
+                var optsT = wins.GetType("PaintDotNet.Imaging.BitmapAllocationOptions");
+                Assert.NotNull(optsT);
+                var allocatorT = core.GetType("PaintDotNet.Imaging.BitmapAllocator");
+                Assert.NotNull(allocatorT);
+                var allocM = allocatorT.GetMethods().First(m => m.Name == "Allocate" && m.IsGenericMethodDefinition && m.GetParameters().Length == 2);
+                var alloc = allocM.MakeGenericMethod(bgraT);
+                object? locked = alloc.Invoke(null, new object?[] { sizeCtor.Invoke(new object?[] { 32, 32 }), Enum.ToObject(optsT, 0) });
+                Assert.NotNull(locked);
+                // Real callers hold the source (control fields, caches):
+                // keep a spare ref so releasing the bitmap lock cannot
+                // drop the last ref before the upload runs.
+                var srcIface = wins.GetType("PaintDotNet.Imaging.IBitmapSource");
+                Assert.NotNull(srcIface);
+                var crefT = wins.GetType("PaintDotNet.Imaging.ImagingObjectRefExtensions");
+                Assert.NotNull(crefT);
+                var crefM = crefT.GetMethods().First(m => m.Name == "CreateRef" && !m.IsGenericMethodDefinition
+                    && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType.FullName == "PaintDotNet.Imaging.IBitmapSource");
+                object? keeper = crefM.Invoke(null, new object?[] { locked });
+                Assert.NotNull(keeper);
+                var lockExtT = core.GetType("PaintDotNet.Imaging.BitmapExtensions");
+                Assert.NotNull(lockExtT);
+                var lockFlags = System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+                var lockFastM = lockExtT.GetMethods(lockFlags).First(m => m.Name == "LockFast" && m.GetParameters().Length == 2);
+                var lockOptsT = wins.GetType("PaintDotNet.Imaging.BitmapLockOptions");
+                Assert.NotNull(lockOptsT);
+                object? bmpLock = lockFastM.Invoke(null, new object?[] { locked, Enum.ToObject(lockOptsT, 0) });
+                Assert.NotNull(bmpLock);
+                var bmpLockIface = wins.GetType("PaintDotNet.Imaging.IBitmapLock");
+                Assert.NotNull(bmpLockIface);
+                // LockFast answers a RefHandle<IBitmapLock>: unwrap it.
+                object? bmpLockInner = bmpLock.GetType().GetMethod("get_Ref")!.Invoke(bmpLock, null);
+                Assert.NotNull(bmpLockInner);
+                bmpLock = bmpLockInner;
+                Assert.True(bmpLockIface.IsInstanceOfType(bmpLock));
+                int stride = (int)bmpLockIface.GetProperty("BufferStride")!.GetValue(bmpLock)!;
+                void* buf = System.Reflection.Pointer.Unbox(bmpLockIface.GetProperty("Buffer")!.GetValue(bmpLock)!);
+                byte* row0 = (byte*)buf;
+                for (int y = 0; y < 32; y++)
+                    for (int x = 0; x < 32; x++)
+                    {
+                        byte* px = row0 + y * stride + x * 4;
+                        px[0] = 255; px[1] = 255; px[2] = 255; px[3] = 255;
+                    }
+                (bmpLock as IDisposable)?.Dispose();
+                var ctxT = core.GetType("PaintDotNet.Direct2D1.CpuDrawingContext");
+                Assert.NotNull(ctxT);
+                object? ctx = Activator.CreateInstance(ctxT, new object?[] { 0L });
+                Assert.NotNull(ctx);
+                var precT = fw.GetType("PaintDotNet.Direct2D1.BufferPrecision") ?? core.GetType("PaintDotNet.Direct2D1.BufferPrecision") ?? wins.GetType("PaintDotNet.Direct2D1.BufferPrecision");
+                Assert.NotNull(precT);
+                var imgOptsT = fw.GetType("PaintDotNet.Direct2D1.BitmapImageOptions");
+                Assert.NotNull(imgOptsT);
+                var dceT = fw.GetType("PaintDotNet.Direct2D1.DeviceContextExtensions");
+                Assert.NotNull(dceT);
+                // The 5-arg extension is trim-kept only when its caller
+                // (paintdotnet) joins the closure, so call CreateImpl
+                // directly: same tiling/upload path the wheel takes.
+                var implFlags = System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+                var createImpl = dceT.Assembly.GetType("PaintDotNet.Direct2D1.BitmapImage")!.GetMethods(implFlags)
+                    .First(m => m.Name == "CreateImpl" && m.GetParameters().Length == 5);
+                object? img = createImpl.Invoke(null, new object?[] { ctx, locked, null, Enum.Parse(precT, "Float16"), Enum.Parse(imgOptsT, "DisableColorSpaceConversion") });
+                Assert.NotNull(img);
+                var inner = img.GetType().GetField("image", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(img);
+                Assert.NotNull(inner);
+                // Readback through the CPU helper (mirrors the bridge's
+                // pinned-target extract): the device bitmap wraps one
+                // native handle field.
+                // Unwrap through the product's own fixpoint (effect
+                // inputs, proxies, BitmapImage shells) to the raw
+                // device bitmap, then take its CPU handle.
+                var cpuAsm = alc.LoadFromAssemblyPath(cpuDll);
+                var cpuPaintT = cpuAsm.GetType("WfWasm.PdnCpu.CpuPaint");
+                Assert.NotNull(cpuPaintT);
+                var unwrapM = cpuPaintT.GetMethod("GetProxySourceImage");
+                Assert.NotNull(unwrapM);
+                object? raw = unwrapM.Invoke(null, new object?[] { inner });
+                if (raw is null)
+                {
+                    // Plain (non-effect) proxy shells: chase _inner,
+                    // InnerRef, RefHandle refs, effect inputs and image
+                    // fields until the _handle carrier is reached.
+                    raw = inner;
+                    var seen = new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal);
+                    var iif2 = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+                    for (int pass = 0; pass < 8 && raw is not null; pass++)
+                    {
+                        var rt = raw.GetType();
+                        if (!seen.Add(rt.FullName ?? "?")) break;
+                        if (rt.GetField("_handle", iif2) is not null) break;
+                        object? next = null;
+                        try { next = rt.GetField("_inner", iif2)?.GetValue(raw); } catch { }
+                        if (next is null)
+                            foreach (var cand in rt.GetProperties(iif2))
+                                if (cand.Name == "InnerRef" && cand.GetIndexParameters().Length == 0)
+                                { try { next = cand.GetValue(raw); } catch { } if (next is not null) break; }
+                        if (next is null)
+                        {
+                            var href = rt.GetMethod("get_Ref", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
+                            try { next = href?.Invoke(raw, null); } catch { }
+                        }
+                        if (next is null && rt.FullName is not null && rt.FullName.Contains("Effect"))
+                        {
+                            try
+                            {
+                                var bag = rt.GetMethod("get_Properties", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public)?.Invoke(raw, null);
+                                var acc = bag?.GetType().GetMethod("get_Source")?.Invoke(bag, null);
+                                next = acc?.GetType().GetMethod("Get", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public)?.Invoke(acc, null);
+                            }
+                            catch { }
+                            if (next is null)
+                            {
+                                // Product fallback: IDeviceEffect.GetInput.
+                                try
+                                {
+                                    var gin = rt.GetMethod("GetInput", new[] { typeof(int) }) ?? rt.GetMethod("GetInput", System.Type.EmptyTypes);
+                                    if (gin is not null)
+                                        next = gin.GetParameters().Length == 0 ? gin.Invoke(raw, null) : gin.Invoke(raw, new object[] { 0 });
+                                }
+                                catch { }
+                            }
+                        }
+                        if (next is null)
+                        {
+                            try { next = rt.GetField("image", iif2)?.GetValue(raw); } catch { }
+                        }
+                        if (next is null || ReferenceEquals(next, raw)) break;
+                        raw = next;
+                    }
+                }
+                Assert.NotNull(raw);
+                var iif3 = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+                var handleF = raw.GetType().GetField("_handle", iif3);
+                Assert.True(handleF is not null && handleF.FieldType == typeof(long),
+                    "UNWRAPPED " + raw.GetType().FullName);
+                long bmpHandle = (long)handleF.GetValue(raw)!;
+                Assert.NotEqual(0, bmpHandle);
+                var dlM = cpuPaintT.GetMethod("DownloadBitmap", new[] { typeof(long), typeof(IntPtr), typeof(int) });
+                Assert.NotNull(dlM);
+                byte[] pixels = new byte[32 * 32 * 4];
+                unsafe
+                {
+                    fixed (byte* p = pixels)
+                        dlM.Invoke(null, new object?[] { bmpHandle, (IntPtr)p, 32 * 4 });
+                }
+                long nz = 0;
+                foreach (byte b in pixels)
+                    if (b != 0) nz++;
+                Assert.True(nz > pixels.Length / 2, $"Float16 upload lost pixels: {nz}/{pixels.Length} nonzero");
+                // Ordering robustness (live scenario: controls dispose
+                // sources while images live): drop every source-side
+                // ref and read the upload back again.
+                (keeper as IDisposable)?.Dispose();
+                (locked as IDisposable)?.Dispose();
+                byte[] pixels2 = new byte[32 * 32 * 4];
+                unsafe
+                {
+                    fixed (byte* p2 = pixels2)
+                        dlM.Invoke(null, new object?[] { bmpHandle, (IntPtr)p2, 32 * 4 });
+                }
+                long nz2 = 0;
+                foreach (byte b in pixels2)
+                    if (b != 0) nz2++;
+                Assert.True(nz2 > pixels2.Length / 2, $"effect lost its input after creator dispose: {nz2}/{pixels2.Length} nonzero");
+                (img as IDisposable)?.Dispose();
+                (ctx as IDisposable)?.Dispose();
             }
             finally { alc.Unload(); }
         }
@@ -5874,6 +6970,11 @@ public sealed class RewriteTests
                     ? tie.InnerException : thrown;
                 Assert.IsType<System.NotSupportedException>(inner);
                 Assert.Contains("(empty)", inner.Message);
+                // Ownership hygiene (see Chain test): no live refs may
+                // survive into unload, or their finalizers crash a
+                // later test's host from the finalizer thread.
+                (empty as IDisposable)?.Dispose();
+                (ctx as IDisposable)?.Dispose();
             }
             finally { alc.Unload(); }
         }
@@ -5883,13 +6984,17 @@ public sealed class RewriteTests
         }
     }
     [Fact]
-    public void Rewrite_Reinterpret_Answers_Source()
+    public void Rewrite_Reinterpret_Keeps_Wrapper()
     {
-        // BitmapImage.CreateReinterpretedBitmap wraps the source in a
-        // COM-flavored ref whose inner comes back null headless, so the
-        // wrapper faults on every later Size/Lock (color wheel). Its only
-        // caller passes a same-bits-per-pixel format, so the source is
-        // answered directly. Regression: NRE | BitmapExtensions.LockFast.
+        // BitmapImage.CreateReinterpretedBitmap must keep its real body
+        // (a fresh ReinterpretedBitmapSource wrapper). An earlier
+        // identity shortcut answered the caller's own bitmap; CreateImpl
+        // then disposed it as an owned tile clip, pool-returning live
+        // single-ref sources (0x0 afterwards) and freeing wrappers the
+        // pipeline still read (NRE in Size). Ownership safety now comes
+        // from counted clips (CreateRef), so the owned wrapper is real.
+        // Regression: source-kill in CreateImageFromBitmap; NRE |
+        // BitmapExtensions.LockFast via ReinterpretedBitmapSource.Size.
         string paintDir = TestPaths.Repo(@"targets\paint.net");
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Framework.dll");
         if (!File.Exists(input)) return;
@@ -5912,7 +7017,8 @@ public sealed class RewriteTests
                 && m.ReturnType.FullName == "PaintDotNet.Imaging.IBitmapSource");
             Assert.NotNull(reinterpret);
             var ops = reinterpret.Body.Instructions.Select(i => i.OpCode).ToList();
-            Assert.Equal(new[] { Mono.Cecil.Cil.OpCodes.Ldarg_0, Mono.Cecil.Cil.OpCodes.Ret }, ops);
+            Assert.True(ops.Count > 2);
+            Assert.Contains(Mono.Cecil.Cil.OpCodes.Newobj, ops);
         }
         finally
         {

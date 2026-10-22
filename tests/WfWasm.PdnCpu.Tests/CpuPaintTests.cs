@@ -1374,4 +1374,469 @@ public sealed unsafe class CpuPaintTests
         Assert.Equal(10f / 255f, (float)h[2], 3);
         Assert.Equal(40f / 255f, (float)h[3], 3);
     }
+
+    [Fact]
+    public void BlitRaster_Tints_WhiteAlpha_With_Ink_SourceOver()
+    {
+        var (ctx, pixels, pin) = MakeBgraTarget(4, 4);
+        try
+        {
+            // 2x2 white-with-alpha sprite: opaque, half, zero, opaque.
+            byte[] rgba = new byte[2 * 2 * 4];
+            rgba[3] = 255;
+            rgba[7] = 128;
+            rgba[11] = 0;
+            rgba[15] = 255;
+            CpuPaint.BlitRaster(ctx, rgba, 2, 2, 1f, 1f, 1f, 1f, 0f, 0f, 1f);
+            uint full = PixelOf(pixels, 4, 1, 1);
+            Assert.Equal(255u, full >> 24);
+            Assert.Equal(255u, (full >> 16) & 0xFFu);
+            Assert.Equal(0u, (full >> 8) & 0xFFu);
+            Assert.Equal(0u, full & 0xFFu);
+            uint half = PixelOf(pixels, 4, 2, 1);
+            Assert.Equal(128u, half >> 24);
+            Assert.Equal(128u, (half >> 16) & 0xFFu);
+            Assert.Equal(0u, PixelOf(pixels, 4, 1, 2));
+            Assert.Equal(0u, PixelOf(pixels, 4, 0, 0));
+            Assert.Equal(0u, PixelOf(pixels, 4, 3, 3));
+        }
+        finally
+        {
+            CpuPaint.FreeContext(ctx);
+            pin.Free();
+        }
+    }
+
+    private sealed class FakeEffectToken
+    {
+        public string Tag { get; set; } = "t";
+        public FakeEffectToken CloneT() => new FakeEffectToken { Tag = Tag };
+    }
+
+    private sealed class FakePaintSurface
+    {
+        public bool WasCloned;
+        public int Width => 320;
+        public int Height => 200;
+        public FakePaintSurface Clone()
+        {
+            WasCloned = true;
+            return new FakePaintSurface();
+        }
+    }
+
+    private sealed class FakePaintLayer
+    {
+        public FakePaintSurface Surface { get; } = new FakePaintSurface();
+    }
+
+    private sealed class FakeDocWorkspace
+    {
+        public FakePaintLayer ActiveLayer { get; } = new FakePaintLayer();
+        public FakeHistoryStack History { get; } = new FakeHistoryStack();
+        public int ActiveLayerIndex => 0;
+    }
+
+    private sealed class FakeHistoryStack
+    {
+        public readonly System.Collections.Generic.List<object> Pushed = new();
+        public void PushNewMemento(object memento) => Pushed.Add(memento);
+    }
+
+    private sealed class FakeAppWorkspace
+    {
+        public FakeDocWorkspace ActiveDocumentWorkspace { get; } = new FakeDocWorkspace();
+    }
+
+    private class FakeEffectMenu
+    {
+        public FakeAppWorkspace AppWorkspace { get; } = new FakeAppWorkspace();
+        public readonly System.Collections.Generic.List<object?[]> DoEffectCalls = new();
+        public bool LastResult = true;
+
+        private bool DoEffect(object effect, object token, object? a, object? b, object snapshot, out object? error)
+        {
+            error = null;
+            DoEffectCalls.Add(new object?[] { effect, token, a, b, snapshot });
+            return LastResult;
+        }
+    }
+
+    private sealed class FakeEffectDialog
+    {
+        public int DialogResult { get; set; }
+        public object Effect { get; set; } = new object();
+        public object Token { get; set; } = new FakeEffectToken();
+    }
+
+    private interface IEffectConfigForm
+    {
+    }
+
+    private sealed class FakeEffectDialogInner : IEffectConfigForm
+    {
+        public int DialogResult { get; set; }
+        public object Effect { get; set; } = new object();
+        public object Token { get; set; } = new FakeEffectToken();
+    }
+
+    private sealed class FakeEffectDialogWrapper
+    {
+        public IEffectConfigForm? innerRef;
+        public FakeEffectDialogWrapper(IEffectConfigForm inner) { innerRef = inner; }
+    }
+
+    [Fact]
+    public void ResumeEffectApply_Runs_DoEffect_With_Cloned_Token_And_Snapshot()
+    {
+        var menu = new FakeEffectMenu();
+        var dialog = new FakeEffectDialog { DialogResult = 1 };
+        var live = menu.AppWorkspace.ActiveDocumentWorkspace.ActiveLayer.Surface;
+        CpuPaint.NoteEffectMenu(dialog, menu);
+        Assert.True(CpuPaint.ResumeEffectApply(dialog));
+        Assert.Single(menu.DoEffectCalls);
+        object?[] call = menu.DoEffectCalls[0];
+        Assert.Same(dialog.Effect, call[0]);
+        // The token is cloned (dialog keeps its own) and the surface is
+        // a snapshot (the live layer is the render target, not the
+        // memento source).
+        Assert.NotSame(dialog.Token, call[1]);
+        Assert.IsType<FakeEffectToken>(call[1]);
+        Assert.NotSame(live, call[4]);
+        Assert.IsType<FakePaintSurface>(call[4]);
+        Assert.True(live.WasCloned);
+        // The render-scan Results are real full-surface scans, not the
+        // nulls that made DoEffect absorb the apply with no undo push.
+        var scans = Assert.IsType<PaintDotNet.Functional.ResultValueImpl<
+            System.Collections.Generic.IReadOnlyList<PaintDotNet.Rendering.RectInt32>>>(call[2]);
+        Assert.Same(scans, call[3]);
+        var rects = Assert.Single(scans.Value);
+        Assert.Equal(0, rects.X);
+        Assert.Equal(0, rects.Y);
+        Assert.Equal(320, rects.Width);
+        Assert.Equal(200, rects.Height);
+        // The stash is consumed: a second settle is a silent no-op.
+        Assert.False(CpuPaint.ResumeEffectApply(dialog));
+        Assert.Single(menu.DoEffectCalls);
+    }
+
+    [Fact]
+    public void ResumeEffectApply_Resolves_Wrapper_Inner_Form()
+    {
+        // Live, the noted dialog is an EffectConfigFormWrapper while
+        // FormClosed fires on the hosted inner form (LevelsGpuEffectForm):
+        // the note must cover the inner instance or the resume misses.
+        var menu = new FakeEffectMenu();
+        var inner = new FakeEffectDialogInner { DialogResult = 1 };
+        var wrapper = new FakeEffectDialogWrapper(inner);
+        CpuPaint.NoteEffectMenu(wrapper, menu);
+        Assert.True(CpuPaint.ResumeEffectApply(inner));
+        Assert.Single(menu.DoEffectCalls);
+        Assert.Same(inner.Effect, menu.DoEffectCalls[0][0]);
+    }
+
+    private sealed class FakeDerivedMenu : FakeEffectMenu
+    {
+    }
+
+    private sealed class FakeEffectInfo
+    {
+        public string Name => "Levels";
+    }
+
+    private sealed class FakeGpuEffectWithInfo : PaintDotNet.Effects.IEffect
+    {
+        // Explicit, like the product GPU effects: the public
+        // get_EffectInfo lookup misses and the resume must use the
+        // interface map, or the history row shows the class name.
+        object PaintDotNet.Effects.IEffect.get_EffectInfo() => new FakeEffectInfo();
+    }
+
+    [Fact]
+    public void DefuseWaitHandle_Keeps_Events_Usable_Without_Finalizer_Crash()
+    {
+        // Nulls and non-handles are silent no-ops.
+        CpuPaint.DefuseWaitHandle(null);
+        CpuPaint.DefuseWaitHandle(new object());
+        // Real events stay fully usable after defusing (Dispose still
+        // releases normally); the abandoned ones simply leak instead
+        // of finalize-crashing the browser PAL.
+        using var mre = new System.Threading.ManualResetEvent(false);
+        CpuPaint.DefuseWaitHandle(mre);
+        Assert.False(mre.WaitOne(0));
+        Assert.True(mre.Set());
+        Assert.True(mre.WaitOne(0));
+        using var are = new System.Threading.AutoResetEvent(false);
+        CpuPaint.DefuseWaitHandle(are);
+        Assert.True(are.Set());
+        Assert.True(are.WaitOne(0));
+        // Abandoned defused handles survive a full collection with no
+        // finalizer behind them (live: no WaitSubsystem.DeleteHandle).
+        for (int i = 0; i < 200; i++)
+            CpuPaint.DefuseWaitHandle(new System.Threading.ManualResetEvent(false));
+        System.GC.Collect();
+        System.GC.WaitForPendingFinalizers();
+        System.GC.Collect();
+    }
+
+    [Fact]
+    public void ResumeEffectApply_Pushes_Named_History_Memento()
+    {
+        var menu = new FakeEffectMenu();
+        var dialog = new FakeEffectDialog
+        {
+            DialogResult = 1,
+            Effect = new FakeGpuEffectWithInfo(),
+        };
+        CpuPaint.NoteEffectMenu(dialog, menu);
+        Assert.True(CpuPaint.ResumeEffectApply(dialog));
+        var history = menu.AppWorkspace.ActiveDocumentWorkspace.History;
+        var memento = Assert.Single(history.Pushed);
+        var saved = Assert.IsType<PaintDotNet.HistoryMementos.BitmapHistoryMemento>(memento);
+        // Desktop b__0 names the row from EffectInfo, not the class.
+        Assert.Equal("Levels", saved.SavedName);
+        // The memento guards the pre-effect snapshot over the same
+        // full-surface scans handed to DoEffect (unwrapped from the
+        // Result, exactly as desktop b__0 reads get_Value()).
+        // DoEffect's `original` arg is a SEPARATE sacrificial clone:
+        // its copy phase renders into it, so handing it the pristine
+        // snapshot would contaminate the undo bytes (undo restores
+        // post-effect pixels: a silent no-op). Both clones come from
+        // the live layer surface but neither may alias it or share
+        // with each other.
+        object liveSurface = menu.AppWorkspace.ActiveDocumentWorkspace.ActiveLayer.Surface;
+        Assert.NotSame(liveSurface, menu.DoEffectCalls[0][4]);
+        Assert.NotSame(liveSurface, saved.SavedOriginal);
+        Assert.NotSame(menu.DoEffectCalls[0][4], saved.SavedOriginal);
+        var scansArg = Assert.IsType<PaintDotNet.Functional.ResultValueImpl<
+            System.Collections.Generic.IReadOnlyList<PaintDotNet.Rendering.RectInt32>>>(
+            menu.DoEffectCalls[0][2]);
+        Assert.Same(scansArg.Value, saved.SavedScans);
+        Assert.Same(scansArg, menu.DoEffectCalls[0][3]);
+        Assert.Equal(0, saved.SavedLayerIndex);
+    }
+
+    [Fact]
+    public void ResumeEffectApply_Finds_Base_Private_DoEffect()
+    {
+        // Live menus derive (AdjustmentsMenu): the private base DoEffect
+        // is invisible through the derived type without a hierarchy walk
+        // (observed live: resume failed with "needs EffectMenuBase.DoEffect").
+        var menu = new FakeDerivedMenu();
+        var dialog = new FakeEffectDialog { DialogResult = 1 };
+        CpuPaint.NoteEffectMenu(dialog, menu);
+        Assert.True(CpuPaint.ResumeEffectApply(dialog));
+        Assert.Single(menu.DoEffectCalls);
+    }
+
+    [Fact]
+    public void ResumeEffectApply_Ignores_Non_Ok_Settle()
+    {
+        var menu = new FakeEffectMenu();
+        var dialog = new FakeEffectDialog { DialogResult = 2 };
+        CpuPaint.NoteEffectMenu(dialog, menu);
+        Assert.False(CpuPaint.ResumeEffectApply(dialog));
+        Assert.Empty(menu.DoEffectCalls);
+    }
+
+    [Fact]
+    public void ResumeEffectApply_Noop_Without_Note_Or_Shape()
+    {
+        var menu = new FakeEffectMenu();
+        Assert.False(CpuPaint.ResumeEffectApply(null));
+        Assert.False(CpuPaint.ResumeEffectApply(new FakeEffectDialog { DialogResult = 1 }));
+        var anonymous = new { DialogResult = 1 };
+        CpuPaint.NoteEffectMenu(anonymous, menu);
+        Assert.False(CpuPaint.ResumeEffectApply(anonymous));
+        Assert.Empty(menu.DoEffectCalls);
+    }
+
+    private struct FakeRgb96Float
+    {
+        public float R { get; set; }
+        public float G { get; set; }
+        public float B { get; set; }
+    }
+
+    private sealed class FakeLevelsParams
+    {
+        public FakeRgb96Float InputBlackPoint { get; set; } = new FakeRgb96Float();
+        public FakeRgb96Float InputWhitePoint { get; set; } = new FakeRgb96Float { R = 1, G = 1, B = 1 };
+        public FakeRgb96Float Gamma { get; set; } = new FakeRgb96Float { R = 1, G = 1, B = 1 };
+        public FakeRgb96Float OutputBlackPoint { get; set; } = new FakeRgb96Float();
+        public FakeRgb96Float OutputWhitePoint { get; set; } = new FakeRgb96Float { R = 1, G = 1, B = 1 };
+    }
+
+    private sealed class FakeLevelsToken
+    {
+        public FakeLevelsParams Levels { get; } = new FakeLevelsParams();
+    }
+
+    private class FakeEffectBase
+    {
+        protected object? Token { get; } = null;
+    }
+
+    private sealed class FakeLevelsGpuEffect : FakeEffectBase
+    {
+        // Protected like the real EffectBase.Token, and shadowed with
+        // new like GpuEffect<TToken>.Token: the renderer must walk
+        // most-derived first (observed live: flat lookup died with
+        // AmbiguousMatchException and every tile fell through).
+        protected new FakeLevelsToken Token { get; } = new FakeLevelsToken();
+        public FakeLevelsParams LevelsForTest => Token.Levels;
+    }
+
+    private sealed class FakeGpuEffect
+    {
+        public sealed class Renderer
+        {
+            public object? owner;
+            public Renderer(object? owner) { this.owner = owner; }
+        }
+    }
+
+    private sealed class FakeTile
+    {
+        public IntPtr Ptr { get; set; }
+        public int Width { get; set; }
+        public int Height { get; set; }
+        public int Stride { get; set; }
+    }
+
+    private sealed class FakePoint
+    {
+        public int X { get; set; }
+        public int Y { get; set; }
+    }
+
+    [Fact]
+    public void LevelsLut_Identity_Roundtrips()
+    {
+        // Oracle values computed independently (python, IEEE double):
+        // the linear pipeline must be exactly invertible here.
+        foreach (int c in new[] { 0, 1, 10, 64, 128, 200, 254, 255 })
+            Assert.Equal(c, (int)CpuPaint.ApplyLevelsChannel(CpuPaint.SrgbByteToLinear(c), 0, 1, 1, 0, 1));
+    }
+
+    [Fact]
+    public void LevelsLut_Constant_Point_Gamma_Direction_Floor_Clip()
+    {
+        Assert.Equal(188, (int)CpuPaint.ApplyLevelsChannel(CpuPaint.SrgbByteToLinear(30), 0, 1, 1, 0.5, 0.5));
+        // Higher gamma brightens (Photoshop-compatible v1 convention).
+        Assert.Equal(181, (int)CpuPaint.ApplyLevelsChannel(CpuPaint.SrgbByteToLinear(128), 0, 1, 2, 0, 1));
+        Assert.Equal(61, (int)CpuPaint.ApplyLevelsChannel(CpuPaint.SrgbByteToLinear(128), 0, 1, 0.5, 0, 1));
+        Assert.Equal(137, (int)CpuPaint.ApplyLevelsChannel(CpuPaint.SrgbByteToLinear(0), 0, 1, 1, 0.25, 1));
+        Assert.Equal(0, (int)CpuPaint.ApplyLevelsChannel(CpuPaint.SrgbByteToLinear(64), 0.25, 1, 1, 0, 1));
+    }
+
+    [Fact]
+    public void TryRenderGpuTileCpu_Rejects_NonLevels()
+    {
+        Assert.False(CpuPaint.TryRenderGpuTileCpu(null, null, null));
+        Assert.False(CpuPaint.TryRenderGpuTileCpu(new object(), new object(), new object()));
+        var blurOwner = new FakeEffectDialog();
+        var blurRenderer = new FakeGpuEffect.Renderer(blurOwner);
+        Assert.False(CpuPaint.TryRenderGpuTileCpu(blurRenderer, new FakeTile(), new FakePoint()));
+    }
+
+    [Fact]
+    public void TryRenderGpuTileCpu_Renders_Levels_Identity_Tile()
+    {
+        var effect = new FakeLevelsGpuEffect();
+        // 2x1 BGRA: opaque mid-gray + opaque black.
+        byte[] src = new byte[] { 128, 128, 128, 255, 0, 0, 0, 255 };
+        CpuPaint.NoteTileSourceBytes(effect, src, 2, 1, 8);
+        byte[] dstBytes = new byte[8];
+        var pin = System.Runtime.InteropServices.GCHandle.Alloc(dstBytes, System.Runtime.InteropServices.GCHandleType.Pinned);
+        try
+        {
+            var tile = new FakeTile { Ptr = pin.AddrOfPinnedObject(), Width = 2, Height = 1, Stride = 8 };
+            Assert.True(CpuPaint.TryRenderGpuTileCpu(new FakeGpuEffect.Renderer(effect), tile, new FakePoint()));
+            Assert.Equal(128, (int)dstBytes[0]);
+            Assert.Equal(0, (int)dstBytes[4]);
+            Assert.Equal(255, (int)dstBytes[3]);
+        }
+        finally
+        {
+            pin.Free();
+        }
+    }
+
+    [Fact]
+    public void TryRenderGpuTileCpu_Renders_Levels_Constant_Tile()
+    {
+        var effect = new FakeLevelsGpuEffect();
+        effect.LevelsForTest.OutputBlackPoint = new FakeRgb96Float { R = 0.5f, G = 0.5f, B = 0.5f };
+        effect.LevelsForTest.OutputWhitePoint = new FakeRgb96Float { R = 0.5f, G = 0.5f, B = 0.5f };
+        byte[] src = new byte[] { 30, 200, 90, 255, 0, 0, 0, 255 };
+        CpuPaint.NoteTileSourceBytes(effect, src, 2, 1, 8);
+        byte[] dstBytes = new byte[8];
+        var pin = System.Runtime.InteropServices.GCHandle.Alloc(dstBytes, System.Runtime.InteropServices.GCHandleType.Pinned);
+        try
+        {
+            var tile = new FakeTile { Ptr = pin.AddrOfPinnedObject(), Width = 2, Height = 1, Stride = 8 };
+            Assert.True(CpuPaint.TryRenderGpuTileCpu(new FakeGpuEffect.Renderer(effect), tile, new FakePoint()));
+            // Desktop derivation, not implementation echo: constant
+            // sRGB-0.5 output is byte 128. (The old 188 enshrined the
+            // v1 boundary bug: sRGB token points fed as linear.)
+            Assert.Equal(128, (int)dstBytes[0]);
+            Assert.Equal(128, (int)dstBytes[1]);
+            Assert.Equal(128, (int)dstBytes[2]);
+            Assert.Equal(128, (int)dstBytes[4]);
+        }
+        finally
+        {
+            pin.Free();
+        }
+    }
+
+    [Fact]
+    public void TryRenderGpuTileCpu_Linearizes_Srgb_Token_Points()
+    {
+        // Live oracle (rev123d probe): dialog white-point 100 with a
+        // dark stroke remapped 85 -> ~132 under the v1 boundary bug
+        // (sRGB token fed as linear). Correct linear-light math maps
+        // 85 -> 220; the tile path must agree exactly.
+        var effect = new FakeLevelsGpuEffect();
+        float w = 100f / 255f;
+        effect.LevelsForTest.InputWhitePoint = new FakeRgb96Float { R = w, G = w, B = w };
+        byte[] src = new byte[] { 85, 85, 85, 255, 0, 0, 0, 255 };
+        CpuPaint.NoteTileSourceBytes(effect, src, 2, 1, 8);
+        byte[] dstBytes = new byte[8];
+        var pin = System.Runtime.InteropServices.GCHandle.Alloc(dstBytes, System.Runtime.InteropServices.GCHandleType.Pinned);
+        try
+        {
+            var tile = new FakeTile { Ptr = pin.AddrOfPinnedObject(), Width = 2, Height = 1, Stride = 8 };
+            Assert.True(CpuPaint.TryRenderGpuTileCpu(new FakeGpuEffect.Renderer(effect), tile, new FakePoint()));
+            Assert.Equal(220, (int)dstBytes[0]);
+            Assert.Equal(220, (int)dstBytes[1]);
+            Assert.Equal(220, (int)dstBytes[2]);
+            Assert.Equal(0, (int)dstBytes[4]);
+        }
+        finally
+        {
+            pin.Free();
+        }
+    }
+
+    [Fact]
+    public void BlitRaster_Guards_Are_Silent_Noop()
+    {
+        // Zero handle, null bytes and dead ink never throw: the
+        // DrawTextLayout fallback owns visible behavior instead.
+        CpuPaint.BlitRaster(0, new byte[4], 1, 1, 0f, 0f, 1f, 1f, 1f, 1f, 1f);
+        CpuPaint.BlitRaster(0, null, 1, 1, 0f, 0f, 1f, 1f, 1f, 1f, 1f);
+        var (ctx, pixels, pin) = MakeBgraTarget(2, 2);
+        try
+        {
+            CpuPaint.BlitRaster(ctx, new byte[16], 2, 2, 0f, 0f, 0f, 1f, 1f, 1f, 0f);
+            Assert.Equal(0u, PixelOf(pixels, 2, 0, 0));
+        }
+        finally
+        {
+            CpuPaint.FreeContext(ctx);
+            pin.Free();
+        }
+    }
 }
