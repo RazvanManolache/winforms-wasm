@@ -247,6 +247,50 @@ public sealed unsafe class CpuPaintTests
     }
 
     [Fact]
+    public void UploadHalfSharedBitmap_Converts_Half_To_Bgra()
+    {
+        // 2x1 premultiplied Half: opaque red + transparent. Regression:
+        // layer/history thumbnails arrive as Half locks and must upload
+        // through CreateSharedBitmap instead of NotSupported (pixel format).
+        ushort one = BitConverter.HalfToUInt16Bits((Half)1.0f);
+        byte[] half = new byte[16];
+        BitConverter.GetBytes(one).CopyTo(half, 0);
+        BitConverter.GetBytes(one).CopyTo(half, 6);
+        GCHandle pin = GCHandle.Alloc(half, GCHandleType.Pinned);
+        try
+        {
+            long bmp = CpuPaint.UploadHalfSharedBitmap(pin.AddrOfPinnedObject(), 16, 2, 1);
+            try
+            {
+                Assert.NotEqual(0, bmp);
+                nint addr = CpuPaint.LockBitmap(bmp);
+                try
+                {
+                    Assert.NotEqual(nint.Zero, addr);
+                    int[] px = new int[2];
+                    Marshal.Copy(addr, px, 0, 2);
+                    Assert.Equal(unchecked((int)0xFFFF0000), px[0]);
+                    Assert.Equal(0, px[1]);
+                }
+                finally
+                {
+                    CpuPaint.UnlockBitmap(bmp);
+                }
+            }
+            finally
+            {
+                CpuPaint.FreeBitmap(bmp);
+            }
+        }
+        finally
+        {
+            pin.Free();
+        }
+        Assert.Equal(0, CpuPaint.UploadHalfSharedBitmap(nint.Zero, 16, 2, 1));
+        Assert.Equal(0, CpuPaint.UploadHalfSharedBitmap((nint)1, 4, 2, 1));
+    }
+
+    [Fact]
     public void Premultiply_Roundtrip_White()
     {
         var pixels = new byte[] { 255, 255, 255, 128, 100, 150, 200, 255 };
@@ -1407,6 +1451,228 @@ public sealed unsafe class CpuPaintTests
         }
     }
 
+    [Fact]
+    public void BlitRaster_Scale2x_Covers_Origin_And_Extent()
+    {
+        var (ctx, pixels, pin) = MakeBgraTarget(8, 8);
+        try
+        {
+            CpuPaint.SetTransform(ctx, 2f, 0f, 0f, 2f, 0f, 0f);
+            // 2x2 sprite: opaque corners on the main diagonal.
+            byte[] rgba = new byte[2 * 2 * 4];
+            rgba[3] = 255;
+            rgba[15] = 255;
+            CpuPaint.BlitRaster(ctx, rgba, 2, 2, 1f, 1f, 1f, 1f, 0f, 0f, 1f);
+            // Origin (1,1) scales to (2,2); each texel covers 2x2.
+            Assert.Equal(255u, PixelOf(pixels, 8, 2, 2) >> 24);
+            Assert.Equal(255u, (PixelOf(pixels, 8, 2, 2) >> 16) & 0xFFu);
+            Assert.Equal(255u, PixelOf(pixels, 8, 3, 3) >> 24);
+            Assert.Equal(255u, PixelOf(pixels, 8, 4, 4) >> 24);
+            Assert.Equal(255u, PixelOf(pixels, 8, 5, 5) >> 24);
+            // Off-diagonal texels are transparent: gaps stay empty.
+            Assert.Equal(0u, PixelOf(pixels, 8, 2, 4) >> 24);
+            Assert.Equal(0u, PixelOf(pixels, 8, 4, 2) >> 24);
+            // Extent ends at (5,5); neighbors untouched.
+            Assert.Equal(0u, PixelOf(pixels, 8, 6, 5) >> 24);
+            Assert.Equal(0u, PixelOf(pixels, 8, 1, 2) >> 24);
+            Assert.Equal(0u, PixelOf(pixels, 8, 0, 0) >> 24);
+        }
+        finally
+        {
+            CpuPaint.FreeContext(ctx);
+            pin.Free();
+        }
+    }
+
+    [Fact]
+    public void BlitRaster_HalfScale_Downsamples_To_Nearest_Texels()
+    {
+        var (ctx, pixels, pin) = MakeBgraTarget(4, 4);
+        try
+        {
+            CpuPaint.SetTransform(ctx, 0.5f, 0f, 0f, 0.5f, 0f, 0f);
+            byte[] rgba = new byte[4 * 1 * 4];
+            for (int i = 0; i < 4; i++)
+                rgba[i * 4 + 3] = 255;
+            CpuPaint.BlitRaster(ctx, rgba, 4, 1, 0f, 0f, 1f, 1f, 1f, 1f, 1f);
+            // 4 texels at half scale cover dest x 0..1 (texels 0 and 2).
+            Assert.Equal(255u, PixelOf(pixels, 4, 0, 0) >> 24);
+            Assert.Equal(255u, PixelOf(pixels, 4, 1, 0) >> 24);
+            Assert.Equal(0u, PixelOf(pixels, 4, 2, 0) >> 24);
+            Assert.Equal(0u, PixelOf(pixels, 4, 0, 1) >> 24);
+        }
+        finally
+        {
+            CpuPaint.FreeContext(ctx);
+            pin.Free();
+        }
+    }
+
+    [Fact]
+    public void BlitRaster_NegativeScale_Mirrors_Texel_Order()
+    {
+        var (ctx, pixels, pin) = MakeBgraTarget(8, 4);
+        try
+        {
+            CpuPaint.SetTransform(ctx, -1f, 0f, 0f, 1f, 4f, 0f);
+            byte[] rgba = new byte[2 * 1 * 4];
+            rgba[3] = 255;
+            rgba[7] = 128;
+            CpuPaint.BlitRaster(ctx, rgba, 2, 1, 0f, 0f, 1f, 1f, 1f, 1f, 1f);
+            // dx0 = round(0 * -1 + 4) = 4: texel 0 lands at 4, texel 1 at 3.
+            Assert.Equal(255u, PixelOf(pixels, 8, 4, 0) >> 24);
+            Assert.Equal(128u, PixelOf(pixels, 8, 3, 0) >> 24);
+            Assert.Equal(0u, PixelOf(pixels, 8, 5, 0) >> 24);
+            Assert.Equal(0u, PixelOf(pixels, 8, 2, 0) >> 24);
+        }
+        finally
+        {
+            CpuPaint.FreeContext(ctx);
+            pin.Free();
+        }
+    }
+
+    [Fact]
+    public void BlitRaster_Translation_Shifts_Identity_Block()
+    {
+        var (ctx, pixels, pin) = MakeBgraTarget(8, 8);
+        try
+        {
+            CpuPaint.SetTransform(ctx, 1f, 0f, 0f, 1f, 2f, 1f);
+            byte[] rgba = new byte[2 * 2 * 4];
+            rgba[3] = 255;
+            rgba[7] = 128;
+            rgba[11] = 0;
+            rgba[15] = 255;
+            CpuPaint.BlitRaster(ctx, rgba, 2, 2, 0f, 0f, 1f, 1f, 1f, 1f, 1f);
+            // Origin (0,0) translates to (2,1).
+            Assert.Equal(255u, PixelOf(pixels, 8, 2, 1) >> 24);
+            Assert.Equal(128u, PixelOf(pixels, 8, 3, 1) >> 24);
+            Assert.Equal(255u, PixelOf(pixels, 8, 3, 2) >> 24);
+            Assert.Equal(0u, PixelOf(pixels, 8, 2, 2) >> 24);
+            Assert.Equal(0u, PixelOf(pixels, 8, 1, 1) >> 24);
+            Assert.Equal(0u, PixelOf(pixels, 8, 4, 3) >> 24);
+        }
+        finally
+        {
+            CpuPaint.FreeContext(ctx);
+            pin.Free();
+        }
+    }
+
+    [Fact]
+    public void BlitRaster_Clips_At_Target_Edge()
+    {
+        var (ctx, pixels, pin) = MakeBgraTarget(4, 4);
+        try
+        {
+            byte[] rgba = new byte[2 * 2 * 4];
+            for (int i = 0; i < 4; i++)
+                rgba[i * 4 + 3] = 255;
+            CpuPaint.BlitRaster(ctx, rgba, 2, 2, 3f, 3f, 1f, 1f, 1f, 1f, 1f);
+            // Only (3,3) is inside the 4x4 target; the rest clips, no throw.
+            Assert.Equal(255u, PixelOf(pixels, 4, 3, 3) >> 24);
+            Assert.Equal(0u, PixelOf(pixels, 4, 2, 3) >> 24);
+            Assert.Equal(0u, PixelOf(pixels, 4, 3, 2) >> 24);
+            Assert.Equal(0u, PixelOf(pixels, 4, 0, 0) >> 24);
+        }
+        finally
+        {
+            CpuPaint.FreeContext(ctx);
+            pin.Free();
+        }
+    }
+
+    [Fact]
+    public void BlitRaster_NonDefaultDpi_Scales_Block_And_Extent()
+    {
+        var (ctx, pixels, pin) = MakeBgraTarget(6, 6);
+        try
+        {
+            // 144 dpi.
+            CpuPaint.SetTransform(ctx, 1.5f, 0f, 0f, 1.5f, 0f, 0f);
+            byte[] rgba = new byte[2 * 2 * 4];
+            for (int i = 0; i < 4; i++)
+                rgba[i * 4 + 3] = 255;
+            CpuPaint.BlitRaster(ctx, rgba, 2, 2, 0f, 0f, 1f, 1f, 1f, 1f, 1f);
+            // 2 texels at 1.5x cover dest 0..2 in each axis.
+            for (int y = 0; y <= 2; y++)
+                for (int x = 0; x <= 2; x++)
+                    Assert.Equal(255u, PixelOf(pixels, 6, x, y) >> 24);
+            Assert.Equal(0u, PixelOf(pixels, 6, 3, 3) >> 24);
+            Assert.Equal(0u, PixelOf(pixels, 6, 3, 0) >> 24);
+            Assert.Equal(0u, PixelOf(pixels, 6, 0, 3) >> 24);
+        }
+        finally
+        {
+            CpuPaint.FreeContext(ctx);
+            pin.Free();
+        }
+    }
+
+    [Fact]
+    public void BlitRaster_Rotation_Is_Rejected_With_No_Paint()
+    {
+        var (ctx, pixels, pin) = MakeBgraTarget(4, 4);
+        try
+        {
+            CpuPaint.SetTransform(ctx, 0f, 1f, -1f, 0f, 5f, 5f);
+            byte[] rgba = new byte[2 * 2 * 4];
+            for (int i = 0; i < 4; i++)
+                rgba[i * 4 + 3] = 255;
+            CpuPaint.BlitRaster(ctx, rgba, 2, 2, 0f, 0f, 1f, 1f, 1f, 1f, 1f);
+            Assert.Equal(new byte[4 * 4 * 4], pixels);
+        }
+        finally
+        {
+            CpuPaint.FreeContext(ctx);
+            pin.Free();
+        }
+    }
+
+    [Fact]
+    public void BlitRaster_Shear_Is_Rejected_With_No_Paint()
+    {
+        var (ctx, pixels, pin) = MakeBgraTarget(4, 4);
+        try
+        {
+            CpuPaint.SetTransform(ctx, 1f, 0.5f, 0f, 1f, 0f, 0f);
+            byte[] rgba = new byte[2 * 2 * 4];
+            for (int i = 0; i < 4; i++)
+                rgba[i * 4 + 3] = 255;
+            CpuPaint.BlitRaster(ctx, rgba, 2, 2, 0f, 0f, 1f, 1f, 1f, 1f, 1f);
+            Assert.Equal(new byte[4 * 4 * 4], pixels);
+        }
+        finally
+        {
+            CpuPaint.FreeContext(ctx);
+            pin.Free();
+        }
+    }
+
+    [Fact]
+    public void BlitRaster_Zero_And_NaN_Scale_Are_Rejected_With_No_Paint()
+    {
+        foreach (float s in new[] { 0f, float.NaN })
+        {
+            var (ctx, pixels, pin) = MakeBgraTarget(4, 4);
+            try
+            {
+                CpuPaint.SetTransform(ctx, s, 0f, 0f, 1f, 0f, 0f);
+                byte[] rgba = new byte[2 * 2 * 4];
+                for (int i = 0; i < 4; i++)
+                    rgba[i * 4 + 3] = 255;
+                CpuPaint.BlitRaster(ctx, rgba, 2, 2, 0f, 0f, 1f, 1f, 1f, 1f, 1f);
+                Assert.Equal(new byte[4 * 4 * 4], pixels);
+            }
+            finally
+            {
+                CpuPaint.FreeContext(ctx);
+                pin.Free();
+            }
+        }
+    }
+
     private sealed class FakeEffectToken
     {
         public string Tag { get; set; } = "t";
@@ -1838,5 +2104,166 @@ public sealed unsafe class CpuPaintTests
             CpuPaint.FreeContext(ctx);
             pin.Free();
         }
+    }
+
+    [Fact]
+    public void ThumbBridge_Opaque_White_RoundTrips_Exactly()
+    {
+        byte[] bgra = new byte[] { 255, 255, 255, 255 };
+        byte[] half = CpuPaint.ThumbBgra32ToHalfBytes(bgra, 4, 1, 1);
+        Assert.Equal(8, half.Length);
+        Assert.Equal((Half)1f, BitConverter.ToHalf(half, 0));
+        Assert.Equal((Half)1f, BitConverter.ToHalf(half, 2));
+        Assert.Equal((Half)1f, BitConverter.ToHalf(half, 4));
+        Assert.Equal((Half)1f, BitConverter.ToHalf(half, 6));
+        Assert.Equal(bgra, CpuPaint.ThumbHalfToBgra32Bytes(half, 8, 1, 1));
+    }
+
+    [Fact]
+    public void ThumbBridge_Opaque_Black_RoundTrips_Exactly()
+    {
+        byte[] bgra = new byte[] { 0, 0, 0, 255 };
+        byte[] half = CpuPaint.ThumbBgra32ToHalfBytes(bgra, 4, 1, 1);
+        Assert.Equal((Half)0f, BitConverter.ToHalf(half, 0));
+        Assert.Equal((Half)0f, BitConverter.ToHalf(half, 2));
+        Assert.Equal((Half)0f, BitConverter.ToHalf(half, 4));
+        Assert.Equal((Half)1f, BitConverter.ToHalf(half, 6));
+        Assert.Equal(bgra, CpuPaint.ThumbHalfToBgra32Bytes(half, 8, 1, 1));
+    }
+
+    [Fact]
+    public void ThumbBridge_Transparent_Is_All_Zero()
+    {
+        byte[] bgra = new byte[] { 10, 20, 30, 0 };
+        byte[] half = CpuPaint.ThumbBgra32ToHalfBytes(bgra, 4, 1, 1);
+        Assert.Equal(new byte[8], half);
+        Assert.Equal(new byte[] { 0, 0, 0, 0 }, CpuPaint.ThumbHalfToBgra32Bytes(half, 8, 1, 1));
+    }
+
+    [Fact]
+    public void ThumbBridge_Semi_Red_Premultiplies()
+    {
+        byte[] bgra = new byte[] { 0, 0, 255, 128 };
+        byte[] half = CpuPaint.ThumbBgra32ToHalfBytes(bgra, 4, 1, 1);
+        float a = 128f / 255f;
+        Assert.Equal((Half)a, BitConverter.ToHalf(half, 0));
+        Assert.Equal((Half)0f, BitConverter.ToHalf(half, 2));
+        Assert.Equal((Half)0f, BitConverter.ToHalf(half, 4));
+        Assert.Equal((Half)a, BitConverter.ToHalf(half, 6));
+        Assert.Equal(bgra, CpuPaint.ThumbHalfToBgra32Bytes(half, 8, 1, 1));
+    }
+
+    [Fact]
+    public void ThumbBridge_Honors_Stride_Padding()
+    {
+        byte[] bgra = new byte[] { 0, 0, 255, 255, 99, 99, 99, 99, 0, 0, 0, 255, 0, 0, 0, 0 };
+        byte[] half = CpuPaint.ThumbBgra32ToHalfBytes(bgra, 8, 1, 2);
+        Assert.Equal(16, half.Length);
+        Assert.Equal((Half)1f, BitConverter.ToHalf(half, 0));
+        Assert.Equal((Half)1f, BitConverter.ToHalf(half, 6));
+        Assert.Equal((Half)0f, BitConverter.ToHalf(half, 8));
+        Assert.Equal((Half)1f, BitConverter.ToHalf(half, 14));
+    }
+
+    [Fact]
+    public void ThumbBridge_Guards_Throw()
+    {
+        Assert.Throws<ArgumentNullException>(() => CpuPaint.ThumbBgra32ToHalfBytes(null, 4, 1, 1));
+        Assert.Throws<ArgumentNullException>(() => CpuPaint.ThumbHalfToBgra32Bytes(null, 8, 1, 1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => CpuPaint.ThumbBgra32ToHalfBytes(new byte[4], 0, 1, 1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => CpuPaint.ThumbHalfToBgra32Bytes(new byte[8], 0, 1, 1));
+        Assert.Throws<ArgumentException>(() => CpuPaint.ThumbBgra32ToHalfBytes(new byte[3], 4, 1, 1));
+        Assert.Throws<ArgumentException>(() => CpuPaint.ThumbHalfToBgra32Bytes(new byte[7], 8, 1, 1));
+    }
+
+    private sealed class NotedEffectStub
+    {
+        private readonly object _bag;
+        public NotedEffectStub(object bag) { _bag = bag; }
+        public object get_Properties() => _bag;
+    }
+
+    private static System.Collections.Generic.List<object?> CallEffectInputs(object effect)
+    {
+        var mi = typeof(CpuPaint).GetMethod("EffectInputs",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(mi);
+        return Assert.IsType<System.Collections.Generic.List<object?>>(mi.Invoke(null, [effect]));
+    }
+
+    [Fact]
+    public void EffectInputNotes_RoundTrip_By_Bag_And_Index()
+    {
+        // The rewriter notes (Properties bag, index) -> image at
+        // EffectInputAccessor.Set time; the draw-time walk reads the
+        // note table first so ReplaceRef-swapped husks still resolve.
+        object bag = new();
+        object img0 = new();
+        object img1 = new();
+        CpuPaint.NoteEffectInput(bag, 1, img1);
+        CpuPaint.NoteEffectInput(bag, 0, img0);
+        var inputs = CallEffectInputs(new NotedEffectStub(bag));
+        Assert.Equal(2, inputs.Count);
+        Assert.Same(img0, inputs[0]);
+        Assert.Same(img1, inputs[1]);
+    }
+
+    [Fact]
+    public void EffectInputNotes_Null_Clears_Index()
+    {
+        object bag = new();
+        object img = new();
+        CpuPaint.NoteEffectInput(bag, 0, img);
+        Assert.Single(CallEffectInputs(new NotedEffectStub(bag)));
+        CpuPaint.NoteEffectInput(bag, 0, null);
+        Assert.Empty(CallEffectInputs(new NotedEffectStub(bag)));
+    }
+
+    private sealed class NotedCpuDeviceEffectHusk { }
+
+    private sealed class SpliceWrapperStub
+    {
+        private readonly object _bag = new();
+        private readonly NotedCpuDeviceEffectHusk _husk = new();
+        public object get_Properties() => _bag;
+        public NotedCpuDeviceEffectHusk Husk => _husk;
+    }
+
+    [Fact]
+    public void EffectInputNotes_Self_Lookup_Hits_Before_Bag()
+    {
+        // Notes are keyed by the inner husk (the accessor's Storage
+        // resolves to the husk itself), so a directly visited husk must
+        // resolve without going through the wrapper's bag.
+        var w = new SpliceWrapperStub();
+        object img = new();
+        CpuPaint.NoteEffectInput(w, 0, img);
+        var inputs = CallEffectInputs(w);
+        Assert.Single(inputs);
+        Assert.Same(img, inputs[0]);
+    }
+
+    [Fact]
+    public void EffectInputNotes_Splice_Replaces_Husk_In_Wrapper()
+    {
+        // A wrapper visit splices the husk's noted inputs in place of
+        // the husk, collapsing one walk level per effect so deep strip
+        // chains stay inside the depth budget.
+        var w = new SpliceWrapperStub();
+        object img = new();
+        CpuPaint.NoteEffectInput(w.Husk, 0, img);
+        var inputs = CallEffectInputs(w);
+        Assert.Single(inputs);
+        Assert.Same(img, inputs[0]);
+    }
+
+    [Fact]
+    public void EffectInputNotes_Guards_Never_Throw()
+    {
+        object bag = new();
+        CpuPaint.NoteEffectInput(null, 0, new object());
+        CpuPaint.NoteEffectInput(bag, -1, new object());
+        CpuPaint.NoteEffectInput(bag, 65, new object());
+        Assert.Empty(CallEffectInputs(new NotedEffectStub(bag)));
     }
 }

@@ -1,5 +1,20 @@
 # Live browser captures
 
+## 22 October 2026 — panel/thumbnail follow-up
+
+Fresh unaltered PNG captures from the development browser at 1093×884. The app is the separately supplied Paint.NET 5.1.12, not the historical OpenPDN benchmark. Close the app-library sidebar, drag History and Layers toward the right, click the visible colour wheel, then draw `(400,320) → (440,460) → (480,350) → (520,460) → (560,320)` as four separate brush drags.
+
+| Capture | Action/result | Boundary |
+|---|---|---|
+| [Readable panels and four brush strokes](paint-net-panels-2026-10-22.png) | Colors shows RGB/HSV/opacity labels and values; History lists Paintbrush entries; a Layers preview is visible; the document contains a green W | Some toolbar controls remain blue blocks/partial; thumbnail freshness and per-layer accuracy are incomplete |
+| [Undo to blank](paint-net-panels-undo-2026-10-22.png) | Four Ctrl+Z actions clear all strokes and select New Image in History | One sequence, not arbitrary history or saved-state correctness |
+| [Toolbar redo](paint-net-panels-redo-2026-10-22.png) | Four clicks at the visible Redo button restore the strokes | The automated keyboard redo attempt had no visible effect; only toolbar redo is established here |
+| [Clean source-only startup](base-project-panels-2026-10-22.png) | Separate fresh staged-source export, with no app inputs, displays the built-in form and 27 Needs preparation entries at 1280×720 | Startup/rendering only; the coordinate input attempt did not arrive in the app log, so this is not a new button-interaction pass |
+
+Independent document-region `(380,300)–(580,480)` green-pixel counts are 1,152 / 0 / 1,151 (green >180, red <180, blue <100). This is a visible roundtrip with a small pixel difference, not exact parity. The first redo attempt's blank capture was replaced only after the actual toolbar workflow succeeded; no pixels were edited. The captured console warning/error list was empty; that is not a full backend error-inventory acceptance test.
+
+These captures used the development host on port 5210, with the app files supplied separately. UI state/panel placement changed through normal input only. See [the follow-up validation and limitations](../update-2026-10-22-panels.md).
+
 ## 22 October 2026
 
 Fresh, unaltered JPEG captures at the browser's natural viewport: 2560×855 for external apps and 2560×911 for the source-only form. No screenshot editing, desktop references or generated images. The browser viewport changed naturally between captures; these are not fixed-size visual-regression baselines.

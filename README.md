@@ -22,18 +22,22 @@ This is an early experiment. Selected applications render and respond to input t
 
 ## Latest update — 22 October 2026
 
-Paint.NET now has a fresh, visible **brush → undo → redo** roundtrip, a rendered color wheel, and more work on text, CPU effect tiles and history compatibility. Its editor is still incomplete; the new screenshots deliberately leave the remaining panel and dialog artifacts visible.
+Paint.NET's editor is becoming much more readable: the Colors panel now shows its RGB/HSV labels and values, History shows named brush entries, and Layers displays a thumbnail. New compatibility work covers thumbnail uploads and delivery, effect-input retention, popup visibility and scaled CPU text rasterization.
+
+A fresh four-stroke **paint → undo → toolbar redo** sequence is captured below. Thumbnail freshness and per-layer accuracy, some toolbar controls, dialogs and full editing/file workflows still need work. Normal application drawing remains on the CPU.
 
 This update also publishes an optional integration skeleton and its tests, with a concrete map for connecting retained rendering and platform services to real applications. **The normal UI still paints on the CPU, and ordinary apps still lack the complete registry/file/print integration.**
 
-See the [current review, validation results and ordered next tasks](docs/review-2026-10-22.md), [integration architecture](docs/integration-bridges.md), and [agent handoff](docs/integration-agent-prompt.md). The source-only build and focused checks passed; the unfiltered rewriter suite has 201 passes and seven failures requiring excluded external inputs. No hardware-GPU or performance acceptance is claimed.
+See the [panel/thumbnail update and current validation](docs/update-2026-10-22-panels.md), [earlier review and ordered next tasks](docs/review-2026-10-22.md), [integration architecture](docs/integration-bridges.md), and [agent handoff](docs/integration-agent-prompt.md). The exported base project builds, and focused checks pass; the unfiltered rewriter suite currently has 216 passes and three failures, detailed in the update. No hardware-GPU or performance acceptance is claimed.
 
 ## Recent progress — October 2026
 
 The experiment now covers more of the platform around a real desktop application:
 
+- **Expanded desktop benchmarks.** Historical OpenPDN, PKHeX, KeePass, Git Extensions, BizHawk, DockPanel Suite, Krypton, Minesweeper, DS-step and ChocolateCHIP now have pinned catalog entries and a local preparation workflow. The expanded library has 27 candidates: 25 prepared inputs and two build-blocked inputs. The five vendor entries now have actual prepared inputs; see [their recipes](docs/vendor-benchmarks-preparation.md). Browser compatibility remains experimental. See [setup, current limits and acceptance tasks](docs/desktop-benchmarks.md).
+
 - **An independent app library and runtime sessions.** Search/filter the library, switch apps during startup, stop/restart a session, and inspect errors attributed to the app and session that produced them. Load time, app payload, network transfer and cache reuse are reported separately.
-- **A wider compatibility corpus.** The local catalog has 62 entries, including 42 selected Syncfusion samples spanning editors, grids, diagrams, maps, charts, navigation and documents. The catalog is a way to expose missing behavior; it is not a claim that all these applications work. A source-only checkout shows only apps whose inputs are actually present.
+- **A wider compatibility corpus.** The local catalog has 89 entries, including 42 selected Syncfusion samples spanning editors, grids, diagrams, maps, charts, navigation and documents. The catalog is a way to expose missing behavior; it is not a claim that all these applications work. A source-only checkout shows available apps plus the optional benchmark candidates, with missing inputs clearly marked.
 - **More runtime and drawing compatibility.** New work covers image lists/resources, rich-text streaming and drawing, cursors/dialog hooks, layout/input plumbing, and additional Windows API boundaries. The Syncfusion diagram node gallery now reaches its real form and rich-text nodes in the captured development build.
 - **A retained-rendering foundation and WebGL2 experiments.** Rendering commands, surface/resource lifetimes, composition and a GLES/WebGL binding now have dedicated tests and a browser probe. Normal application painting still uses the CPU path; broad GPU acceleration and its performance acceptance remain work in progress.
 - **Platform-service foundations.** A separate demo and server/browser modules explore declared file mounts, browser file selection, scoped virtual registry storage and browser printing. Wiring these services consistently into existing applications is still incomplete; the presence of the demo is not full WinForms API parity.
@@ -45,9 +49,9 @@ See the [progress and validation notes](docs/progress-2026-10.md) for what was c
 
 These are **unaltered captures from the live local browser on 22 October 2026**. They show real applications and their current limitations. External app files are supplied separately and are not distributed here.
 
-![Paint.NET 5.1.12 after a real brush stroke, with its color wheel rendered and incomplete panels still visible.](docs/screenshots/paint-net-2026-10-22.jpg)
+![Paint.NET 5.1.12 displaying a brush-drawn W, readable Colors and History panels, and a Layers thumbnail in the browser.](docs/screenshots/paint-net-panels-2026-10-22.png)
 
-**Paint.NET remains the most ambitious showcase.** A brush drag produces the diagonal stroke above. Ctrl+Z removes it and Ctrl+Y restores it; saved document-region pixels independently confirm the visible roundtrip. See [undo](docs/screenshots/paint-net-undo-2026-10-22.jpg), [redo](docs/screenshots/paint-net-redo-2026-10-22.jpg), and the [partially rendered Levels dialog](docs/screenshots/paint-net-levels-2026-10-22.jpg). Panel text, controls, modal workflows, effects, file operations and long-session behavior still need work. This is not a complete image editor.
+**Paint.NET remains the most ambitious showcase.** Four real brush drags draw the W above. Four undo actions clear the document; four clicks on Paint.NET's Redo toolbar button restore it. See the fresh [undo](docs/screenshots/paint-net-panels-undo-2026-10-22.png) and [redo](docs/screenshots/paint-net-panels-redo-2026-10-22.png) captures. Independent document-region analysis finds 1,152 green pixels before undo, zero after undo, and 1,151 after redo; this supports the visible workflow, not exact pixel parity. The new panel rendering is progress, while thumbnail refresh/accuracy, remaining toolbar artifacts, effects, file operations and long-session behaviour are still incomplete. See also the earlier [partially rendered Levels dialog](docs/screenshots/paint-net-levels-2026-10-22.jpg).
 
 ![Syncfusion Map Selection after Brazil is clicked and its actual polygon turns cyan.](docs/screenshots/map-selection-2026-10-22.jpg)
 
@@ -79,11 +83,11 @@ dotnet workload restore src/WfWasm.CanvasHost/WfWasm.CanvasHost.csproj
 ./scripts/build.ps1 -Run
 ```
 
-Open [http://127.0.0.1:5210](http://127.0.0.1:5210). The checkout starts with the built-in smoke form; external applications appear only when their files are available locally. No third-party application is required to build or open the base project.
+Open [http://127.0.0.1:5210](http://127.0.0.1:5210). The checkout starts with the built-in smoke form and 27 benchmark candidates marked **Needs preparation**. Other external applications appear when their files are available locally. No third-party application is required to build or open the base project.
 
-![The updated source-only base project running its built-in WinForms form without any external applications installed.](docs/screenshots/base-project-2026-10-22.jpg)
+![A clean source-only build rendering its built-in WinForms form, with optional benchmark candidates clearly marked Needs preparation.](docs/screenshots/base-project-panels-2026-10-22.png)
 
-*Fresh source-only build: one built-in form, no external apps installed. Clicking its button shows `Clicks: 1 (Success!)`.*
+*Fresh source-only build: one runnable built-in form and 27 unprepared benchmark entries, with no external apps installed. The earlier [button-interaction capture](docs/screenshots/base-project-2026-10-22.jpg) documents a separate previous run; the current clean capture establishes startup/rendering.*
 
 The script builds the fork and rewriter, generates the browser-compatible runtime under the ignored `.artifacts/` directory, and builds the host. See [build instructions](docs/building.md) for individual steps, tests, and locally supplied applications.
 

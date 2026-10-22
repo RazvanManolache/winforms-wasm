@@ -28,8 +28,17 @@ public static class TextLayoutRaster
     // back into device px at the given dpi, so identity at 96.
     private const double DipToPoint = 72.0 / 96.0;
 
+    // Diagnostic-only record of the last UNEXPECTED raster failure
+    // (font construction / engine rasterization throwing). Expected
+    // nulls (unreadable input below) never set it, and the null
+    // fallback contract is unchanged either way. Recorded only when
+    // the WfWasm.TextDiagnostics switch is on; the host reads it for
+    // triage, never for control flow.
+    internal static string? LastFault { get; private set; }
+
     public static LayoutRaster? TryRasterLayout(object? layout, float dpi, int maxWidth)
     {
+        LastFault = null;
         try
         {
             if (layout is null || dpi <= 0 || maxWidth <= 0)
@@ -62,8 +71,10 @@ public static class TextLayoutRaster
                 return null;
             return new LayoutRaster(r.Width, r.Height, r.Rgba);
         }
-        catch
+        catch (Exception ex)
         {
+            if (System.AppContext.TryGetSwitch("WfWasm.TextDiagnostics", out bool diag) && diag)
+                LastFault = ex.GetType().FullName + ": " + ex.Message;
             return null;
         }
     }

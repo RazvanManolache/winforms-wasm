@@ -405,6 +405,12 @@ public static class AssemblyRewriter
             catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
             {
             }
+            // Half device uploads convert through WIC (see method):
+            // convert managed instead (same Half bridge as the render).
+            try { EnsureThumbnailConsumeManaged(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
         }
         if (assembly.Name.Name == "PaintDotNet.Windows.Core")
         {
@@ -574,6 +580,26 @@ public static class AssemblyRewriter
             // headless that eviction loses the only copy (disk persist
             // is stubbed), so every undo IOEs at get_Object.
             try { EnsureHistoryFlushRetained(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // History rows with a non-null icon paint blank headless
+            // (see method): text-only rows paint.
+            try { EnsureHistoryRowTextOnly(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // The thumbnail render thread never starts headless
+            // (Thread.Start is neutered), so layer previews stay
+            // blank: drain the render loop inline (see method). The
+            // Half bridge it feeds on needs the CPU paint helpers.
+            try { EnsureThumbnailManagerInline(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // One faulting ready-handler must not starve the other
+            // strips sharing the drain batch (see method).
+            try { EnsureThumbnailDeliveryRobust(module); }
             catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
             {
             }
@@ -4687,6 +4713,31 @@ public static class AssemblyRewriter
                         setIl.Emit(OpCodes.Ldarg_1);
                         setIl.Emit(OpCodes.Ldarg_2);
                         setIl.Emit(OpCodes.Callvirt, setInput);
+                        // Input retention (rev173): the inner device
+                        // effect this Set lands on is ReplaceRef-swapped
+                        // for a fresh husk afterwards, so at draw time
+                        // the husk's table is empty and strip chains
+                        // (crop->opacity->composite) unwrap to nothing.
+                        // The Properties bag lives on the wrapper and
+                        // survives the swap: also note (bag, index) ->
+                        // image into CpuPaint, which the draw-time walk
+                        // reads first. Claimed path only (the note is a
+                        // whole-body-guarded no-op otherwise). Best
+                        // effort: without the helper the Set reroute
+                        // above still stands on its own.
+                        try
+                        {
+                            MethodReference noteInput = ImportCpuPaintMethod(module, cpuPaintPath, "NoteEffectInput", 3);
+                            setIl.Emit(OpCodes.Ldarg_0);
+                            setIl.Emit(OpCodes.Call, module.ImportReference(storageGetter));
+                            setIl.Emit(OpCodes.Ldarg_0);
+                            setIl.Emit(OpCodes.Call, module.ImportReference(indexGetter));
+                            setIl.Emit(OpCodes.Ldarg_1);
+                            setIl.Emit(OpCodes.Call, noteInput);
+                        }
+                        catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+                        {
+                        }
                         setIl.Append(unclaimed);
                         setIl.Emit(OpCodes.Ret);
                         method.Body.MaxStackSize = 32;
@@ -6960,6 +7011,22 @@ public static class AssemblyRewriter
                 // Dispose stays a no-op: grants held past the effect's
                 // managed death leak one bitmap per effect lifetime
                 // (bounded: effects die on resource invalidation).
+                // Input retention: composite ctors call SetInput directly,
+                // bypassing the EffectInputAccessor hook, so note
+                // (this, index) -> image here too; the draw-time walk
+                // splices husk notes in place of the husk. Best effort:
+                // without the helper the retain logic above still stands.
+                try
+                {
+                    MethodReference noteInput = ImportCpuPaintMethod(module, cpuPaintPath, "NoteEffectInput", 3);
+                    body.Emit(OpCodes.Ldarg_0);
+                    body.Emit(OpCodes.Ldarg_1);
+                    body.Emit(OpCodes.Ldarg_2);
+                    body.Emit(OpCodes.Call, noteInput);
+                }
+                catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+                {
+                }
                 TypeDefinition orExtDef = ResolveExternalDef(module, "PaintDotNet.ComponentModel", "PaintDotNet.ComponentModel.ObjectRefExtensions");
                 MethodDefinition createRefDef = orExtDef.Methods.First(mm => mm.Name == "CreateRef" && !mm.HasGenericParameters && mm.Parameters.Count == 1 && mm.Parameters[0].ParameterType.FullName == "PaintDotNet.ComponentModel.IObjectRef");
                 MethodReference createRef = module.ImportReference(createRefDef);
@@ -7009,6 +7076,7 @@ public static class AssemblyRewriter
                 body.Emit(OpCodes.Callvirt, dispDispose);
                 body.Append(released);
                 body.Emit(OpCodes.Ret);
+                impl.Body.MaxStackSize = System.Math.Max(impl.Body.MaxStackSize, 4);
             }
             else if (contract.Name == "get_PropertyCount" && contract.Parameters.Count == 0)
             {
@@ -9527,6 +9595,34 @@ public static class AssemblyRewriter
         Console.WriteLine("CpuFx: SoftReference<T> pinned strongly headless");
     }
 
+    // HistoryControl.OnRenderAdvanced resolves each row's icon through
+    // ImageResourceUtil.GetDeviceImage and lays the text out AFTER the
+    // icon bounds. Observed headless: any row with a non-null icon
+    // paints as a blank selected band (the icon path leaves no usable
+    // text rect, so AdjustFontSizeToFitLayoutSize shrinks the name to
+    // invisible), while icon-less rows paint their text fine. Hence
+    // every tool row (Paintbrush, New Image, Select All, ...) is blank
+    // while our own icon-less Levels row paints. All get_Image callers (row
+    // paint, OnUndo/redo propagation, CompoundHistoryMemento,
+    // TransactedTool commit paths) pass the value into another memento
+    // ctor or branch on null: none dereferences it. Returning null
+    // makes every row text-only, matching the established Levels
+    // precedent; the setter still stores (harmless).
+    private static void EnsureHistoryRowTextOnly(ModuleDefinition module)
+    {
+        var history = module.GetType("PaintDotNet.HistoryMementos.HistoryMemento")
+            ?? throw new InvalidOperationException("history text needs HistoryMemento");
+        var getter = history.Methods.FirstOrDefault(m => m.Name == "get_Image" && m.Parameters.Count == 0 && m.HasBody)
+            ?? throw new InvalidOperationException("history text getter missing");
+        getter.Body.ExceptionHandlers.Clear();
+        getter.Body.Variables.Clear();
+        getter.Body.Instructions.Clear();
+        var il = getter.Body.GetILProcessor();
+        il.Emit(OpCodes.Ldnull);
+        il.Emit(OpCodes.Ret);
+        Console.WriteLine("CpuFx: HistoryMemento.Image nulled headless (text-only rows)");
+    }
+
     // HistoryStack.PushNewMemento calls HistoryMemento.Flush right
     // after pushing, and PersistedObject<T>.Flush waits for the disk
     // save then nulls softObjectRef to free memory: on desktop the
@@ -9555,6 +9651,307 @@ public static class AssemblyRewriter
         flush.Body.Instructions.Clear();
         flush.Body.GetILProcessor().Emit(OpCodes.Ret);
         Console.WriteLine("CpuFx: PersistedObject<T>.Flush retained (no headless eviction)");
+    }
+
+    // Layer previews stay blank headless: ThumbnailManager renders them
+    // on a dedicated render thread (new Thread(RenderThread) in .ctor),
+    // but Thread.Start is neutered browser-wide (pop, no worker), so
+    // RenderThreadLoop never runs, the queue only grows via
+    // QueueThumbnailUpdate + Monitor.Pulse, and OnThumbnailReady never
+    // fires. Nothing throws, so the error inventory stays silent.
+    // The loop body itself is single-thread-safe (Monitor Enter/Exit
+    // re-enter on the caller, waits only fire on an empty queue, the
+    // per-item catch classifies exceptions internally), and its callees
+    // self-pump: CopyPixelsParallel funnels into
+    // CountdownWorkItemQueue.JoinWhileExecutingWorkItems, which executes
+    // queued tiles on the CALLING thread. So drain the loop inline at
+    // the end of QueueThumbnailUpdate (UI thread): while the queue is
+    // non-empty, run one RenderThreadLoop pass; stop when it reports
+    // false (disposed). The empty-queue Monitor.Wait path is never
+    // reached because of the count guard. SleepUntilUtc (a 200 ms
+    // debounce Thread.Sleep for the background loop) reduces to ret:
+    // it would stall the UI thread per thumbnail, and nothing else
+    // calls it (asserted: every call site lives in ThumbnailManager).
+    // Mutation order is load-bearing: opacity (harmless alone), then
+    // the Half-bridge swap (safe alone), then sleep, then the drain
+    // last. Any abort leaves at most safe mutations; drain without
+    // the swap would run ToScRgb/WIC and OOB the runtime (rev131).
+    private static void EnsureThumbnailManagerInline(ModuleDefinition module, string? cpuPaintPath)
+    {
+        var manager = module.GetType("PaintDotNet.Rendering.ThumbnailManager")
+            ?? throw new InvalidOperationException("thumbnail inline needs ThumbnailManager");
+        var strip = module.GetType("PaintDotNet.Controls.LayersStrip")
+            ?? throw new InvalidOperationException("thumbnail inline strip missing");
+        // InsertLayer zeroes the new strip item's ImageOpacity so the
+        // later OnThumbnailUpdated can fade it in over 0.5 s. Headless
+        // that fade never advances (observed live: op=0 forever with
+        // the image set), so DrawItemImage skips on opacity product 0
+        // and the strip shows its empty band. Start at the end state
+        // (1) instead: desktop converges there after the fade.
+        var insert = strip.Methods.FirstOrDefault(m => m.Name == "InsertLayer" && m.HasBody)
+            ?? throw new InvalidOperationException("thumbnail inline insert missing");
+        bool opPatched = false;
+        {
+            var iins = insert.Body.Instructions.ToList();
+            for (int k = 0; k < iins.Count; k++)
+            {
+                if ((iins[k].OpCode == OpCodes.Callvirt || iins[k].OpCode == OpCodes.Call)
+                    && iins[k].Operand is MethodReference imr
+                    && imr.Name == "get_ImageOpacity")
+                {
+                    for (int j = k + 1; j < iins.Count; j++)
+                    {
+                        if (iins[j].OpCode == OpCodes.Ldc_R8)
+                        {
+                            if (!(iins[j].Operand is double d && d == 0.0))
+                                throw new InvalidOperationException("thumbnail opacity init changed");
+                            var iil = insert.Body.GetILProcessor();
+                            iil.Replace(iins[j], iil.Create(OpCodes.Ldc_R8, 1.0));
+                            opPatched = true;
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        if (!opPatched)
+            throw new InvalidOperationException("thumbnail opacity init missing");
+        Console.WriteLine("CpuFx: LayersStrip item ImageOpacity starts at 1 headless (no fade-in)");
+        // Render swap (rev134): the default CreateThumbnailBitmapScRgb
+        // converts Bgra32->Half through ToScRgb and the WIC imaging
+        // factory, whose native COM sidecars cannot load in the
+        // browser (OOB trap observed live). Route the render through
+        // the managed Half bridge instead: same stack shape
+        // (provider, side, priority, token), object result recast to
+        // the interface return type.
+        var loop = manager.Methods.FirstOrDefault(m => m.Name == "RenderThreadLoop" && m.Parameters.Count == 0 && m.HasBody)
+            ?? throw new InvalidOperationException("thumbnail inline loop missing");
+        Instruction? scrgbIns = null;
+        MethodReference? scrgbSig = null;
+        foreach (var i in loop.Body.Instructions)
+        {
+            if ((i.OpCode == OpCodes.Call || i.OpCode == OpCodes.Callvirt)
+                && i.Operand is MethodReference smr
+                && smr.Name == "CreateThumbnailBitmapScRgb")
+            {
+                scrgbIns = i;
+                scrgbSig = smr;
+                break;
+            }
+        }
+        if (scrgbIns is null || scrgbSig is null)
+            throw new InvalidOperationException("thumbnail scrgb call missing");
+        // The interface call leaves (provider, sideLength, priority,
+        // token) on the stack with sideLength as int32 and priority
+        // as an enum: both must be re-pushed in boxable form for the
+        // object-typed bridge (passing raw int32 bits as an object
+        // reference OOBs the interpreter: rev134). Spill to locals,
+        // box the enum, and call.
+        var bridge = ImportCpuPaintMethod(module, cpuPaintPath, "RenderLayerThumbnail", 4);
+        // Instance-method Parameters exclude `this`: [0]=sideLength,
+        // [1]=priority, [2]=token.
+        if (scrgbSig.Parameters.Count != 3
+            || scrgbSig.Parameters[0].ParameterType.FullName != "System.Int32"
+            || scrgbSig.Parameters[1].ParameterType.FullName != "PaintDotNet.Threading.WorkItemQueuePriority")
+            throw new InvalidOperationException("thumbnail scrgb signature changed");
+        var priType = module.ImportReference(scrgbSig.Parameters[1].ParameterType);
+        var provLoc = new Mono.Cecil.Cil.VariableDefinition(module.TypeSystem.Object);
+        var sideLoc = new Mono.Cecil.Cil.VariableDefinition(module.TypeSystem.Int32);
+        var priLoc = new Mono.Cecil.Cil.VariableDefinition(priType);
+        var tokLoc = new Mono.Cecil.Cil.VariableDefinition(module.TypeSystem.Object);
+        loop.Body.Variables.Add(provLoc);
+        loop.Body.Variables.Add(sideLoc);
+        loop.Body.Variables.Add(priLoc);
+        loop.Body.Variables.Add(tokLoc);
+        loop.Body.InitLocals = true;
+        var bl = loop.Body.GetILProcessor();
+        bl.InsertBefore(scrgbIns, bl.Create(OpCodes.Stloc, tokLoc));
+        bl.InsertBefore(scrgbIns, bl.Create(OpCodes.Stloc, priLoc));
+        bl.InsertBefore(scrgbIns, bl.Create(OpCodes.Stloc, sideLoc));
+        bl.InsertBefore(scrgbIns, bl.Create(OpCodes.Stloc, provLoc));
+        bl.InsertBefore(scrgbIns, bl.Create(OpCodes.Ldloc, provLoc));
+        bl.InsertBefore(scrgbIns, bl.Create(OpCodes.Ldloc, sideLoc));
+        bl.InsertBefore(scrgbIns, bl.Create(OpCodes.Ldloc, priLoc));
+        bl.InsertBefore(scrgbIns, bl.Create(OpCodes.Box, priType));
+        bl.InsertBefore(scrgbIns, bl.Create(OpCodes.Ldloc, tokLoc));
+        scrgbIns.OpCode = OpCodes.Call;
+        scrgbIns.Operand = bridge;
+        bl.InsertAfter(scrgbIns, bl.Create(OpCodes.Castclass, module.ImportReference(scrgbSig.ReturnType)));
+        loop.Body.MaxStackSize = System.Math.Max(loop.Body.MaxStackSize, 4);
+        Console.WriteLine("CpuFx: thumbnail render uses managed Half bridge (no WIC)");
+        var sleep = manager.Methods.FirstOrDefault(m => m.Name == "SleepUntilUtc" && m.Parameters.Count == 1 && m.HasBody)
+            ?? throw new InvalidOperationException("thumbnail inline sleep missing");
+        foreach (var t in module.GetTypes())
+        {
+            foreach (var m in t.Methods)
+            {
+                if (!m.HasBody)
+                    continue;
+                foreach (var i in m.Body.Instructions)
+                {
+                    if ((i.OpCode == OpCodes.Call || i.OpCode == OpCodes.Callvirt)
+                        && i.Operand is MethodReference mr
+                        && mr.Name == "SleepUntilUtc"
+                        && mr.DeclaringType.FullName == "PaintDotNet.Rendering.ThumbnailManager"
+                        && m.DeclaringType.FullName != "PaintDotNet.Rendering.ThumbnailManager")
+                        throw new InvalidOperationException("thumbnail sleep caller outside manager: " + m.FullName);
+                }
+            }
+        }
+        sleep.Body.ExceptionHandlers.Clear();
+        sleep.Body.Variables.Clear();
+        sleep.Body.Instructions.Clear();
+        sleep.Body.GetILProcessor().Emit(OpCodes.Ret);
+        var queue = manager.Methods.FirstOrDefault(m => m.Name == "QueueThumbnailUpdate" && m.HasBody)
+            ?? throw new InvalidOperationException("thumbnail inline queue missing");
+        var queueField = manager.Fields.FirstOrDefault(f => f.Name == "renderQueue")
+            ?? throw new InvalidOperationException("thumbnail inline queue field missing");
+        if (!queueField.FieldType.FullName.StartsWith("PaintDotNet.Collections.Deque", StringComparison.Ordinal))
+            throw new InvalidOperationException("thumbnail inline queue type changed");
+        MethodReference? countGetter = null;
+        foreach (var i in loop.Body.Instructions)
+        {
+            if (i.OpCode == OpCodes.Callvirt
+                && i.Operand is MethodReference mr
+                && mr.Name == "get_Count"
+                && mr.DeclaringType.FullName.StartsWith("PaintDotNet.Collections.Deque", StringComparison.Ordinal))
+            {
+                countGetter = module.ImportReference(mr);
+                break;
+            }
+        }
+        if (countGetter is null)
+            throw new InvalidOperationException("thumbnail inline count getter missing");
+        var tail = queue.Body.Instructions[queue.Body.Instructions.Count - 1];
+        if (tail.OpCode != OpCodes.Ret)
+            throw new InvalidOperationException("thumbnail inline queue tail changed");
+        // The try body exits via leave.s to the final ret: without
+        // retargeting, the unwind jumps OVER an appended drain and
+        // the queue grows forever (observed live: 3..10, never
+        // drained). So retarget the ORIGINAL branches first (they
+        // alone target the tail at this point), then append the
+        // drain whose own exits keep targeting the tail.
+        var il = queue.Body.GetILProcessor();
+        var top = il.Create(OpCodes.Ldarg_0);
+        foreach (var i in queue.Body.Instructions)
+        {
+            if (i.Operand is Instruction target && target == tail)
+                i.Operand = top;
+        }
+        il.InsertBefore(tail, top);
+        il.InsertBefore(tail, il.Create(OpCodes.Ldfld, queueField));
+        il.InsertBefore(tail, il.Create(OpCodes.Callvirt, countGetter));
+        il.InsertBefore(tail, il.Create(OpCodes.Brfalse_S, tail));
+        il.InsertBefore(tail, il.Create(OpCodes.Ldarg_0));
+        il.InsertBefore(tail, il.Create(OpCodes.Call, loop));
+        il.InsertBefore(tail, il.Create(OpCodes.Brfalse_S, tail));
+        il.InsertBefore(tail, il.Create(OpCodes.Br_S, top));
+        queue.Body.MaxStackSize = System.Math.Max(queue.Body.MaxStackSize, 2);
+        Console.WriteLine("CpuFx: ThumbnailManager drains inline headless (layer previews)");
+        // (Opacity init + render swap run first, above; the drain they
+        // feed lands here, last.)
+    }
+
+    // One poisoned thumbnail batch must not kill document setup:
+    // DrainThumbnailReadyInvokeList invokes every ready handler
+    // (LayersStrip, DocumentStrip, ...) in one pass, and any fault
+    // inside it (observed live: NRE in the snapshot/dispose phase,
+    // DocumentStrip ANE on a null bitmap) propagates through
+    // RenderThreadLoop and QueueThumbnailUpdate into the layer/document
+    // wiring that queued it, aborting boot setup (blank canvas, empty
+    // history). Headless, a faulting batch is dropped after logging
+    // nothing: the first-chance inventory keeps the signal, the app
+    // survives, and the next invalidation re-queues. This wraps the
+    // whole body (narrow handler guards cannot cover snapshot-phase
+    // faults); the existing enumerator finally still runs on unwind.
+    private static void EnsureThumbnailDeliveryRobust(ModuleDefinition module)
+    {
+        var manager = module.GetType("PaintDotNet.Rendering.ThumbnailManager")
+            ?? throw new InvalidOperationException("thumbnail delivery needs ThumbnailManager");
+        var drain = manager.Methods.FirstOrDefault(m => m.Name == "DrainThumbnailReadyInvokeList" && m.HasBody)
+            ?? throw new InvalidOperationException("thumbnail delivery drain missing");
+        var dil = drain.Body.GetILProcessor();
+        var first = drain.Body.Instructions[0];
+        var pop = dil.Create(OpCodes.Pop);
+        var done = dil.Create(OpCodes.Ret);
+        dil.Append(pop);
+        dil.Append(done);
+        drain.Body.ExceptionHandlers.Add(new Mono.Cecil.Cil.ExceptionHandler(Mono.Cecil.Cil.ExceptionHandlerType.Catch)
+        {
+            TryStart = first,
+            TryEnd = pop,
+            HandlerStart = pop,
+            HandlerEnd = done,
+            CatchType = module.ImportReference(typeof(System.Exception)),
+        });
+        drain.Body.MaxStackSize = System.Math.Max(drain.Body.MaxStackSize, 1);
+        Console.WriteLine("CpuFx: thumbnail delivery drops faulting batches headless");
+    }
+
+    // Half-bitmap consumption (rev134): BitmapImage.CreateImpl routes
+    // Half sources through CreateWithFormatConversion, which converts
+    // via the WIC color transformer (native COM sidecars cannot load
+    // headless: OOB trap, same family as the ToScRgb render death).
+    // Headless, 64-bit sources instead recurse into CreateImpl with a
+    // managed Bgra32 conversion (CpuPaint.ConvertHalfSourceToBgra),
+    // landing on the proven Bgra32 device-bitmap path (HALFUP upload).
+    // A null conversion throws NotSupported (loud, managed, no trap).
+    private static void EnsureThumbnailConsumeManaged(ModuleDefinition module, string? cpuPaintPath)
+    {
+        var img = module.GetType("PaintDotNet.Direct2D1.BitmapImage")
+            ?? throw new InvalidOperationException("thumbnail consume needs BitmapImage");
+        var conv = img.Methods.FirstOrDefault(m => m.Name == "CreateWithFormatConversion" && m.HasBody)
+            ?? throw new InvalidOperationException("thumbnail consume convert missing");
+        if (conv.Parameters.Count != 6
+            || conv.Parameters[1].ParameterType.FullName != "PaintDotNet.Imaging.IBitmapSource")
+            throw new InvalidOperationException("thumbnail consume signature changed");
+        var createImpl = img.Methods.FirstOrDefault(m => m.Name == "CreateImpl" && m.HasBody && m.Parameters.Count == 5
+                && m.Parameters[0].ParameterType.FullName == "PaintDotNet.Direct2D1.IDeviceContext"
+                && m.Parameters[1].ParameterType.FullName == "PaintDotNet.Imaging.IBitmapSource")
+            ?? throw new InvalidOperationException("thumbnail consume createimpl missing");
+        var getFormat = VirtualCpuCall(module, "PaintDotNet.Imaging.IBitmapSource", "get_PixelFormat", 0);
+        var getBpp = StructCpuGetter(module, "PaintDotNet.Imaging.PixelFormat", "GetBitsPerPixel");
+        var fmtType = OwnedCpuRef(module, "PaintDotNet.Imaging.PixelFormat");
+        var convert = ImportCpuPaintMethod(module, cpuPaintPath, "ConvertHalfSourceToBgra", 1);
+        var nseCtor = module.ImportReference(
+            typeof(NotSupportedException).GetConstructor(new[] { typeof(string) })!);
+        var fmtLoc = new Mono.Cecil.Cil.VariableDefinition(fmtType);
+        var convLoc = new Mono.Cecil.Cil.VariableDefinition(module.TypeSystem.Object);
+        conv.Body.Variables.Add(fmtLoc);
+        conv.Body.Variables.Add(convLoc);
+        conv.Body.InitLocals = true;
+        var il = conv.Body.GetILProcessor();
+        var first = conv.Body.Instructions[0];
+        var is32 = il.Create(OpCodes.Nop);
+        var convOk = il.Create(OpCodes.Nop);
+        il.InsertBefore(first, il.Create(OpCodes.Ldarg_1));
+        il.InsertBefore(first, il.Create(OpCodes.Callvirt, getFormat));
+        il.InsertBefore(first, il.Create(OpCodes.Stloc, fmtLoc));
+        il.InsertBefore(first, il.Create(OpCodes.Ldloca_S, fmtLoc));
+        il.InsertBefore(first, il.Create(OpCodes.Call, getBpp));
+        il.InsertBefore(first, il.Create(OpCodes.Ldc_I4_S, (sbyte)64));
+        il.InsertBefore(first, il.Create(OpCodes.Bne_Un, is32));
+        il.InsertBefore(first, il.Create(OpCodes.Ldarg_1));
+        il.InsertBefore(first, il.Create(OpCodes.Call, convert));
+        il.InsertBefore(first, il.Create(OpCodes.Stloc, convLoc));
+        il.InsertBefore(first, il.Create(OpCodes.Ldloc, convLoc));
+        il.InsertBefore(first, il.Create(OpCodes.Brtrue_S, convOk));
+        il.InsertBefore(first, il.Create(OpCodes.Ldstr, "CpuPaint: no headless backend for Half thumbnail upload"));
+        il.InsertBefore(first, il.Create(OpCodes.Newobj, nseCtor));
+        il.InsertBefore(first, il.Create(OpCodes.Throw));
+        il.InsertBefore(first, convOk);
+        il.InsertBefore(first, il.Create(OpCodes.Ldarg_0));
+        il.InsertBefore(first, il.Create(OpCodes.Ldloc, convLoc));
+        il.InsertBefore(first, il.Create(OpCodes.Castclass, conv.Parameters[1].ParameterType));
+        il.InsertBefore(first, il.Create(OpCodes.Ldarg_2));
+        il.InsertBefore(first, il.Create(OpCodes.Ldarg_S, conv.Parameters[4]));
+        il.InsertBefore(first, il.Create(OpCodes.Ldarg_S, conv.Parameters[5]));
+        il.InsertBefore(first, il.Create(OpCodes.Call, createImpl));
+        il.InsertBefore(first, il.Create(OpCodes.Ret));
+        il.InsertBefore(first, is32);
+        conv.Body.MaxStackSize = System.Math.Max(conv.Body.MaxStackSize, 6);
+        Console.WriteLine("CpuFx: Half device upload converts managed headless (no WIC)");
     }
 
     // Update checks cannot install anything headless, and the boot
@@ -11008,6 +11405,7 @@ public static class AssemblyRewriter
         MethodReference freeContext = Cpu("FreeContext", 1);
         MethodReference setTransformCpu = Cpu("SetTransform", 7);
         MethodReference createBitmapCpu = Cpu("CreateBitmap", 4);
+        MethodReference uploadHalfShared = Cpu("UploadHalfSharedBitmap", 4);
         MethodReference createBitmapEmpty = Cpu("CreateBitmapEmpty", 2);
         MethodReference freeBitmap = Cpu("FreeBitmap", 1);
         MethodReference lockBitmap = Cpu("LockBitmap", 1);
@@ -11416,8 +11814,9 @@ public static class AssemblyRewriter
 
         // -- CreateSharedBitmap(IBitmapLock, props&): upload the lock's
         // live buffer straight into a CPU bitmap. The extension disposes
-        // the lock in finally, so pixels are copied, not shared. Only
-        // 32-bit locks upload (Bgra/Pbgra); anything else keeps today's
+        // the lock in finally, so pixels are copied, not shared. 32-bit
+        // locks upload packed (Bgra/Pbgra); 64-bit Half locks convert
+        // through UploadHalfSharedBitmap; anything else keeps today's
         // NotSupported.
         MethodDefinition contractShared = Contract("CreateSharedBitmap",
             m => m.Parameters.Count == 2
@@ -11436,24 +11835,27 @@ public static class AssemblyRewriter
             TypeReference formatType = OwnedCpuRef(module, "PaintDotNet.Imaging.PixelFormat");
             var sizeLoc = new VariableDefinition(sizeType);
             var formatLoc = new VariableDefinition(formatType);
+            var bppLoc = new VariableDefinition(module.TypeSystem.Int32);
             var wLoc = new VariableDefinition(module.TypeSystem.Int32);
             var hLoc = new VariableDefinition(module.TypeSystem.Int32);
             var strideLoc = new VariableDefinition(module.TypeSystem.Int32);
             var handleLoc = new VariableDefinition(module.TypeSystem.Int64);
-            foreach (var v in new[] { sizeLoc, formatLoc, wLoc, hLoc, strideLoc, handleLoc })
+            foreach (var v in new[] { sizeLoc, formatLoc, bppLoc, wLoc, hLoc, strideLoc, handleLoc })
                 shared.Body.Variables.Add(v);
             shared.Body.InitLocals = true;
             var badFormat = il.Create(OpCodes.Nop);
             var badAlloc = il.Create(OpCodes.Nop);
             var emptySize = il.Create(OpCodes.Nop);
             var gotBitmap = il.Create(OpCodes.Nop);
+            var is32 = il.Create(OpCodes.Nop);
+            var is64 = il.Create(OpCodes.Nop);
+            var checkAlloc = il.Create(OpCodes.Nop);
             il.Emit(OpCodes.Ldarg_1);
             il.Emit(OpCodes.Callvirt, lockFormat);
             il.Emit(OpCodes.Stloc, formatLoc);
             il.Emit(OpCodes.Ldloca_S, formatLoc);
             il.Emit(OpCodes.Call, bitsPerPixel);
-            il.Emit(OpCodes.Ldc_I4, 32);
-            il.Emit(OpCodes.Bne_Un, badFormat);
+            il.Emit(OpCodes.Stloc, bppLoc);
             il.Emit(OpCodes.Ldarg_1);
             il.Emit(OpCodes.Callvirt, lockSize);
             il.Emit(OpCodes.Stloc, sizeLoc);
@@ -11469,6 +11871,27 @@ public static class AssemblyRewriter
             il.Emit(OpCodes.Ldloc, hLoc);
             il.Emit(OpCodes.Ldc_I4_1);
             il.Emit(OpCodes.Blt, emptySize);
+            // 32-bit locks take the packed upload; 64-bit Half locks
+            // convert through UploadHalfSharedBitmap; anything else
+            // keeps today's NotSupported.
+            il.Emit(OpCodes.Ldloc, bppLoc);
+            il.Emit(OpCodes.Ldc_I4, 32);
+            il.Emit(OpCodes.Beq, is32);
+            il.Emit(OpCodes.Ldloc, bppLoc);
+            il.Emit(OpCodes.Ldc_I4, 64);
+            il.Emit(OpCodes.Bne_Un, badFormat);
+            il.Append(is64);
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Callvirt, lockBuffer);
+            il.Emit(OpCodes.Conv_I);
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Callvirt, lockStride);
+            il.Emit(OpCodes.Ldloc, wLoc);
+            il.Emit(OpCodes.Ldloc, hLoc);
+            il.Emit(OpCodes.Call, uploadHalfShared);
+            il.Emit(OpCodes.Stloc, handleLoc);
+            il.Emit(OpCodes.Br, checkAlloc);
+            il.Append(is32);
             il.Emit(OpCodes.Ldarg_1);
             il.Emit(OpCodes.Callvirt, lockStride);
             il.Emit(OpCodes.Stloc, strideLoc);
@@ -11480,6 +11903,7 @@ public static class AssemblyRewriter
             il.Emit(OpCodes.Ldloc, hLoc);
             il.Emit(OpCodes.Call, createBitmapCpu);
             il.Emit(OpCodes.Stloc, handleLoc);
+            il.Append(checkAlloc);
             il.Emit(OpCodes.Ldloc, handleLoc);
             il.Emit(OpCodes.Ldc_I4_0);
             il.Emit(OpCodes.Conv_I8);
@@ -12317,12 +12741,25 @@ public static class AssemblyRewriter
                 drawBitmap.Body.Variables.Add(v);
             drawBitmap.Body.InitLocals = true;
 
+            MethodReference getProxySourceBmp = Cpu("GetProxySourceImage", 1);
+            var isBmp = il.Create(OpCodes.Nop);
             il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Isinst, cpuBmp);
+            il.Emit(OpCodes.Stloc, bmpLoc);
+            il.Emit(OpCodes.Ldloc, bmpLoc);
+            il.Emit(OpCodes.Brtrue, isBmp);
+            // ImageStrip item images (layer/history thumbnails) arrive
+            // as BitmapImage/effect shells, not raw uploads: unwrap to
+            // the shared bitmap exactly like DrawImage does. Anything
+            // else keeps today's silent skip.
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Call, getProxySourceBmp);
             il.Emit(OpCodes.Isinst, cpuBmp);
             il.Emit(OpCodes.Stloc, bmpLoc);
             il.Emit(OpCodes.Ldloc, bmpLoc);
             var doneLabel = il.Create(OpCodes.Nop);
             il.Emit(OpCodes.Brfalse, doneLabel);
+            il.Append(isBmp);
             // Perspective: anything set is beyond stamp scope.
             il.Emit(OpCodes.Ldarg, drawBitmap.Parameters[5]);
             il.Emit(perspHas.Op, perspHas.Ref);
@@ -12517,6 +12954,7 @@ public static class AssemblyRewriter
             // module; otherwise the loud unknown-image throw stays.
             MethodReference drawCheckerCpu = Cpu("DrawChecker", 8);
             MethodReference drawProceduralCpu = Cpu("DrawProceduralEffect", 6);
+            MethodReference drawCompositeCpu = Cpu("DrawCompositeImage", 12);
             MethodReference getTargetSizeCpu = Cpu("GetTargetSize", 3);
             TypeReference? cropFxRef = module.GetType("PaintDotNet.Direct2D1.Effects.CropEffect");
             TypeReference? checkerFxRef = null;
@@ -12565,6 +13003,9 @@ public static class AssemblyRewriter
             var rectLoc = new VariableDefinition(rectType);
             var dxLoc = new VariableDefinition(module.TypeSystem.Single);
             var dyLoc = new VariableDefinition(module.TypeSystem.Single);
+            var dwLoc = new VariableDefinition(module.TypeSystem.Single);
+            var dhLoc = new VariableDefinition(module.TypeSystem.Single);
+            var hasDestLoc = new VariableDefinition(module.TypeSystem.Int32);
             var sxLoc = new VariableDefinition(module.TypeSystem.Single);
             var syLoc = new VariableDefinition(module.TypeSystem.Single);
             var swLoc = new VariableDefinition(module.TypeSystem.Single);
@@ -12572,7 +13013,7 @@ public static class AssemblyRewriter
             var hasSrcLoc = new VariableDefinition(module.TypeSystem.Int32);
             var procTwLoc = new VariableDefinition(module.TypeSystem.Int32);
             var procThLoc = new VariableDefinition(module.TypeSystem.Int32);
-            foreach (var v in new[] { imgLoc, pointLoc, rectLoc, dxLoc, dyLoc, sxLoc, syLoc, swLoc, shLoc, hasSrcLoc, procTwLoc, procThLoc })
+            foreach (var v in new[] { imgLoc, pointLoc, rectLoc, dxLoc, dyLoc, dwLoc, dhLoc, hasDestLoc, sxLoc, syLoc, swLoc, shLoc, hasSrcLoc, procTwLoc, procThLoc })
                 drawImage.Body.Variables.Add(v);
             drawImage.Body.InitLocals = true;
             il.Emit(OpCodes.Ldarg_1);
@@ -12727,6 +13168,8 @@ public static class AssemblyRewriter
             il.Emit(OpCodes.Ldloca_S, pointLoc);
             il.Emit(OpCodes.Call, ptY);
             il.Emit(OpCodes.Stloc, dyLoc);
+            il.Emit(OpCodes.Ldc_I4_1);
+            il.Emit(OpCodes.Stloc, hasDestLoc);
             il.Append(noDst);
             il.Emit(OpCodes.Ldarg, drawImage.Parameters[2]);
             il.Emit(rectHas.Op, rectHas.Ref);
@@ -12783,6 +13226,24 @@ public static class AssemblyRewriter
             il.Emit(OpCodes.Ldloc, imgLoc);
             il.Emit(OpCodes.Brtrue_S, doBlit);
             var tryProc = il.Create(OpCodes.Nop);
+            // Composite item images (checker + thumbnail): draw both
+            // before the procedural fallback swallows the thumbnail.
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldfld, targetField);
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Ldloc, dxLoc);
+            il.Emit(OpCodes.Ldloc, dyLoc);
+            il.Emit(OpCodes.Ldloc, dwLoc);
+            il.Emit(OpCodes.Ldloc, dhLoc);
+            il.Emit(OpCodes.Ldloc, hasDestLoc);
+            il.Emit(OpCodes.Ldloc, sxLoc);
+            il.Emit(OpCodes.Ldloc, syLoc);
+            il.Emit(OpCodes.Ldloc, swLoc);
+            il.Emit(OpCodes.Ldloc, shLoc);
+            il.Emit(OpCodes.Ldloc, hasSrcLoc);
+            il.Emit(OpCodes.Call, drawCompositeCpu);
+            il.Emit(OpCodes.Brfalse, tryProc);
+            il.Emit(OpCodes.Ret);
             il.Emit(OpCodes.Ldloc, srcLoc);
             il.Emit(OpCodes.Isinst, cpuCmdList);
             il.Emit(OpCodes.Brfalse_S, tryProc);

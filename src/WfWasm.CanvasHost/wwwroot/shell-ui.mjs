@@ -12,6 +12,12 @@ function status(title, message, kind = '', actions = false) {
     $('status-message').textContent = message;
     $('recovery-actions').hidden = !actions;
 }
+function showPreparation(app) {
+    const manual = app.setupKind === 'manual';
+    const title = `${app.label} ${manual ? 'needs app files' : 'needs preparation'}`;
+    const message = manual ? app.setupNote : 'Prepare this optional benchmark locally and reload. ' + (app.setupNote ?? '');
+    status(title, message + ' You can choose another app.');
+}
 function renderSession(s) {
     const m = s?.metrics;
     $('shell-load').textContent = s ? time((s.ended ?? performance.now()) - s.started) : '—';
@@ -20,6 +26,10 @@ function renderSession(s) {
     $('shell-network').textContent = mb(m?.wireBytes ?? 0);
     $('shell-cache').textContent = `${m?.httpCacheHits ?? 0} HTTP · ${m?.memoryReuse ?? 0} memory`;
     $('shell-boot').textContent = m?.bootMs ? time(m.bootMs) : '—';
+    if (selected?.available === false) {
+        showPreparation(selected);
+        return;
+    }
     if (!s) { status('App stopped', 'Choose an app from your library, or restart this one.', '', !!selected); return; }
     if (s.status === 'failed') status(`${s.app.label} could not continue`, s.phase + ' You can restart it or choose another app.', 'error', true);
     else if (sessions.isBusy()) status(`${s.app.label} is busy`, 'The app is not responding. Your library is still available; switch apps or restart this session.', 'busy', true);
@@ -28,7 +38,7 @@ function renderSession(s) {
 }
 function renderLibrary() {
     const query = $('app-search').value.trim().toLowerCase();
-    const entries = catalog.filter(a => (group === 'all' || (a.slug.startsWith('syncfusion-') ? 'syncfusion' : a.slug.startsWith('telerik-') ? 'telerik' : 'everyday') === group) &&
+    const entries = catalog.filter(a => (group === 'all' || (a.category === 'benchmarks' ? 'benchmarks' : a.slug.startsWith('syncfusion-') ? 'syncfusion' : a.slug.startsWith('telerik-') ? 'telerik' : 'everyday') === group) &&
         `${a.label} ${a.sourceLabel ?? ''} ${a.family ?? ''} ${a.purpose ?? ''} ${(a.components ?? []).join(' ')}`.toLowerCase().includes(query));
     $('app-list').replaceChildren(...entries.map(app => {
         const button = document.createElement('button');
@@ -38,7 +48,7 @@ function renderLibrary() {
         const icon = document.createElement('span'); icon.className = 'app-icon ' + (app.slug.startsWith('telerik-') || app.slug.startsWith('syncfusion-') ? 'violet' : 'teal'); icon.textContent = app.label.replace(/^(Telerik|Syncfusion): /, '').slice(0,1);
         const copy = document.createElement('span'); copy.className = 'app-item-copy';
         const title = document.createElement('strong'); title.textContent = app.label.replace(/^(Telerik|Syncfusion): /, '');
-        const detail = document.createElement('small'); detail.textContent = app.slug.startsWith('syncfusion-') ? `${app.family ?? 'Syncfusion'} · experimental` : app.slug.startsWith('telerik-') ? 'Telerik demo' : app.slug === 'smoke' ? 'Built-in demo' : 'WinForms application';
+        const detail = document.createElement('small'); detail.textContent = app.category === 'benchmarks' ? `${app.setupKind === 'manual' ? 'App files not prepared' : app.available === false ? 'Needs preparation' : 'Prepared · unverified'} · ${app.family}` : app.slug.startsWith('syncfusion-') ? `${app.family ?? 'Syncfusion'} · experimental` : app.slug.startsWith('telerik-') ? 'Telerik demo' : app.slug === 'smoke' ? 'Built-in demo' : 'WinForms application';
         if (app.purpose) button.title = app.purpose;
         copy.append(title, detail); button.append(icon, copy);
         button.addEventListener('click', () => select(app));
@@ -57,6 +67,11 @@ function select(app, push = true) {
     if (push) history.pushState(null, '', '/app/' + encodeURIComponent(app.slug));
     if (matchMedia('(max-width:760px)').matches) { $('app').classList.remove('menu-open'); $('toggle-menu').setAttribute('aria-expanded','false'); }
     renderLibrary();
+    if (app.available === false) {
+        sessions.stop();
+        showPreparation(app);
+        return;
+    }
     try { sessions.select(app); } catch (error) { status('App could not start', error.message, 'error', true); }
 }
 function fromUrl() {

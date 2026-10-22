@@ -111,6 +111,28 @@ public static unsafe class CpuPaint
         return ToHandle(new Bitmap { Pixels = pixels, Width = width, Height = height });
     }
 
+    // Uploads a 64-bit Half lock as a shared CPU bitmap (Half ->
+    // Bgra32, then the packed 32-bit upload). Lets ImageStrip item
+    // images (layer/history thumbnails) display instead of throwing
+    // "no headless backend (pixel format)".
+    public static long UploadHalfSharedBitmap(IntPtr buf, int stride, int w, int h)
+    {
+        if (buf == IntPtr.Zero || w <= 0 || h <= 0 || stride < w * 8)
+            return 0;
+        byte[] half = new byte[checked(stride * h)];
+        Marshal.Copy(buf, half, 0, half.Length);
+        byte[] bgra = ThumbHalfToBgra32Bytes(half, stride, w, h);
+        GCHandle pin = GCHandle.Alloc(bgra, GCHandleType.Pinned);
+        try
+        {
+            return CreateBitmap(pin.AddrOfPinnedObject(), checked(w * 4), w, h);
+        }
+        finally
+        {
+            pin.Free();
+        }
+    }
+
     public static long CreateBitmapEmpty(int width, int height)
     {
         if (width <= 0 || height <= 0)
@@ -1155,9 +1177,14 @@ public static unsafe class CpuPaint
 
     // Browser-raster blit for the DrawTextLayout path: white-with-alpha
     // RGBA (BrowserText convention) tinted by the ink color, straight-
-    // alpha source-over per pixel. Rotation is out of scope (panel
-    // text is axis-aligned); translation + axis scale apply like the
-    // brush stamps. Primitives only, like the rest of this contract.
+    // alpha source-over per pixel. Supported transform: translation +
+    // axis-aligned scale (panel text is axis-aligned; this covers
+    // non-default DPI and mirrored layouts). Rotation/shear (M12/M21
+    // nonzero), zero scale, and non-finite scales are explicitly
+    // rejected: the call is a silent no-op, like the other guards.
+    // Destination pixels inverse-map to source texels (nearest), so
+    // upscale covers without holes and downscale/mirror stay exact.
+    // Primitives only, like the rest of this contract.
     public static void BlitRaster(
         long ctx, byte[]? rgba, int w, int h, float x, float y,
         float opacity, float r, float g, float b, float a)
@@ -1167,16 +1194,35 @@ public static unsafe class CpuPaint
             return;
         var t = FromHandle<Target>(ctx);
         float ink = Math.Clamp(a, 0f, 1f) * opacity;
-        int dx0 = (int)MathF.Round(x * t.M11 + y * t.M21 + t.M31);
-        int dy0 = (int)MathF.Round(x * t.M12 + y * t.M22 + t.M32);
-        for (int sy = 0; sy < h; sy++)
+        if (t.M12 != 0f || t.M21 != 0f)
+            return;
+        float sx = t.M11, sy = t.M22;
+        if (!float.IsFinite(sx) || !float.IsFinite(sy) || sx == 0f || sy == 0f)
+            return;
+        int dx0 = (int)MathF.Round(x * sx + t.M31);
+        int dy0 = (int)MathF.Round(y * sy + t.M32);
+        int loX = sx > 0f ? dx0 : dx0 + (int)MathF.Floor(w * sx) + 1;
+        int hiX = sx > 0f ? dx0 + (int)MathF.Ceiling(w * sx) - 1 : dx0;
+        int loY = sy > 0f ? dy0 : dy0 + (int)MathF.Floor(h * sy) + 1;
+        int hiY = sy > 0f ? dy0 + (int)MathF.Ceiling(h * sy) - 1 : dy0;
+        int cx0 = Math.Max(loX, 0), cx1 = Math.Min(hiX, t.Width - 1);
+        int cy0 = Math.Max(loY, 0), cy1 = Math.Min(hiY, t.Height - 1);
+        if (cx0 > cx1 || cy0 > cy1)
+            return;
+        for (int dy = cy0; dy <= cy1; dy++)
         {
-            for (int sx = 0; sx < w; sx++)
+            int siy = (int)MathF.Floor((dy - dy0) / sy);
+            if ((uint)siy >= (uint)h)
+                continue;
+            for (int dx = cx0; dx <= cx1; dx++)
             {
-                float sa = rgba[(sy * w + sx) * 4 + 3] / 255f;
+                int six = (int)MathF.Floor((dx - dx0) / sx);
+                if ((uint)six >= (uint)w)
+                    continue;
+                float sa = rgba[(siy * w + six) * 4 + 3] / 255f;
                 if (sa <= 0f)
                     continue;
-                BlendPixel(t, dx0 + sx, dy0 + sy, sa * ink, r, g, b);
+                BlendPixel(t, dx, dy, sa * ink, r, g, b);
             }
         }
     }
@@ -2508,6 +2554,104 @@ public static unsafe class CpuPaint
         return hasEffect && hasProxy;
     }
 
+    // Latest canvas composite bitmap (ColorManagementEffect-rooted
+    // unwrap): the only post-commit stroke holder reachable from our
+    // code. The strip mixer thumbnails it when the provider overlay is
+    // content-free (single-layer: exact; multi-layer: composite
+    // approximation). One object reference; PDN owns the pixels.
+    // Live doc composite fed by the host (RGBA bytes, full doc dims)
+    // for layer strip thumbs when the provider overlay is content-free.
+    // Single slot, latest wins; no copy (holds the upload buffer ref).
+    private sealed class DocRgba
+    {
+        public byte[] Rgba = System.Array.Empty<byte>();
+        public int W;
+        public int H;
+    }
+
+    // Blank-doc feed (undo-to-empty): all-white or all-transparent
+    // full-doc buffer so thumbs clear instead of going stale (surface
+    // reads return null for uniform surfaces).
+    public static bool NoteDocBlank(int w, int h, bool white)
+    {
+        try
+        {
+            if (w <= 0 || h <= 0 || (long)w * h * 4 > 64L * 1024 * 1024)
+                return false;
+            byte[] rgba = new byte[w * h * 4];
+            if (white)
+                System.Array.Fill<byte>(rgba, 0xFF);
+            s_docComposite = new DocRgba { Rgba = rgba, W = w, H = h };
+            int sig = white ? 1 : 2;
+            int dark = 0;
+            int prev = System.Threading.Interlocked.Exchange(ref s_docFeedSig, sig);
+            int prevDark = System.Threading.Interlocked.Exchange(ref s_docFeedDark, dark);
+            return sig != prev || dark != prevDark;
+        }
+        catch { return false; }
+    }
+
+    private static DocRgba? s_docComposite;
+    private static int s_docFeedSig;
+    private static int s_docFeedDark = -1;
+
+    // Returns true when the fed composite differs from the previously
+    // fed one (the caller re-invalidates layer thumbs on change).
+    public static bool NoteDocComposite(byte[] rgba, int w, int h)
+    {
+        try
+        {
+            if (rgba is null || w <= 0 || h <= 0 || rgba.Length != w * h * 4)
+                return false;
+            s_docComposite = new DocRgba { Rgba = rgba, W = w, H = h };
+            int sig = 0;
+            int dark = 0;
+            int step = rgba.Length / 16384 + 1;
+            for (int i = 0; i + 3 < rgba.Length; i += step)
+            {
+                sig = (sig * 31) ^ rgba[i];
+                if (rgba[i] + rgba[i + 1] + rgba[i + 2] < 300 && rgba[i + 3] > 128)
+                    dark++;
+            }
+            int prev = System.Threading.Interlocked.Exchange(ref s_docFeedSig, sig);
+            int prevDark = System.Threading.Interlocked.Exchange(ref s_docFeedDark, dark);
+            return sig != prev || dark != prevDark;
+        }
+        catch { return false; }
+    }
+
+    private static int s_thumbLayerW;
+    private static int s_thumbLayerH;
+
+    private static bool OverlayHasContent(long handle)
+    {
+        try
+        {
+            Bitmap ob = FromHandle<Bitmap>(handle);
+            uint[] px = ob.Pixels;
+            int n = px.Length;
+            if (n <= 0 || ob.Width <= 0 || ob.Height <= 0)
+                return false;
+            if (n != ob.Width * ob.Height)
+                return false;
+            for (int i = 0; i < n; i++)
+            {
+                uint p = px[i];
+                uint a = p >> 24;
+                if (a <= 128)
+                    continue;
+                uint lum = (((p >> 16) & 0xFF) + ((p >> 8) & 0xFF) + (p & 0xFF)) / 3;
+                if (lum < 128)
+                    return true;
+            }
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     public static object? GetProxySourceImage(object? image)
     {
         try
@@ -2854,6 +2998,735 @@ public static unsafe class CpuPaint
         }
     }
 
+    // Managed Bgra32 <-> Prgba64Half bridge for layer thumbnails
+    // (rev134): every PDN pixel-format conversion funnels into the
+    // WIC imaging factory, whose native COM sidecars cannot load in
+    // the browser (OOB trap observed live in ToScRgb during the
+    // inline thumbnail drain). Both directions below are pure
+    // managed code with the SAME no-EOTF convention as
+    // CreateBitmapFromHalfSource, so a render->consume roundtrip is
+    // the identity (modulo Half precision): thumbnails show exact
+    // layer bytes. All PDN-typed access in the wrappers is
+    // reflection-only; failures return null (blank thumb, no crash).
+    public static byte[] ThumbBgra32ToHalfBytes(byte[] bgra, int stride, int width, int height)
+    {
+        if (bgra is null)
+            throw new ArgumentNullException(nameof(bgra));
+        if (width <= 0 || height <= 0 || stride < width * 4)
+            throw new ArgumentOutOfRangeException(nameof(width));
+        if (bgra.Length < checked(stride * height))
+            throw new ArgumentException("short buffer", nameof(bgra));
+        byte[] half = new byte[checked(width * height * 8)];
+        for (int y = 0; y < height; y++)
+        {
+            int s = y * stride;
+            int d = y * width * 8;
+            for (int x = 0; x < width; x++)
+            {
+                int si = s + x * 4;
+                float a = bgra[si + 3] / 255f;
+                float r = bgra[si + 2] / 255f * a;
+                float g = bgra[si + 1] / 255f * a;
+                float b = bgra[si + 0] / 255f * a;
+                int di = d + x * 8;
+                BitConverter.GetBytes((Half)r).CopyTo(half, di);
+                BitConverter.GetBytes((Half)g).CopyTo(half, di + 2);
+                BitConverter.GetBytes((Half)b).CopyTo(half, di + 4);
+                BitConverter.GetBytes((Half)a).CopyTo(half, di + 6);
+            }
+        }
+        return half;
+    }
+
+    public static byte[] ThumbHalfToBgra32Bytes(byte[] half, int stride, int width, int height)
+    {
+        if (half is null)
+            throw new ArgumentNullException(nameof(half));
+        if (width <= 0 || height <= 0 || stride < width * 8)
+            throw new ArgumentOutOfRangeException(nameof(width));
+        if (half.Length < checked(stride * height))
+            throw new ArgumentException("short buffer", nameof(half));
+        byte[] bgra = new byte[checked(width * height * 4)];
+        for (int y = 0; y < height; y++)
+        {
+            int s = y * stride;
+            int d = y * width * 4;
+            for (int x = 0; x < width; x++)
+            {
+                int si = s + x * 8;
+                float r = (float)BitConverter.ToHalf(half, si);
+                float g = (float)BitConverter.ToHalf(half, si + 2);
+                float b = (float)BitConverter.ToHalf(half, si + 4);
+                float a = Math.Clamp((float)BitConverter.ToHalf(half, si + 6), 0f, 1f);
+                float inv = a > 1e-6f ? 1f / a : 0f;
+                uint A = (uint)(a * 255f + 0.5f);
+                uint R = (uint)(Math.Clamp(r * inv, 0f, 1f) * 255f + 0.5f);
+                uint G = (uint)(Math.Clamp(g * inv, 0f, 1f) * 255f + 0.5f);
+                uint B = (uint)(Math.Clamp(b * inv, 0f, 1f) * 255f + 0.5f);
+                int di = d + x * 4;
+                bgra[di] = (byte)B;
+                bgra[di + 1] = (byte)G;
+                bgra[di + 2] = (byte)R;
+                bgra[di + 3] = (byte)A;
+            }
+        }
+        return bgra;
+    }
+
+    private static readonly object s_pdnTypeLock = new();
+    private static readonly System.Collections.Generic.Dictionary<string, System.Type?> s_pdnTypes = new();
+
+    private static System.Type? FindPdnType(string fullName)
+    {
+        lock (s_pdnTypeLock)
+        {
+            if (s_pdnTypes.TryGetValue(fullName, out System.Type? t))
+                return t;
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try { t = asm.GetType(fullName, false); }
+                catch { continue; }
+                if (t is not null)
+                    break;
+            }
+            s_pdnTypes[fullName] = t;
+            return t;
+        }
+    }
+
+    private static byte[] ReadLockedBytes(object bmp, string readWrite, int bpp)
+    {
+        System.Type bt = bmp.GetType();
+        object? sizeObj = bt.GetMethod("get_Size", System.Type.EmptyTypes)?.Invoke(bmp, null)
+            ?? throw new InvalidOperationException("nosize");
+        int w = System.Convert.ToInt32(sizeObj.GetType().GetMethod("get_Width", System.Type.EmptyTypes)?.Invoke(sizeObj, null));
+        int h = System.Convert.ToInt32(sizeObj.GetType().GetMethod("get_Height", System.Type.EmptyTypes)?.Invoke(sizeObj, null));
+        if (w <= 0 || h <= 0 || bpp <= 0)
+            throw new InvalidOperationException("badwh");
+        System.Type? rectT = FindPdnType("PaintDotNet.Rendering.RectInt32")
+            ?? throw new InvalidOperationException("norect");
+        object? rect = Activator.CreateInstance(rectT, 0, 0, sizeObj)
+            ?? throw new InvalidOperationException("norectobj");
+        System.Reflection.MethodInfo? lockM = null;
+        foreach (var m in bt.GetMethods())
+        {
+            if (m.Name == "Lock" && m.GetParameters().Length == 2)
+            {
+                lockM = m;
+                break;
+            }
+        }
+        if (lockM is null)
+            throw new InvalidOperationException("nolock");
+        object opt = Enum.Parse(lockM.GetParameters()[1].ParameterType, readWrite);
+        object? lk = lockM.Invoke(bmp, new[] { rect, opt })
+            ?? throw new InvalidOperationException("nolockobj");
+        try
+        {
+            int lstride = System.Convert.ToInt32(lk.GetType().GetProperty("BufferStride")?.GetValue(lk));
+            uint lsize = System.Convert.ToUInt32(lk.GetType().GetProperty("BufferSize")?.GetValue(lk));
+            IntPtr ptr = IntPtr.Zero;
+            foreach (var m in lk.GetType().GetMethods())
+            {
+                if (m.Name == "get_Buffer" && m.GetParameters().Length == 0)
+                {
+                    ptr = UnboxPointer(m.Invoke(lk, null));
+                    break;
+                }
+            }
+            if (ptr == IntPtr.Zero)
+                throw new InvalidOperationException("nobuf");
+            // Proxy locks (IBitmapLockProxy) alias a packed subrect:
+            // BufferSize can be smaller than stride*h while still
+            // holding every row contiguously. Trust the smaller of
+            // the two, but never less than the packed pixels.
+            long need = (long)lstride * h;
+            long packed = (long)w * bpp * h;
+            if (need <= 0 || (ulong)lsize < (ulong)packed)
+                throw new InvalidOperationException("badsize w=" + w + " h=" + h
+                    + " stride=" + lstride + " bufsize=" + lsize
+                    + " lock=" + lk.GetType().FullName + " bmp=" + bt.FullName);
+            int readLen = (int)Math.Min(need, (long)lsize);
+            byte[] bytes = new byte[readLen];
+            Marshal.Copy(ptr, bytes, 0, readLen);
+            return bytes;
+        }
+        finally
+        {
+            (lk as IDisposable)?.Dispose();
+        }
+    }
+
+    // Managed Half bridge: builds an IccBitmap<ColorPrgba64Half> from
+    // half-float bytes for provider thumbnails (headless has no native
+    // scaler/WIC path, so delivery goes through this).
+    private static object? BuildHalfBitmap(byte[] half, int w, int h, object? sizeObj)
+    {
+        try
+        {
+            System.Type? halfPx = FindPdnType("PaintDotNet.Imaging.ColorPrgba64Half");
+            System.Type? iccOpen = FindPdnType("PaintDotNet.Imaging.IccBitmap`1");
+            System.Type? profiles = FindPdnType("PaintDotNet.Imaging.ColorProfiles");
+            if (halfPx is null || iccOpen is null || profiles is null)
+                return null;
+            object? scrgb = profiles.GetMethod("get_ScRgb", System.Type.EmptyTypes)?.Invoke(null, null);
+            if (sizeObj is null)
+            {
+                System.Type? sizeT = FindPdnType("PaintDotNet.Rendering.SizeInt32");
+                if (sizeT is null)
+                    return null;
+                sizeObj = Activator.CreateInstance(sizeT, w, h);
+            }
+            if (scrgb is null || sizeObj is null)
+                return null;
+            object? halfBmp = Activator.CreateInstance(iccOpen.MakeGenericType(halfPx), sizeObj, scrgb);
+            if (halfBmp is null)
+                return null;
+            System.Reflection.MethodInfo? wlock = null;
+            foreach (var m in halfBmp.GetType().GetMethods())
+            {
+                if (m.Name == "Lock" && m.GetParameters().Length == 2)
+                {
+                    wlock = m;
+                    break;
+                }
+            }
+            if (wlock is null)
+                return null;
+            System.Type? rectT = FindPdnType("PaintDotNet.Rendering.RectInt32");
+            if (rectT is null)
+                return null;
+            object? rect = Activator.CreateInstance(rectT, 0, 0, sizeObj);
+            if (rect is null)
+                return null;
+            object wopt = Enum.Parse(wlock.GetParameters()[1].ParameterType, "Write");
+            object? wlk = wlock.Invoke(halfBmp, new[] { rect, wopt });
+            if (wlk is null)
+                return null;
+            try
+            {
+                uint lsize = System.Convert.ToUInt32(wlk.GetType().GetProperty("BufferSize")?.GetValue(wlk));
+                IntPtr ptr = IntPtr.Zero;
+                foreach (var m in wlk.GetType().GetMethods())
+                {
+                    if (m.Name == "get_Buffer" && m.GetParameters().Length == 0)
+                    {
+                        ptr = UnboxPointer(m.Invoke(wlk, null));
+                        break;
+                    }
+                }
+                if (ptr == IntPtr.Zero || (ulong)lsize < (ulong)half.Length)
+                    return null;
+                Marshal.Copy(half, 0, ptr, half.Length);
+            }
+            finally
+            {
+                (wlk as IDisposable)?.Dispose();
+            }
+            return halfBmp;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // CPU downscale of the layer surface for the LayersStrip provider
+    // (its native scaler OOBs at any size). Falls back to null (caller
+    // emits blank) on any failure.
+    private static object? RenderLayerSurfaceThumb(object provider, int side)
+    {
+        try
+        {
+            object? layer = null;
+            foreach (var f in provider.GetType().GetFields(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public))
+            {
+                if (f.Name == "layer")
+                {
+                    try { layer = f.GetValue(provider); } catch { }
+                    break;
+                }
+            }
+            if (layer is null)
+                return null;
+            // Desktop renders thumbs from the layer renderer (live device
+            // pixels); layer.Surface goes stale headless (stamps land in
+            // the device bitmap via write-back, never syncing back), so a
+            // surface-read thumb never shows edits. Prefer the renderer
+            // source; the surface path below stays as fallback.
+            try
+            {
+                if (TryReadLayerRendererPixels(provider, out byte[]? rsrc, out int rsw, out int rsh, out int rsstride)
+                    && rsrc is not null)
+                    return DownscaleSurfaceToHalfThumb(rsrc, rsstride, rsw, rsh, side);
+            }
+            catch { }
+            System.Reflection.PropertyInfo? surfProp = layer.GetType().GetProperty("Surface");
+            if (surfProp is null)
+                return null;
+            object? surf = null;
+            try { surf = surfProp.GetValue(layer, null); } catch { }
+            if (surf is null)
+                return null;
+            System.Type st = surf.GetType();
+            int sw = System.Convert.ToInt32(st.GetProperty("Width")?.GetValue(surf, null));
+            int sh = System.Convert.ToInt32(st.GetProperty("Height")?.GetValue(surf, null));
+            if (sw <= 0 || sh <= 0 || side <= 0)
+                return null;
+            // Classic CPU Surface: direct Scan0/Stride read, no lock.
+            object? scanRaw = null;
+            try { scanRaw = st.GetMethod("get_Scan0", System.Type.EmptyTypes)?.Invoke(surf, null); }
+            catch { }
+            int sstride = 0;
+            try { sstride = System.Convert.ToInt32(st.GetMethod("get_Stride", System.Type.EmptyTypes)?.Invoke(surf, null)); }
+            catch { }
+            IntPtr scan0 = IntPtr.Zero;
+            try { scan0 = UnboxPointer(scanRaw); }
+            catch { }
+            if (scan0 == IntPtr.Zero && scanRaw is not null)
+            {
+                // Scan0 may be a MemoryBlock wrapper: unwrap Pointer.
+                try
+                {
+                    object? inner = scanRaw.GetType().GetProperty("Pointer")?.GetValue(scanRaw, null);
+                    if (inner is not null)
+                        scan0 = UnboxPointer(inner);
+                }
+                catch { }
+            }
+            if (scan0 == IntPtr.Zero || sstride < sw * 4)
+                return null;
+            byte[] src = new byte[sstride * sh];
+            Marshal.Copy(scan0, src, 0, src.Length);
+            return DownscaleSurfaceToHalfThumb(src, sstride, sw, sh, side);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // Box downscale of a Bgra32 source into a side x side Half thumb
+    // (transparent pad). Shared by the renderer-first and surface
+    // fallback sources.
+    private static void RecordThumbLayerSize(int sw, int sh)
+    {
+        if (sw > 0 && sh > 0)
+        {
+            s_thumbLayerW = sw;
+            s_thumbLayerH = sh;
+        }
+    }
+
+    private static object? DownscaleSurfaceToHalfThumb(byte[] src, int sstride, int sw, int sh, int side)
+    {
+        RecordThumbLayerSize(sw, sh);
+        try
+        {
+            if (src is null || sstride < sw * 4 || sw <= 0 || sh <= 0 || side <= 0)
+                return null;
+            // Fit inside side x side, transparent pad (zeros).
+            int dw = side, dh = side;
+            double k = System.Math.Min((double)side / sw, (double)side / sh);
+            int iw = System.Math.Max(1, (int)(sw * k));
+            int ih = System.Math.Max(1, (int)(sh * k));
+            int ox = (dw - iw) / 2, oy = (dh - ih) / 2;
+            byte[] dst = new byte[dw * dh * 4];
+            for (int y = 0; y < ih; y++)
+            {
+                int sy = (int)((y + 0.5) / k);
+                if (sy < 0) sy = 0; else if (sy >= sh) sy = sh - 1;
+                for (int x = 0; x < iw; x++)
+                {
+                    int sx = (int)((x + 0.5) / k);
+                    if (sx < 0) sx = 0; else if (sx >= sw) sx = sw - 1;
+                    int si = sy * sstride + sx * 4, di = (((y + oy) * dw) + (x + ox)) * 4;
+                    dst[di] = src[si]; dst[di + 1] = src[si + 1]; dst[di + 2] = src[si + 2]; dst[di + 3] = src[si + 3];
+                }
+            }
+            byte[] half = ThumbBgra32ToHalfBytes(dst, dw * 4, dw, dh);
+            return BuildHalfBitmap(half, dw, dh, null);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static readonly object s_asBitmapSourceLock = new();
+    private static readonly System.Collections.Generic.Dictionary<string, System.Reflection.MethodInfo> s_asBitmapSourceCache = new();
+
+    // Reads the layer renderer's live device pixels (Bgra32) via
+    // RendererExtensions.AsBitmapSource + CopyPixels. This is the
+    // desktop thumbnail source; layer.Surface goes stale headless.
+    // Returns false (caller keeps the surface fallback) on any failure.
+    private static bool TryReadLayerRendererPixels(object provider, out byte[]? bgra, out int w, out int h, out int stride)
+    {
+        bgra = null; w = 0; h = 0; stride = 0;
+        try
+        {
+            object? renderer = null;
+            foreach (var f in provider.GetType().GetFields(
+                System.Reflection.BindingFlags.Instance
+                | System.Reflection.BindingFlags.NonPublic
+                | System.Reflection.BindingFlags.Public))
+            {
+                if (f.Name == "layerRenderer")
+                {
+                    try { renderer = f.GetValue(provider); } catch { }
+                    break;
+                }
+            }
+            if (renderer is null)
+                return false;
+            System.Type rt = renderer.GetType();
+            System.Type? pixelT = null;
+            foreach (var ii in rt.GetInterfaces())
+            {
+                if (ii.IsGenericType && ii.Name == "IRenderer`1")
+                {
+                    pixelT = ii.GetGenericArguments()[0];
+                    break;
+                }
+            }
+            if (pixelT is null)
+                return false;
+            string cacheKey = rt.FullName + "|" + pixelT.FullName;
+            System.Reflection.MethodInfo? asSource;
+            lock (s_asBitmapSourceLock)
+            {
+                if (!s_asBitmapSourceCache.TryGetValue(cacheKey, out asSource) || asSource is null)
+                {
+                    asSource = null;
+                    System.Type? extT = FindPdnType("PaintDotNet.Rendering.RendererExtensions");
+                    if (extT is not null)
+                    {
+                        System.Reflection.MethodInfo[] extMethods;
+                        try { extMethods = extT.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static); }
+                        catch { extMethods = []; }
+                        foreach (var m in extMethods)
+                        {
+                            string mname = "";
+                            bool isGen = false;
+                            try { mname = m.Name; isGen = m.IsGenericMethodDefinition; }
+                            catch { continue; }
+                            if (mname != "AsBitmapSource" || !isGen)
+                                continue;
+                            System.Reflection.ParameterInfo[] ps;
+                            try { ps = m.GetParameters(); }
+                            catch { continue; }
+                            if (ps.Length != 1)
+                                continue;
+                            System.Reflection.MethodInfo? gm = null;
+                            try
+                            {
+                                var gargs = m.GetGenericArguments();
+                                if (gargs.Length == 1)
+                                    gm = m.MakeGenericMethod(pixelT);
+                                else if (gargs.Length == 2)
+                                    gm = m.MakeGenericMethod(pixelT, pixelT);
+                                else
+                                    continue;
+                            }
+                            catch { continue; }
+                            try
+                            {
+                                object? probe = gm.Invoke(null, [renderer]);
+                                if (probe is not null)
+                                {
+                                    asSource = gm;
+                                    break;
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                    if (asSource is not null)
+                        s_asBitmapSourceCache[cacheKey] = asSource;
+                }
+            }
+            if (asSource is null)
+                return false;
+            object? source = null;
+            try { source = asSource.Invoke(null, [renderer]); }
+            catch { return false; }
+            if (source is null)
+                return false;
+            // Bgra32 only: the pixel generic arg must name a Bgra type.
+            bool isBgra = false;
+            try
+            {
+                foreach (var ii in source.GetType().GetInterfaces())
+                {
+                    if (ii.IsGenericType && ii.Name.StartsWith("IBitmapSource", StringComparison.Ordinal))
+                    {
+                        foreach (var ga in ii.GetGenericArguments())
+                        {
+                            if ((ga.FullName ?? ga.Name).Contains("Bgra"))
+                                isBgra = true;
+                        }
+                    }
+                }
+            }
+            catch { return false; }
+            if (!isBgra)
+                return false;
+            object? sizeObj = null;
+            try { sizeObj = source.GetType().GetMethod("get_Size", System.Type.EmptyTypes)?.Invoke(source, null); }
+            catch { return false; }
+            if (sizeObj is null)
+                return false;
+            int sw = 0, sh = 0;
+            try
+            {
+                sw = System.Convert.ToInt32(sizeObj.GetType().GetMethod("get_Width", System.Type.EmptyTypes)?.Invoke(sizeObj, null));
+                sh = System.Convert.ToInt32(sizeObj.GetType().GetMethod("get_Height", System.Type.EmptyTypes)?.Invoke(sizeObj, null));
+            }
+            catch { return false; }
+            if (sw <= 0 || sh <= 0 || (long)sw * sh > 16777216L)
+                return false;
+            // Prefer Lock (Scan0 read, same as ReadLockedBytes): the
+            // adapter inherits BitmapSourceBase, whose CopyPixels
+            // overloads take typed pointers, not IntPtr.
+            try
+            {
+                object? wlk = null;
+                try
+                {
+                    System.Reflection.MethodInfo? lockM = null;
+                    foreach (var m in source.GetType().GetMethods(
+                        System.Reflection.BindingFlags.Instance
+                        | System.Reflection.BindingFlags.Public
+                        | System.Reflection.BindingFlags.NonPublic))
+                    {
+                        if (m.Name == "Lock" && m.GetParameters().Length == 2)
+                        {
+                            lockM = m;
+                            break;
+                        }
+                    }
+                    if (lockM is not null)
+                        wlk = lockM.Invoke(source, ["ReadOnly", null]);
+                }
+                catch { wlk = null; }
+                if (wlk is not null)
+                {
+                    try
+                    {
+                        object? scanObj = wlk.GetType().GetProperty("Scan0")?.GetValue(wlk)
+                            ?? wlk.GetType().GetMethod("get_Scan0", System.Type.EmptyTypes)?.Invoke(wlk, null);
+                        object? strideObj = wlk.GetType().GetProperty("Stride")?.GetValue(wlk)
+                            ?? wlk.GetType().GetMethod("get_Stride", System.Type.EmptyTypes)?.Invoke(wlk, null);
+                        IntPtr s0 = scanObj is IntPtr p ? p : IntPtr.Zero;
+                        if (scanObj is not null && s0 == IntPtr.Zero)
+                        {
+                            try { s0 = (IntPtr)System.Convert.ToInt64(scanObj); } catch { }
+                        }
+                        int sst = strideObj is null ? 0 : System.Convert.ToInt32(strideObj);
+                        if (s0 != IntPtr.Zero && sst >= sw * 4)
+                        {
+                            byte[] lbuf = new byte[checked(sst * sh)];
+                            Marshal.Copy(s0, lbuf, 0, lbuf.Length);
+                            byte[] packed = new byte[checked(sw * 4 * sh)];
+                            for (int yy = 0; yy < sh; yy++)
+                                Buffer.BlockCopy(lbuf, yy * sst, packed, yy * sw * 4, sw * 4);
+                            bgra = packed; w = sw; h = sh; stride = sw * 4;
+                            return true;
+                        }
+                    }
+                    finally
+                    {
+                        try { (wlk as IDisposable)?.Dispose(); } catch { }
+                    }
+                }
+            }
+            catch { }
+            // 4-arg IntPtr CopyPixels into a pinned Bgra32 buffer (same
+            // shape the Half upload path already uses).
+            System.Reflection.MethodInfo? cp = null;
+            try
+            {
+                foreach (var ii in source.GetType().GetInterfaces())
+                {
+                    if (ii.Name != "IBitmapSource" || ii.IsGenericType)
+                        continue;
+                    cp = ii.GetMethods().FirstOrDefault(m => m.Name == "CopyPixels"
+                        && m.GetParameters().Length == 4
+                        && m.GetParameters()[0].ParameterType == typeof(IntPtr));
+                    if (cp is not null)
+                        break;
+                }
+                cp ??= source.GetType().GetMethods(
+                        System.Reflection.BindingFlags.Instance
+                        | System.Reflection.BindingFlags.Public
+                        | System.Reflection.BindingFlags.NonPublic)
+                    .FirstOrDefault(m => m.Name.EndsWith("CopyPixels", StringComparison.Ordinal)
+                        && m.GetParameters().Length == 4
+                        && m.GetParameters()[0].ParameterType == typeof(IntPtr));
+            }
+            catch { return false; }
+            if (cp is null)
+                return false;
+            int sstride = checked(sw * 4);
+            byte[] buf = new byte[checked(sstride * sh)];
+            GCHandle pin = GCHandle.Alloc(buf, GCHandleType.Pinned);
+            try
+            {
+                try { cp.Invoke(source, [pin.AddrOfPinnedObject(), sstride, buf.Length, null]); }
+                catch { return false; }
+            }
+            finally
+            {
+                pin.Free();
+            }
+            bgra = buf; w = sw; h = sh; stride = sstride;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // Render side: provider bitmap (Bgra32) -> Half bitmap, bypassing
+    // ToScRgb/WIC. Owns and disposes the source bitmap.
+    public static object? RenderLayerThumbnail(object? provider, int sideLength, object? priority, object? token)
+    {
+        object? bgra = null;
+        try
+        {
+            if (provider is null || sideLength <= 0 || priority is null || token is null)
+                return null;
+            // The LayersStrip provider crashes at any size: CPU downscale
+            // of the layer surface instead, blank 1x1 on any failure.
+            string pname = provider.GetType().FullName ?? "?";
+            if (pname.Contains("OurThumbnailProvider"))
+            {
+                object? cpuThumb = RenderLayerSurfaceThumb(provider, sideLength);
+                if (cpuThumb is not null)
+                    return cpuThumb;
+                return BuildHalfBitmap(new byte[8], 1, 1, null);
+            }
+            int effSide = sideLength > 8 ? 8 : sideLength;
+            System.Reflection.MethodInfo? render = null;
+            foreach (var m in provider.GetType().GetMethods())
+            {
+                if (m.Name == "CreateThumbnailBitmap" && m.GetParameters().Length == 3
+                    && m.GetParameters()[0].ParameterType == typeof(int))
+                {
+                    render = m;
+                    break;
+                }
+            }
+            if (render is null)
+                return null;
+            bgra = render.Invoke(provider, new object?[] { effSide, priority, token });
+            if (bgra is null)
+                return null;
+            object? sizeObj = bgra.GetType().GetMethod("get_Size", System.Type.EmptyTypes)?.Invoke(bgra, null);
+            if (sizeObj is null)
+                return null;
+            int w = System.Convert.ToInt32(sizeObj.GetType().GetMethod("get_Width", System.Type.EmptyTypes)?.Invoke(sizeObj, null));
+            int h = System.Convert.ToInt32(sizeObj.GetType().GetMethod("get_Height", System.Type.EmptyTypes)?.Invoke(sizeObj, null));
+            if (w <= 0 || h <= 0)
+                return null;
+            byte[] src = ReadLockedBytes(bgra, "Read", 4);
+            int srcStride = src.Length / h;
+            byte[] half = ThumbBgra32ToHalfBytes(src, srcStride, w, h);
+            return BuildHalfBitmap(half, w, h, sizeObj);
+        }
+        catch
+        {
+            return null;
+        }
+        finally
+        {
+            (bgra as IDisposable)?.Dispose();
+        }
+    }
+
+    // Consumption side: Half source -> Bgra32 bitmap for the device
+    // upload, bypassing the WIC color transformer.
+    public static object? ConvertHalfSourceToBgra(object? halfSrc)
+    {
+        try
+        {
+            if (halfSrc is null)
+                return null;
+            object? sizeObj = halfSrc.GetType().GetMethod("get_Size", System.Type.EmptyTypes)?.Invoke(halfSrc, null);
+            if (sizeObj is null)
+                return null;
+            int w = System.Convert.ToInt32(sizeObj.GetType().GetMethod("get_Width", System.Type.EmptyTypes)?.Invoke(sizeObj, null));
+            int h = System.Convert.ToInt32(sizeObj.GetType().GetMethod("get_Height", System.Type.EmptyTypes)?.Invoke(sizeObj, null));
+            if (w <= 0 || h <= 0)
+                return null;
+            byte[] src = ReadLockedBytes(halfSrc, "Read", 8);
+            int srcStride = src.Length / h;
+            byte[] bgra = ThumbHalfToBgra32Bytes(src, srcStride, w, h);
+            System.Type? bgraPx = FindPdnType("PaintDotNet.Imaging.ColorBgra32");
+            System.Type? iccOpen = FindPdnType("PaintDotNet.Imaging.IccBitmap`1");
+            if (bgraPx is null || iccOpen is null)
+                return null;
+            object? profile = null;
+            try { profile = halfSrc.GetType().GetMethod("get_ColorProfile", System.Type.EmptyTypes)?.Invoke(halfSrc, null); }
+            catch { }
+            if (profile is null)
+            {
+                System.Type? profiles = FindPdnType("PaintDotNet.Imaging.ColorProfiles");
+                profile = profiles?.GetMethod("get_Srgb", System.Type.EmptyTypes)?.Invoke(null, null);
+            }
+            if (profile is null)
+                return null;
+            object? bgraBmp = Activator.CreateInstance(iccOpen.MakeGenericType(bgraPx), sizeObj, profile);
+            if (bgraBmp is null)
+                return null;
+            System.Reflection.MethodInfo? wlock = null;
+            foreach (var m in bgraBmp.GetType().GetMethods())
+            {
+                if (m.Name == "Lock" && m.GetParameters().Length == 2)
+                {
+                    wlock = m;
+                    break;
+                }
+            }
+            System.Type? rectT = FindPdnType("PaintDotNet.Rendering.RectInt32");
+            if (wlock is null || rectT is null)
+                return null;
+            object? rect = Activator.CreateInstance(rectT, 0, 0, sizeObj);
+            if (rect is null)
+                return null;
+            object wopt = Enum.Parse(wlock.GetParameters()[1].ParameterType, "Write");
+            object? wlk = wlock.Invoke(bgraBmp, new[] { rect, wopt });
+            if (wlk is null)
+                return null;
+            try
+            {
+                uint lsize = System.Convert.ToUInt32(wlk.GetType().GetProperty("BufferSize")?.GetValue(wlk));
+                IntPtr ptr = IntPtr.Zero;
+                foreach (var m in wlk.GetType().GetMethods())
+                {
+                    if (m.Name == "get_Buffer" && m.GetParameters().Length == 0)
+                    {
+                        ptr = UnboxPointer(m.Invoke(wlk, null));
+                        break;
+                    }
+                }
+                if (ptr == IntPtr.Zero || (ulong)lsize < (ulong)bgra.Length)
+                    return null;
+                Marshal.Copy(bgra, 0, ptr, bgra.Length);
+            }
+            finally
+            {
+                (wlk as IDisposable)?.Dispose();
+            }
+            return bgraBmp;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     public static bool DrawProceduralEffect(
         long ctx, object? effect, float x, float y, float w, float h)
     {
@@ -2888,6 +3761,446 @@ public static unsafe class CpuPaint
             return true;
         }
         catch { return false; }
+    }
+
+    // Draws a composite device image (ImageStrip item images are
+    // CompositeEffect(checker-crop, thumbnail)): background inputs
+    // procedurally, then the overlay bitmap. Answers false when the
+    // image is not a resolvable composite so callers keep today's
+    // procedural-or-throw behavior for everything else.
+    public static bool DrawCompositeImage(
+        long ctx, object? image,
+        float dx, float dy, float dw, float dh, int hasDest,
+        float sx, float sy, float sw, float sh, int hasSrc)
+    {
+        try
+        {
+            if (ctx == 0 || image is null)
+                return false;
+            // Strip item images are checker+thumbnail mixers: match ONLY
+            // when a CPU upload and a checkerboard are both reachable.
+            // Small-upload gate keeps canvas blends on today's path.
+            object? overlay;
+            object? checkerBg;
+            try
+            {
+                bool matched = FindStripMixer(image, out overlay, out checkerBg)
+                    && overlay is not null && checkerBg is not null;
+                if (!matched)
+                    return false;
+            }
+            catch { return false; }
+            if (overlay is null || checkerBg is null)
+                return false;
+            int bw = 0, bh = 0;
+            long handle = 0;
+            try
+            {
+                bw = System.Convert.ToInt32(overlay.GetType().GetField("_width")?.GetValue(overlay));
+                bh = System.Convert.ToInt32(overlay.GetType().GetField("_height")?.GetValue(overlay));
+                handle = System.Convert.ToInt64(overlay.GetType().GetField("_handle")?.GetValue(overlay));
+            }
+            catch { }
+            if (bw <= 0 || bh <= 0 || handle == 0 || bw > 128 || bh > 128)
+                return false;
+            // Live-doc thumb: when the provider overlay carries no
+            // dark-opaque content, thumbnail the host-fed doc composite
+            // instead. Downscale to the overlay dims so the dest math
+            // below is unchanged; the upload is owned here and freed
+            // after the blit.
+            long upload = 0;
+            try
+            {
+                DocRgba? live = s_docComposite;
+                if (live is not null
+                    && (live.Rgba.Length != live.W * live.H * 4
+                        || (s_thumbLayerW > 0 && (live.W != s_thumbLayerW || live.H != s_thumbLayerH))))
+                    live = null;
+                if (live is not null && !OverlayHasContent(handle))
+                {
+                    // Darkest-of-footprint downscale so thin strokes
+                    // survive the shrink to strip size.
+                    uint[] small = new uint[bw * bh];
+                    for (int yy = 0; yy < bh; yy++)
+                    {
+                        int y0 = yy * live.H / bh;
+                        int y1 = (yy + 1) * live.H / bh;
+                        if (y1 <= y0) y1 = y0 + 1;
+                        if (y0 < 0) y0 = 0;
+                        if (y1 > live.H) y1 = live.H;
+                        for (int xx = 0; xx < bw; xx++)
+                        {
+                            int x0 = xx * live.W / bw;
+                            int x1 = (xx + 1) * live.W / bw;
+                            if (x1 <= x0) x1 = x0 + 1;
+                            if (x0 < 0) x0 = 0;
+                            if (x1 > live.W) x1 = live.W;
+                            uint best = 0xFFFFFFFF;
+                            uint bestSum = uint.MaxValue;
+                            uint bestA = 0xFF;
+                            for (int sy2 = y0; sy2 < y1; sy2++)
+                            {
+                                for (int sx2 = x0; sx2 < x1; sx2++)
+                                {
+                                    int si = (sy2 * live.W + sx2) * 4;
+                                    uint r = live.Rgba[si];
+                                    uint g = live.Rgba[si + 1];
+                                    uint b2 = live.Rgba[si + 2];
+                                    uint sum = r + g + b2;
+                                    if (sum < bestSum)
+                                    {
+                                        bestSum = sum;
+                                        best = b2 | (g << 8) | (r << 16);
+                                        bestA = live.Rgba[si + 3];
+                                    }
+                                }
+                            }
+                            small[yy * bw + xx] = best | (bestA << 24);
+                        }
+                    }
+                    GCHandle pin = GCHandle.Alloc(small, GCHandleType.Pinned);
+                    try { upload = CreateBitmap(pin.AddrOfPinnedObject(), checked(bw * 4), bw, bh); }
+                    finally { pin.Free(); }
+                    if (upload != 0)
+                        handle = upload;
+                }
+            }
+            catch { }
+            float destX = hasDest != 0 ? dx : 0f;
+            float destY = hasDest != 0 ? dy : 0f;
+            float destW = hasSrc != 0 ? sw : bw;
+            float destH = hasSrc != 0 ? sh : bh;
+            if (destW <= 0f || destH <= 0f)
+                return false;
+            DrawProceduralEffect(ctx, checkerBg, destX, destY, destW, destH);
+            DrawBitmap(ctx, handle, destX, destY, destW, destH, true,
+                0f, 0f, bw, bh, true, 1f, true);
+            if (upload != 0)
+            {
+                try { FreeBitmap(upload); } catch { }
+            }
+            return true;
+        }
+        catch { return false; }
+    }
+
+    // Cycle-proof structural search for a checker+thumbnail mixer:
+    // walks the effect graph iteratively (visited set + depth cap +
+    // node budget, so hostile cycles terminate) and matches ONLY when
+    // one node is a CPU upload and another a checkerboard. No unwrap
+    // calls: identification is by type name alone. Canvas blends (no
+    // checker node) never match.
+    private static bool FindStripMixer(object root, out object? overlay, out object? checkerBg)
+    {
+        overlay = null;
+        checkerBg = null;
+        try
+        {
+            // Reference identity: PDN device objects may overload value
+            // equality (headless null handles compare equal), which would
+            // wrongly prune distinct chain links out of the walk.
+            var seen = new System.Collections.Generic.HashSet<object>(System.Collections.Generic.ReferenceEqualityComparer.Instance);
+            var stack = new System.Collections.Generic.Stack<(object Node, int Depth)>();
+            stack.Push((root, 0));
+            int budget = 60;
+            while (stack.Count > 0 && budget-- > 0)
+            {
+                var (node, depth) = stack.Pop();
+                if (node is null || !seen.Add(node))
+                    continue;
+                string? tn = null;
+                try { tn = node.GetType().FullName; } catch { continue; }
+                if (tn is not null && tn.Contains("CpuDeviceBitmap"))
+                {
+                    overlay ??= node;
+                    continue;
+                }
+                if (tn is not null && tn.Contains("CheckerboardEffect"))
+                {
+                    checkerBg ??= node;
+                    continue;
+                }
+                if (tn is not null && tn.Contains("Props"))
+                {
+                    // Property bags only repeat their wrapper's inputs
+                    // (verified: bag visits resolve to the same effects):
+                    // expanding them doubles the chain depth and burns
+                    // the node budget for no new information.
+                    continue;
+                }
+                if (tn is not null && tn.Contains("Proxy") && overlay is null)
+                {
+                    // The strip composite holds the thumb behind an
+                    // IDeviceImageProxy: claim the underlying bitmap
+                    // without spending walk depth on the wrapper. The
+                    // proven proxy unwrap goes first (proxy fields do
+                    // not always name an image type), then the field
+                    // scan fallback.
+                    try
+                    {
+                        object? unwrapped = null;
+                        try { unwrapped = GetProxySourceImage(node); }
+                        catch { }
+                        string? utn = null;
+                        try { utn = unwrapped?.GetType().FullName; } catch { }
+                        if (utn is not null && utn.Contains("CpuDeviceBitmap"))
+                            overlay = unwrapped;
+                        else foreach (object? c in EffectInputs(node))
+                        {
+                            string? ctn = null;
+                            try { ctn = c?.GetType().FullName; } catch { continue; }
+                            if (ctn is not null && ctn.Contains("CpuDeviceBitmap"))
+                            {
+                                overlay = c;
+                                break;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+                // Depth 5: the spliced strip chain is outer crop ->
+                // opacity -> [blur] -> composite -> (checker crop, thumb
+                // bitmap), so the checker crop (depth 4) must still
+                // expand. The node budget above bounds the total work.
+                if (depth >= 5)
+                    continue;
+                System.Collections.Generic.List<object?> ins;
+                try { ins = EffectInputs(node); }
+                catch { continue; }
+                foreach (object? c in ins)
+                {
+                    if (c is not null)
+                        stack.Push((c, depth + 1));
+                }
+            }
+            return overlay is not null && checkerBg is not null;
+        }
+        catch { overlay = null; checkerBg = null; return false; }
+    }
+
+    // Construction-time effect inputs, noted by the rewriter's
+    // EffectInputAccessor.Set hook (see NoteEffectInput): the inner
+    // device effect PDN constructs inputs against is ReplaceRef-swapped
+    // for a fresh husk afterwards, so the husk's own input table is
+    // empty at draw time. The Properties bag lives on the WRAPPER and
+    // survives the swap, keyed per input index. Whole-body guarded:
+    // a note must never fault effect construction.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, System.Collections.Generic.Dictionary<int, object?>> s_effectInputNotes = new();
+
+    public static void NoteEffectInput(object? storage, int index, object? image)
+    {
+        try
+        {
+            if (storage is null || index < 0 || index > 64)
+                return;
+            lock (s_effectInputNotes)
+            {
+                if (image is null)
+                {
+                    if (s_effectInputNotes.TryGetValue(storage, out var existing))
+                        existing.Remove(index);
+                    return;
+                }
+                if (!s_effectInputNotes.TryGetValue(storage, out var perIndex))
+                {
+                    perIndex = new System.Collections.Generic.Dictionary<int, object?>();
+                    s_effectInputNotes.Add(storage, perIndex);
+                }
+                perIndex[index] = image;
+            }
+        }
+        catch { }
+    }
+
+    // Effect inputs: the construction-time note table first (see
+    // NoteEffectInput), then instance fields (whole hierarchy: sources
+    // live in private base fields) whose type looks like an
+    // image/effect, then the properties Source accessor, then GetInput
+    // fallback. Field reads are pure data; the accessors are the same
+    // ones the proven unwrap path uses every run.
+    private static System.Collections.Generic.List<object?> EffectInputs(object effect)
+    {
+        var list = new System.Collections.Generic.List<object?>();
+        try
+        {
+            // The Set hook keys notes by the inner husk (the accessor's
+            // Storage resolves to the husk itself): a direct hit collapses
+            // one chain level, keeping deep strip chains inside the
+            // walk's depth budget.
+            try
+            {
+                if (s_effectInputNotes.TryGetValue(effect, out var selfNotes))
+                {
+                    var orderedSelf = new System.Collections.Generic.List<int>(selfNotes.Keys);
+                    orderedSelf.Sort();
+                    foreach (int i in orderedSelf)
+                    {
+                        if (list.Count >= 8)
+                            break;
+                        object? notedSelf = selfNotes[i];
+                        if (notedSelf is not null && !ReferenceEquals(notedSelf, effect))
+                            list.Add(notedSelf);
+                    }
+                    if (list.Count > 0)
+                        return list;
+                }
+            }
+            catch { }
+            try
+            {
+                var bagProp = effect.GetType().GetMethod("get_Properties", System.Type.EmptyTypes);
+                object? bag = bagProp?.Invoke(effect, null);
+                if (bag is not null && s_effectInputNotes.TryGetValue(bag, out var perIndex))
+                {
+                    var ordered = new System.Collections.Generic.List<int>(perIndex.Keys);
+                    ordered.Sort();
+                    foreach (int i in ordered)
+                    {
+                        if (list.Count >= 8)
+                            break;
+                        object? noted = perIndex[i];
+                        if (noted is not null && !ReferenceEquals(noted, effect))
+                            list.Add(noted);
+                    }
+                    if (list.Count > 0)
+                        return list;
+                }
+            }
+            catch { }
+            for (System.Type? t = effect.GetType();
+                t is not null && t != typeof(object) && list.Count < 8;
+                t = t.BaseType)
+            {
+                System.Reflection.FieldInfo[] fields;
+                try
+                {
+                    fields = t.GetFields(
+                        System.Reflection.BindingFlags.DeclaredOnly
+                        | System.Reflection.BindingFlags.Instance
+                        | System.Reflection.BindingFlags.Public
+                        | System.Reflection.BindingFlags.NonPublic);
+                }
+                catch { break; }
+                foreach (var f in fields)
+                {
+                    if (list.Count >= 8)
+                        break;
+                    // Declared-type pre-filter skips primitives only: the
+                    // source often hides in object-typed fields, so the
+                    // keep/drop decision uses the VALUE's runtime type.
+                    string? tn = null;
+                    try { tn = f.FieldType.FullName; } catch { continue; }
+                    if (tn is null || tn == "System.String" || tn == "System.Int32"
+                        || tn == "System.Single" || tn == "System.Boolean"
+                        || tn == "System.Double" || tn == "System.Int64"
+                        || tn == "System.Byte" || tn == "System.Char")
+                        continue;
+                    object? v;
+                    try { v = f.GetValue(effect); } catch { continue; }
+                    if (v is null || ReferenceEquals(v, effect))
+                        continue;
+                    if (v is System.Collections.IList il)
+                    {
+                        for (int i = 0; i < il.Count && list.Count < 8; i++)
+                        {
+                            try
+                            {
+                                object? e = il[i];
+                                if (e is not null && !ReferenceEquals(e, effect))
+                                    list.Add(e);
+                            }
+                            catch { break; }
+                        }
+                    }
+                    else if (v is System.Collections.IDictionary dict)
+                    {
+                        // CPU effect stand-ins keep inputs in a Hashtable.
+                        try
+                        {
+                            foreach (object? e in dict.Values)
+                            {
+                                if (list.Count >= 8)
+                                    break;
+                                if (e is not null && !ReferenceEquals(e, effect))
+                                    list.Add(e);
+                            }
+                        }
+                        catch { }
+                    }
+                    else
+                    {
+                        string? vtn = null;
+                        try { vtn = v.GetType().FullName; } catch { continue; }
+                        if (vtn is not null && (vtn.Contains("Image") || vtn.Contains("Effect")
+                            || vtn.Contains("Bitmap") || vtn.Contains("Source")))
+                        {
+                            // Splice husk notes in place of the husk: the
+                            // inner device effect carries its inputs in the
+                            // note table (and its own _inputs), but every
+                            // husk level costs walk depth. Replacing the
+                            // husk with its noted inputs collapses the
+                            // strip chain (crop->opacity->composite) to one
+                            // level per wrapper. Falls back to the husk
+                            // itself when nothing was noted.
+                            bool spliced = false;
+                            if (vtn.Contains("CpuDeviceEffect"))
+                            {
+                                try
+                                {
+                                    if (s_effectInputNotes.TryGetValue(v, out var huskNotes))
+                                    {
+                                        var orderedHusk = new System.Collections.Generic.List<int>(huskNotes.Keys);
+                                        orderedHusk.Sort();
+                                        int added = 0;
+                                        foreach (int i in orderedHusk)
+                                        {
+                                            if (list.Count >= 8)
+                                                break;
+                                            object? notedHusk = huskNotes[i];
+                                            if (notedHusk is not null && !ReferenceEquals(notedHusk, effect))
+                                            { list.Add(notedHusk); added++; }
+                                        }
+                                        spliced = added > 0;
+                                    }
+                                }
+                                catch { }
+                            }
+                            if (!spliced)
+                                list.Add(v);
+                        }
+                    }
+                }
+            }
+            if (list.Count == 0)
+            {
+                var propsProp = effect.GetType().GetMethod("get_Properties", System.Type.EmptyTypes);
+                object? bag = propsProp?.Invoke(effect, null);
+                var srcProp = bag?.GetType().GetMethod("get_Source", System.Type.EmptyTypes);
+                object? acc = srcProp?.Invoke(bag, null);
+                var get = acc?.GetType().GetMethod("Get", System.Type.EmptyTypes);
+                object? via = get?.Invoke(acc, null);
+                if (via is not null)
+                    list.Add(via);
+            }
+            if (list.Count == 0)
+            {
+                var getInput = effect.GetType().GetMethod("GetInput", [typeof(int)]);
+                if (getInput is not null)
+                {
+                    for (int i = 0; i < 8 && list.Count < 8; i++)
+                    {
+                        object? inp;
+                        try { inp = getInput.Invoke(effect, [i]); }
+                        catch { break; }
+                        if (inp is null)
+                            break;
+                        list.Add(inp);
+                    }
+                }
+            }
+        }
+        catch { }
+        return list;
     }
 
     private static bool s_procLogged;

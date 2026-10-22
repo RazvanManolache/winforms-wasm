@@ -25,14 +25,18 @@ app.MapGet("/api/preview-config", (HttpContext context) =>
     context.Response.Headers.CacheControl = "no-cache";
     return Results.Ok(new {
         runtimeOrigin = app.Configuration["Preview:RuntimeOrigin"],
-        apps = new SceneState().Entries.Where(entry => entry.AppFolder is null ||
+        apps = new SceneState().Entries.Where(entry => DesktopBenchmarks.Find(entry.Scene) is not null || entry.AppFolder is null ||
             (AppTransform.TryGetSpec(entry.AppFolder, out var spec) && spec is not null &&
              AppTransform.TryResolveAssembly(entry.AppFolder, spec.Entry, out _))).Select(entry => new {
             slug = SceneState.ToSlug(entry.Scene), entry.Label, entry.SourceLabel,
             entry.SourceUrl, entry.AppFolder,
-            family = SyncfusionDemos.Find(entry.Scene)?.Family,
-            purpose = SyncfusionDemos.Find(entry.Scene)?.Purpose,
-            components = SyncfusionDemos.Find(entry.Scene)?.Components,
+            category = DesktopBenchmarks.Find(entry.Scene) is null ? null : "benchmarks",
+            available = DesktopBenchmarks.Find(entry.Scene) is not { } benchmark || DesktopBenchmarkInputs.IsPrepared(benchmark),
+            setupNote = DesktopBenchmarks.Find(entry.Scene)?.Notes,
+            setupKind = DesktopBenchmarks.Find(entry.Scene)?.Build,
+            family = DesktopBenchmarks.Find(entry.Scene)?.Family ?? SyncfusionDemos.Find(entry.Scene)?.Family,
+            purpose = DesktopBenchmarks.Find(entry.Scene)?.Purpose ?? SyncfusionDemos.Find(entry.Scene)?.Purpose,
+            components = DesktopBenchmarks.Find(entry.Scene)?.Components ?? SyncfusionDemos.Find(entry.Scene)?.Components,
         }),
     });
 });

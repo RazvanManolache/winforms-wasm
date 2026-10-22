@@ -77,7 +77,8 @@ public sealed class SceneState
             null, "telerik-toastnotificationmanagerexamples"),
     }.Concat(SyncfusionDemos.Entries.Select(demo => new SceneEntry(demo.Scene, "Syncfusion: " + demo.Label,
         "Syncfusion WinForms demos · experimental compatibility test", SyncfusionDemos.RepositoryUrl,
-        null, demo.Slug))).ToArray();
+        null, demo.Slug))).Concat(DesktopBenchmarks.Entries.Select(demo => new SceneEntry(demo.Scene, demo.Label,
+        demo.Family + " benchmark · experimental", demo.SourceUrl, null, demo.Slug))).ToArray();
 
     public AppScene Current { get; private set; } = AppScene.Smoke;
 
@@ -116,7 +117,7 @@ public sealed class SceneState
         AppScene.TelerikRssReader => "telerik-rssreader",
         AppScene.TelerikSpellCheck => "telerik-spellcheckasyoutype",
         AppScene.TelerikToast => "telerik-toastnotificationmanagerexamples",
-        _ => SyncfusionDemos.Find(scene)?.Slug ?? "smoke",
+        _ => DesktopBenchmarks.Find(scene)?.Slug ?? SyncfusionDemos.Find(scene)?.Slug ?? "smoke",
     };
 
     // Server-side folder names differ from URL slugs for a few apps

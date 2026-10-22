@@ -254,6 +254,9 @@ public sealed class WinFormsAppHost : IDisposable
 	internal Rectangle _documentPageBounds;
 
 	private ZoomedBlit? _docZoomBlit;
+	// Layers tool window captured per frame for thumb re-invalidation
+	// on changed doc composites.
+	private System.Windows.Forms.Control? _thumbRefreshTarget;
 
 	private Size _documentOriginalSize;
 
@@ -867,6 +870,8 @@ public sealed class WinFormsAppHost : IDisposable
 				form = CreateAppForm("ToastNotificationManagerExamples.FirstLook.Form1", "ToastNotificationManagerExamples");
 				break;
 			}
+			if (form is null && DesktopBenchmarks.Find(scene) is { } benchmark)
+				form = DesktopBenchmarkForms.Create(benchmark);
 			if (form is null && SyncfusionDemos.Find(scene) is { } sfdemo)
 				form = CreateAppForm(sfdemo.FormType, sfdemo.Assembly);
 			if (form != null)
@@ -2936,6 +2941,14 @@ public sealed class WinFormsAppHost : IDisposable
 				}
 				Console.WriteLine($"[Host] Dialog placed: {form.GetType().Name} '{form.Text}' at {form.Location} size {form.Size} modal={wasmShownWindow.IsModal}");
 			}
+			// Capture the Layers tool window so a changed doc composite
+			// can re-invalidate its strips.
+			try
+			{
+				if (form.Text == "Layers")
+					_thumbRefreshTarget = form;
+			}
+			catch { }
 			int x = form.Location.X;
 			int y = form.Location.Y;
 			int width = form.Width;
@@ -3646,9 +3659,48 @@ public sealed class WinFormsAppHost : IDisposable
 						{
 							array = ExtractCompositedRgba(activeDocumentWorkspace, docW, docH);
 						}
-						array = array ?? ExtractSurfaceRgba(activeDocumentSurface, docW, docH);
+						int blankKind = 0;
+						array = array ?? ExtractSurfaceRgba(activeDocumentSurface, docW, docH, out blankKind);
+						// Undo-to-blank reads null; feed an explicit blank
+						// so thumbs clear, then invalidate.
+						if ((array == null || array.Length == 0) && blankKind > 0 && !_isDrawingOnDocument)
+						{
+							bool blankChanged = false;
+							try { blankChanged = CpuPaint.NoteDocBlank(docW, docH, blankKind == 1); } catch { }
+							if (blankChanged)
+							{
+								try
+								{
+									var tw0 = _thumbRefreshTarget;
+									if (tw0 is not null && !tw0.IsDisposed && !tw0.Disposing)
+										tw0.Invalidate();
+									else
+										_thumbRefreshTarget = null;
+								}
+								catch { }
+							}
+						}
 						if (array != null && array.Length != 0)
 						{
+							// Feed the live doc composite to the thumb stash
+							// (full-doc dims, pre-crop); on change,
+							// re-invalidate the Layers window so strips
+							// repaint from the fresh stash (retained
+							// surfaces would otherwise lag one commit).
+							bool thumbChanged = false;
+							try { thumbChanged = CpuPaint.NoteDocComposite(array, docW, docH); } catch { }
+							if (thumbChanged)
+							{
+								try
+								{
+									var tw = _thumbRefreshTarget;
+									if (tw is not null && !tw.IsDisposed && !tw.Disposing)
+										tw.Invalidate();
+									else
+										_thumbRefreshTarget = null;
+								}
+								catch { }
+							}
 							if (zoomedBlit.SrcX != 0 || zoomedBlit.SrcY != 0 || zoomedBlit.SrcW != docW || zoomedBlit.SrcH != docH)
 							{
 								array = DocumentZoom.CropRgba(array, docW, docH, zoomedBlit.SrcX, zoomedBlit.SrcY, zoomedBlit.SrcW, zoomedBlit.SrcH);
@@ -6570,8 +6622,10 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 	}
 
-	private unsafe static byte[]? ExtractSurfaceRgba(object surface, int w, int h)
+	private unsafe static byte[]? ExtractSurfaceRgba(object surface, int w, int h, out int blankKind)
 	{
+		// blankKind 0 = content/error, 1 = all-white, 2 = all-transparent.
+		blankKind = 0;
 		try
 		{
 			object obj = surface.GetType().GetProperty("Scan0", BindingFlags.Instance | BindingFlags.Public)?.GetValue(surface);
@@ -6591,6 +6645,8 @@ public sealed class WinFormsAppHost : IDisposable
 			}
 			int num3 = (int)(surface.GetType().GetProperty("Stride", BindingFlags.Instance | BindingFlags.Public)?.GetValue(surface) ?? ((object)(w * 4)));
 			bool flag = false;
+			bool allWhite = true;
+			bool allZero = true;
 			byte* ptr = (byte*)((IntPtr)num).ToPointer();
 			int num4 = w * h;
 			uint* ptr2 = (uint*)ptr;
@@ -6601,9 +6657,14 @@ public sealed class WinFormsAppHost : IDisposable
 					flag = true;
 					break;
 				}
+				if (ptr2[i] != uint.MaxValue)
+					allWhite = false;
+				if (ptr2[i] != 0)
+					allZero = false;
 			}
 			if (!flag)
 			{
+				blankKind = allWhite ? 1 : (allZero ? 2 : 0);
 				return null;
 			}
 			byte[] array = new byte[w * h * 4];

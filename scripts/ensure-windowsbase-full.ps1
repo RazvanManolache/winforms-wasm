@@ -31,7 +31,8 @@ $sidecar = $outDll + '.pristine.sha256'
 $sha = [Security.Cryptography.SHA256]::Create()
 try { $pristineHash = [BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($pristine))).Replace('-', '') }
 finally { $sha.Dispose() }
-if ((Test-Path $outDll) -and (Test-Path $sidecar) -and ((Get-Content $sidecar -Raw).Trim() -eq $pristineHash)) {
+$stageRev = "$pristineHash|refonly1"
+if ((Test-Path $outDll) -and (Test-Path $sidecar) -and ((Get-Content $sidecar -Raw).Trim() -eq $stageRev)) {
     Write-Host "WindowsBase full copy up to date ($outDll)"
     return
 }
@@ -60,9 +61,11 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "stub-pinvokes failed for WindowsBase" }
     dotnet $tool --patch-probes $tmp $tmp
     if ($LASTEXITCODE -ne 0) { throw "patch-probes failed for WindowsBase" }
+    dotnet $tool --refonly $tmp $tmp
+    if ($LASTEXITCODE -ne 0) { throw "refonly failed for WindowsBase" }
     New-Item -ItemType Directory -Path $outDir -Force | Out-Null
     Copy-Item $tmp $outDll -Force
-    Set-Content $sidecar $pristineHash -NoNewline
+    Set-Content $sidecar $stageRev -NoNewline
     $len = (Get-Item $outDll).Length
     Write-Host "WindowsBase full copy staged: $outDll ($len bytes)"
 }

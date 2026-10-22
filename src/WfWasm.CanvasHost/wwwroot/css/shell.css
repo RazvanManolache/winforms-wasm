@@ -4,3 +4,6 @@
 .embedded-runtime .app-sidebar,.embedded-runtime .app-rail,.embedded-runtime .workspace-toolbar,.embedded-runtime .workspace-footer{display:none!important}
 .embedded-runtime .preview-shell{display:block;height:100dvh}.embedded-runtime .preview-main{height:100%;padding:0}.embedded-runtime .preview-content{height:100%;margin:0;border:0;border-radius:0;box-shadow:none}.embedded-runtime .stage-layout{height:100%}
 .shell-phase{max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.app-list[aria-busy=true]{opacity:.7}
+
+/* Keep the optional benchmark filter reachable on narrow sidebars. */
+.library-tabs{flex-wrap:wrap}

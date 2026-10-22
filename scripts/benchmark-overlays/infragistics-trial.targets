@@ -1,0 +1,12 @@
+<Project>
+  <!-- Build the unchanged official sample against public evaluation packages.
+       This preserves the vendor's trial behavior; it supplies no license key. -->
+  <Target Name="UseBenchmarkEvaluationPackages" BeforeTargets="CollectPackageReferences">
+  <ItemGroup>
+    <_BenchmarkTrialReference Include="@(PackageReference)"
+      Condition="$([System.String]::Copy('%(PackageReference.Identity)').StartsWith('Infragistics.WinForms'))" />
+    <PackageReference Remove="@(_BenchmarkTrialReference)" />
+    <PackageReference Include="@(_BenchmarkTrialReference -> '%(Identity).Trial')" Version="26.1.22" />
+  </ItemGroup>
+  </Target>
+</Project>

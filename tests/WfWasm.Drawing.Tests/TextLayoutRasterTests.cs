@@ -155,4 +155,69 @@ public sealed class TextLayoutRasterTests
             WfBrowserText.RasterOverride = null;
         }
     }
+
+    // get_Text itself throws: GetString does not catch, so the fault
+    // reaches the outer handler (Invoke wraps it in
+    // TargetInvocationException). BrowserText never runs.
+    private sealed class ThrowingTextLayout
+    {
+        public string Text => throw new InvalidOperationException("unreadable text");
+        public string FontFamilyName { get; set; } = "Segoe UI";
+        public double FontSize { get; set; } = 12;
+        public int FontWeight { get; set; }
+        public string FontStyle { get; set; } = "Normal";
+        public double MaxWidth { get; set; } = double.PositiveInfinity;
+    }
+
+    [Fact]
+    public void Unexpected_Raster_Fault_Is_Diagnosable_When_Switch_On()
+    {
+        AppContext.SetSwitch("WfWasm.TextDiagnostics", true);
+        try
+        {
+            // Fallback contract holds: still null, caller keeps 5x7.
+            Assert.Null(WfTextLayoutRaster.TryRasterLayout(new ThrowingTextLayout(), 96f, 2048));
+            string? fault = WfTextLayoutRaster.LastFault;
+            Assert.NotNull(fault);
+            Assert.Contains("TargetInvocationException", fault);
+        }
+        finally
+        {
+            AppContext.SetSwitch("WfWasm.TextDiagnostics", false);
+        }
+    }
+
+    [Fact]
+    public void Unexpected_Raster_Fault_Stays_Silent_When_Switch_Off()
+    {
+        AppContext.SetSwitch("WfWasm.TextDiagnostics", false);
+        try
+        {
+            Assert.Null(WfTextLayoutRaster.TryRasterLayout(new ThrowingTextLayout(), 96f, 2048));
+            Assert.Null(WfTextLayoutRaster.LastFault);
+        }
+        finally
+        {
+            AppContext.SetSwitch("WfWasm.TextDiagnostics", false);
+        }
+    }
+
+    [Fact]
+    public void Expected_Null_Leaves_No_Fault_Even_When_Switch_On()
+    {
+        AppContext.SetSwitch("WfWasm.TextDiagnostics", true);
+        try
+        {
+            var empty = HeadersLayout();
+            empty.Text = string.Empty;
+            Assert.Null(WfTextLayoutRaster.TryRasterLayout(empty, 96f, 2048));
+            Assert.Null(WfTextLayoutRaster.LastFault);
+            Assert.Null(WfTextLayoutRaster.TryRasterLayout(null, 96f, 2048));
+            Assert.Null(WfTextLayoutRaster.LastFault);
+        }
+        finally
+        {
+            AppContext.SetSwitch("WfWasm.TextDiagnostics", false);
+        }
+    }
 }

@@ -2372,6 +2372,44 @@ public sealed class RewriteTests
     }
 
     [Fact]
+    public void HistoryRow_Is_Text_Only_Headless()
+    {
+        // Rows with a non-null icon paint as blank selected bands
+        // headless (the icon path leaves no usable text rect), while
+        // icon-less rows paint their names. The rewrite nulls the
+        // image at the getter so every row (Paintbrush, New Image,
+        // ...) is text-only. All get_Image callers pass the value
+        // into another memento ctor or branch on null.
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
+        if (!File.Exists(pdnInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"pdn_RowText_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(pdnInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var history = asm.MainModule.GetType("PaintDotNet.HistoryMementos.HistoryMemento");
+            Assert.NotNull(history);
+            var getter = Assert.Single(history.Methods, m => m.Name == "get_Image" && m.Parameters.Count == 0);
+            Assert.True(getter.HasBody);
+            var ins = getter.Body.Instructions.ToList();
+            Assert.Equal(2, ins.Count);
+            Assert.Equal(Mono.Cecil.Cil.OpCodes.Ldnull, ins[0].OpCode);
+            Assert.Equal(Mono.Cecil.Cil.OpCodes.Ret, ins[1].OpCode);
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
+
+    [Fact]
     public void HistoryFlush_Is_Retained_Headless()
     {
         // HistoryStack.PushNewMemento flushes the memento at push,
@@ -2402,6 +2440,335 @@ public sealed class RewriteTests
             Assert.True(flush.HasBody);
             var ins = flush.Body.Instructions.ToList();
             var single = Assert.Single(ins);
+            Assert.Equal(Mono.Cecil.Cil.OpCodes.Ret, single.OpCode);
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
+
+    [Fact]
+    public void ThumbnailManager_Drains_Inline_Headless()
+    {
+        // Layer previews stay blank headless: ThumbnailManager renders
+        // them on a dedicated render thread, but Thread.Start is
+        // neutered browser-wide, so RenderThreadLoop never runs and
+        // OnThumbnailReady never fires (no error: nothing throws). The
+        // rewrite drains the loop inline at the end of
+        // QueueThumbnailUpdate: while the queue is non-empty, run one
+        // RenderThreadLoop pass; stop when it reports false.
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
+        if (!File.Exists(pdnInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"pdn_ThumbInline_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(pdnInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var manager = asm.MainModule.GetType("PaintDotNet.Rendering.ThumbnailManager");
+            Assert.NotNull(manager);
+            var queue = Assert.Single(manager.Methods, m => m.Name == "QueueThumbnailUpdate" && m.HasBody);
+            var ins = queue.Body.Instructions.ToList();
+            Assert.Equal(Mono.Cecil.Cil.OpCodes.Ret, ins[ins.Count - 1].OpCode);
+            int loopCalls = ins.Count(i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Call
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.Name == "RenderThreadLoop"
+                && mr.DeclaringType.FullName == "PaintDotNet.Rendering.ThumbnailManager");
+            Assert.Equal(1, loopCalls);
+            Assert.Contains(ins, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.Name == "get_Count"
+                && mr.DeclaringType.FullName.StartsWith("PaintDotNet.Collections.Deque", StringComparison.Ordinal));
+            // The try body leaves to the final ret: the drain entry
+            // (not the ret) must be the leave target, or the unwind
+            // jumps over the drain and the queue grows forever live.
+            var tail = ins[ins.Count - 1];
+            bool retargeted = false;
+            foreach (var i in ins)
+            {
+                if ((i.OpCode == Mono.Cecil.Cil.OpCodes.Leave || i.OpCode == Mono.Cecil.Cil.OpCodes.Leave_S)
+                    && i.Operand is Mono.Cecil.Cil.Instruction tgt)
+                {
+                    Assert.NotEqual(tail, tgt);
+                    retargeted = true;
+                }
+            }
+            Assert.True(retargeted);
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
+
+    [Fact]
+    public void ThumbnailManager_InsertLayer_Opacity_Starts_At_One_Headless()
+    {
+        // InsertLayer zeroes the new strip item's ImageOpacity for a
+        // 0.5 s fade-in that never advances headless (observed live:
+        // op=0 with the image set, so DrawItemImage skips on opacity
+        // product 0). The rewrite starts at the end state (1).
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
+        if (!File.Exists(pdnInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"pdn_ThumbOp_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(pdnInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var strip = asm.MainModule.GetType("PaintDotNet.Controls.LayersStrip");
+            Assert.NotNull(strip);
+            var insert = Assert.Single(strip.Methods, m => m.Name == "InsertLayer" && m.HasBody);
+            var ins = insert.Body.Instructions.ToList();
+            int at = ins.FindIndex(i =>
+                (i.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt || i.OpCode == Mono.Cecil.Cil.OpCodes.Call)
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.Name == "get_ImageOpacity");
+            Assert.True(at >= 0);
+            int val = -1;
+            for (int k = at + 1; k < ins.Count; k++)
+            {
+                if (ins[k].OpCode == Mono.Cecil.Cil.OpCodes.Ldc_R8)
+                {
+                    val = ins[k].Operand is double d && d == 1.0 ? 1 : 0;
+                    break;
+                }
+            }
+            Assert.Equal(1, val);
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
+
+    [Fact]
+    public void ThumbnailManager_Render_Uses_Half_Bridge_Headless()
+    {
+        // The default CreateThumbnailBitmapScRgb converts Bgra32->Half
+        // through ToScRgb and the WIC imaging factory, whose native
+        // COM sidecars cannot load in the browser (OOB trap observed
+        // live in the inline drain). The drain instead renders through
+        // the managed Half bridge: RenderThreadLoop calls
+        // CpuPaint.RenderLayerThumbnail and no longer touches
+        // CreateThumbnailBitmapScRgb.
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
+        if (!File.Exists(pdnInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"pdn_ThumbBridge_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(pdnInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var manager = asm.MainModule.GetType("PaintDotNet.Rendering.ThumbnailManager");
+            Assert.NotNull(manager);
+            var loop = Assert.Single(manager.Methods, m => m.Name == "RenderThreadLoop" && m.Parameters.Count == 0 && m.HasBody);
+            var ins = loop.Body.Instructions.ToList();
+            Assert.Contains(ins, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Call
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.Name == "RenderLayerThumbnail"
+                && mr.DeclaringType.FullName == "WfWasm.PdnCpu.CpuPaint");
+            Assert.DoesNotContain(ins, i =>
+                (i.OpCode == Mono.Cecil.Cil.OpCodes.Call || i.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt)
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.Name == "CreateThumbnailBitmapScRgb");
+            // The enum priority must be boxed for the object-typed
+            // bridge: raw int32 bits as an object reference OOBs the
+            // interpreter (rev134 crash).
+            Assert.Contains(ins, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Box
+                && i.Operand is Mono.Cecil.TypeReference tr
+                && tr.FullName == "PaintDotNet.Threading.WorkItemQueuePriority");
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
+
+    [Fact]
+    public void ThumbnailConsume_Converts_Half_Managed_Headless()
+    {
+        // BitmapImage.CreateImpl routes Half sources through
+        // CreateWithFormatConversion's WIC color transformer (same OOB
+        // family as the ToScRgb render death). Headless, 64-bit
+        // sources instead recurse into CreateImpl with a managed
+        // Bgra32 conversion (CpuPaint.ConvertHalfSourceToBgra).
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string fwInput = Path.Combine(paintDir, "PaintDotNet.Windows.Framework.dll");
+        if (!File.Exists(fwInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"pdn_ThumbConsume_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(fwInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var img = asm.MainModule.GetType("PaintDotNet.Direct2D1.BitmapImage");
+            Assert.NotNull(img);
+            var conv = Assert.Single(img.Methods, m => m.Name == "CreateWithFormatConversion" && m.HasBody);
+            var ins = conv.Body.Instructions.ToList();
+            Assert.Contains(ins, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Call
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.Name == "ConvertHalfSourceToBgra"
+                && mr.DeclaringType.FullName == "WfWasm.PdnCpu.CpuPaint");
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
+
+    [Fact]
+    public void EffectInputRetention_Notes_Set_Inputs_Headless()
+    {
+        // EffectInputAccessor.Set routes the input into SetInput on the
+        // current inner effect, but resource invalidation ReplaceRef-swaps
+        // a fresh husk in afterwards: at draw time the husk's table is
+        // empty and the strip chain unwraps to nothing (blank layer
+        // previews). Headless, Set also notes (bag, index) -> image into
+        // CpuPaint.NoteEffectInput, which the draw-time walk reads first.
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string coreInput = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
+        if (!File.Exists(coreInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"pdn_InputRetain_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(coreInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var accessor = asm.MainModule.GetType("PaintDotNet.Direct2D1.Effects.EffectInputAccessor");
+            Assert.NotNull(accessor);
+            var set = Assert.Single(accessor.Methods, m => m.Name == "Set" && m.HasBody && m.Parameters.Count == 2);
+            var ins = set.Body.Instructions.ToList();
+            Assert.Contains(ins, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Call
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.Name == "NoteEffectInput"
+                && mr.DeclaringType.FullName == "WfWasm.PdnCpu.CpuPaint");
+            // Composite ctors call SetInput directly, bypassing the
+            // accessor: the synthesized husk notes (this, index) ->
+            // image in SetInput itself so the walk splices composite
+            // inputs too.
+            var cpuEffect = asm.MainModule.Types.FirstOrDefault(t => t.Name == "CpuDeviceEffect");
+            Assert.NotNull(cpuEffect);
+            var setInput = Assert.Single(cpuEffect.Methods, m => m.Name == "SetInput" && m.HasBody && m.Parameters.Count == 3);
+            var setIns = setInput.Body.Instructions.ToList();
+            Assert.Contains(setIns, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Call
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.Name == "NoteEffectInput"
+                && mr.DeclaringType.FullName == "WfWasm.PdnCpu.CpuPaint");
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
+
+    [Fact]
+    public void ThumbnailDelivery_Drops_Faulting_Batches_Headless()
+    {
+        // DrainThumbnailReadyInvokeList invokes every ready handler
+        // in one pass, and any fault inside it propagates through the
+        // render loop into the layer/document wiring that queued it,
+        // aborting boot setup (observed live: blank canvas, empty
+        // history). Headless the faulting batch is dropped: the
+        // first-chance inventory keeps the signal, the app survives,
+        // and the next invalidation re-queues.
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
+        if (!File.Exists(pdnInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"pdn_ThumbDeliver_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(pdnInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var manager = asm.MainModule.GetType("PaintDotNet.Rendering.ThumbnailManager");
+            Assert.NotNull(manager);
+            var drain = Assert.Single(manager.Methods, m => m.Name == "DrainThumbnailReadyInvokeList" && m.HasBody);
+            var span = drain.Body.Instructions.ToList();
+            bool guarded = false;
+            foreach (var h in drain.Body.ExceptionHandlers)
+            {
+                if (h.HandlerType == Mono.Cecil.Cil.ExceptionHandlerType.Catch
+                    && h.TryStart == span[0])
+                {
+                    guarded = true;
+                }
+            }
+            Assert.True(guarded);
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
+
+    [Fact]
+    public void ThumbnailManager_SleepUntilUtc_Neutered_Headless()
+    {
+        // SleepUntilUtc is the background loop's 200 ms debounce
+        // (Thread.Sleep): draining inline on the UI thread must not
+        // stall per thumbnail, so it reduces to ret. Only
+        // ThumbnailManager itself may call it.
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
+        if (!File.Exists(pdnInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"pdn_ThumbSleep_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(pdnInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var manager = asm.MainModule.GetType("PaintDotNet.Rendering.ThumbnailManager");
+            Assert.NotNull(manager);
+            var sleep = Assert.Single(manager.Methods, m => m.Name == "SleepUntilUtc" && m.Parameters.Count == 1 && m.HasBody);
+            var sins = sleep.Body.Instructions.ToList();
+            var single = Assert.Single(sins);
             Assert.Equal(Mono.Cecil.Cil.OpCodes.Ret, single.OpCode);
         }
         finally
@@ -3242,7 +3609,7 @@ public sealed class RewriteTests
         string input = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release\Microsoft.AnalysisServices.AdomdClient.dll");
         if (!File.Exists(input)) return;
         string forms = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
-        Assert.True(File.Exists(forms), "regenerate via E:/tmp/rewrite-small.ps1");
+        Assert.True(File.Exists(forms), "regenerate via scripts/build.ps1");
         string drawing = ShimDll("WfWasm.Drawing", "WfWasm.Drawing");
         var assemblyMap = new Dictionary<string, string>(StringComparer.Ordinal)
         {
@@ -3271,7 +3638,7 @@ public sealed class RewriteTests
         string pool = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release");
         if (!File.Exists(input) || !Directory.Exists(pool)) return;
         string forms = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
-        Assert.True(File.Exists(forms), "regenerate via E:/tmp/rewrite-small.ps1");
+        Assert.True(File.Exists(forms), "regenerate via scripts/build.ps1");
         string drawing = ShimDll("WfWasm.Drawing", "WfWasm.Drawing");
         var assemblyMap = new Dictionary<string, string>(StringComparer.Ordinal)
         {
@@ -4995,7 +5362,7 @@ public sealed class RewriteTests
     [Fact]
     public void PresentationCore_ModuleInitializer_Is_Nooped()
     {
-        string corePath = @"E:\tmp\rewritten-paint\PresentationCore.dll";
+        string corePath = TestPaths.Repo(@"external-apps\paintnet-support\PresentationCore.dll");
         if (File.Exists(corePath))
         {
             string tempCoreOut = Path.Combine(Path.GetTempPath(), $"PresentationCore_Test_{Guid.NewGuid()}.dll");
@@ -5052,7 +5419,7 @@ public sealed class RewriteTests
         string fwPath = @"C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App\9.0.20\PresentationFramework.dll";
         if (!File.Exists(fwPath))
         {
-            fwPath = @"E:\tmp\rewritten-paint\PresentationFramework.dll";
+            fwPath = TestPaths.Repo(@"external-apps\paintnet-support\PresentationFramework.dll");
             if (!File.Exists(fwPath)) return;
         }
 
@@ -7115,8 +7482,9 @@ public sealed class RewriteTests
     {
         // CpuDrawingContext.CreateSharedBitmap uploads the lock's live
         // buffer into a CPU device bitmap (the extension disposes the
-        // lock in finally, so pixels are copied). Only 32-bit locks
-        // upload; anything else keeps the loud NotSupported.
+        // lock in finally, so pixels are copied). 32-bit locks upload
+        // packed; 64-bit Half locks convert (see Uploads_Half_Lock);
+        // anything else keeps the loud NotSupported.
         // Regression: NotSupported | CpuDrawingContext.CreateSharedBitmap.
         string paintDir = TestPaths.Repo(@"targets\paint.net");
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
@@ -7146,6 +7514,135 @@ public sealed class RewriteTests
                 && i.Operand is Mono.Cecil.MethodReference nm && nm.DeclaringType.Name == "CpuDeviceBitmap");
             Assert.Contains(instrs, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Ret);
             AssertCalleesResolve(asm.MainModule, shared);
+        }
+        finally
+        {
+            try { if (File.Exists(tempOut)) File.Delete(tempOut); } catch { }
+        }
+    }
+    [Fact]
+    public void Rewrite_SharedBitmap_Uploads_Half_Lock()
+    {
+        // 64-bit Half locks convert through
+        // CpuPaint.UploadHalfSharedBitmap (layer/history thumbnails);
+        // other widths keep the loud pixel-format NotSupported.
+        // Regression: NotSupported | DeviceContextExtensions.CreateSharedBitmap
+        // from ImageStrip.DrawImageItemImage <- ImageItem.GetDeviceImage.
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
+        if (!File.Exists(input)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        string tempOut = Path.Combine(Path.GetTempPath(), $"Core_SharedHalf_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(input, tempOut,
+                new Dictionary<string, string>(StringComparer.Ordinal),
+                new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal),
+                cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var ctx = asm.MainModule.GetType("PaintDotNet.Direct2D1.CpuDrawingContext");
+            Assert.NotNull(ctx);
+            var shared = ctx.Methods.FirstOrDefault(m => m.Name == "CreateSharedBitmap"
+                && m.Parameters.Count == 2
+                && m.Parameters[0].ParameterType.FullName == "PaintDotNet.Imaging.IBitmapLock");
+            Assert.NotNull(shared);
+            var instrs = shared.Body.Instructions.ToList();
+            Assert.Contains(instrs, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Call
+                && i.Operand is Mono.Cecil.MethodReference mr && mr.Name == "UploadHalfSharedBitmap" && mr.Parameters.Count == 4);
+            Assert.Contains(instrs, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Call
+                && i.Operand is Mono.Cecil.MethodReference mr && mr.Name == "CreateBitmap" && mr.Parameters.Count == 4);
+            Assert.Contains(instrs, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Beq);
+            Assert.Contains(instrs, i => (i.OpCode == Mono.Cecil.Cil.OpCodes.Bne_Un || i.OpCode == Mono.Cecil.Cil.OpCodes.Bne_Un_S)
+                && i.Operand is Mono.Cecil.Cil.Instruction);
+            Assert.Contains(instrs, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Ldstr
+                && (string?)i.Operand == "CpuDrawingContext.CreateSharedBitmap has no headless backend (pixel format)");
+            Assert.Contains(instrs, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Ret);
+            AssertCalleesResolve(asm.MainModule, shared);
+        }
+        finally
+        {
+            try { if (File.Exists(tempOut)) File.Delete(tempOut); } catch { }
+        }
+    }
+    [Fact]
+    public void Rewrite_DrawBitmap_Unwraps_Proxy_Source()
+    {
+        // ImageStrip item images (layer/history thumbnails) arrive as
+        // BitmapImage/effect shells: DrawBitmap unwraps them through
+        // GetProxySourceImage like DrawImage does instead of silently
+        // skipping every non-CpuDeviceBitmap source.
+        // Regression: blank layer rows + missing history icons with
+        // zero errors (the Isinst miss fell through to ret).
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
+        if (!File.Exists(input)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        string tempOut = Path.Combine(Path.GetTempPath(), $"Core_DrawBmpUnwrap_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(input, tempOut,
+                new Dictionary<string, string>(StringComparer.Ordinal),
+                new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal),
+                cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var ctx = asm.MainModule.GetType("PaintDotNet.Direct2D1.CpuDrawingContext");
+            Assert.NotNull(ctx);
+            var drawBitmap = ctx.Methods.FirstOrDefault(m => m.Name == "DrawBitmap"
+                && m.Parameters.Count == 6
+                && m.Parameters[0].ParameterType.FullName == "PaintDotNet.Direct2D1.IDeviceBitmap");
+            Assert.NotNull(drawBitmap);
+            var instrs = drawBitmap.Body.Instructions.ToList();
+            Assert.Contains(instrs, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Call
+                && i.Operand is Mono.Cecil.MethodReference mr && mr.Name == "GetProxySourceImage" && mr.Parameters.Count == 1);
+            Assert.Contains(instrs, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Call
+                && i.Operand is Mono.Cecil.MethodReference mr && mr.Name == "DrawBitmap" && mr.Parameters.Count == 14);
+            Assert.Contains(instrs, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Ret);
+            AssertCalleesResolve(asm.MainModule, drawBitmap);
+        }
+        finally
+        {
+            try { if (File.Exists(tempOut)) File.Delete(tempOut); } catch { }
+        }
+    }
+    [Fact]
+    public void Rewrite_DrawImage_Draws_Composite()
+    {
+        // ImageStrip item images are CompositeEffect(checker, thumb):
+        // DrawImage draws both through DrawCompositeImage instead of
+        // letting the procedural fallback swallow the thumbnail.
+        // Regression: blank layer rows + missing history icons with
+        // zero errors (checker filled the panel, thumb never drew).
+        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
+        if (!File.Exists(input)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        string tempOut = Path.Combine(Path.GetTempPath(), $"Core_DrawComposite_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(input, tempOut,
+                new Dictionary<string, string>(StringComparer.Ordinal),
+                new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal),
+                cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var ctx = asm.MainModule.GetType("PaintDotNet.Direct2D1.CpuDrawingContext");
+            Assert.NotNull(ctx);
+            var drawImage = ctx.Methods.FirstOrDefault(m => m.Name == "DrawImage"
+                && m.Parameters.Count == 5
+                && m.Parameters[0].ParameterType.FullName == "PaintDotNet.Direct2D1.IDeviceImage");
+            Assert.NotNull(drawImage);
+            var instrs = drawImage.Body.Instructions.ToList();
+            Assert.Contains(instrs, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Call
+                && i.Operand is Mono.Cecil.MethodReference mr && mr.Name == "DrawCompositeImage" && mr.Parameters.Count == 12);
+            AssertCalleesResolve(asm.MainModule, drawImage);
         }
         finally
         {

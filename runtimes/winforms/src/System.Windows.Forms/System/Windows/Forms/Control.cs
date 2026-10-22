@@ -1,4 +1,4 @@
-﻿// Licensed to the .NET Foundation under one or more agreements.
+// Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.ComponentModel;
@@ -11319,6 +11319,11 @@ public unsafe partial class Control :
                 &value,
                 (uint)sizeof(BOOL)).AssertSuccess();
         }
+
+            // Fork-owned: feed parentless visibility calls to the popup registry
+            // (WS_CHILD-styled and default-visible popups never call ShowWindow; the
+            // registry filters candidates itself). Track is idempotent; Snapshot prunes.
+            WasmPopupHost.NoteVisibleTransition(this, value);
     }
 
     /// <summary>

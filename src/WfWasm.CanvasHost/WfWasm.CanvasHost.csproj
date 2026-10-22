@@ -1,5 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk.BlazorWebAssembly">
-  <ItemGroup><EmbeddedResource Include="SyncfusionDemos.json" /></ItemGroup>
+  <ItemGroup><EmbeddedResource Include="SyncfusionDemos.json" /><EmbeddedResource Include="DesktopBenchmarks.json" /></ItemGroup>
 
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>

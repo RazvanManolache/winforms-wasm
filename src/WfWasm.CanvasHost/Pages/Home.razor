@@ -166,6 +166,8 @@
             if (_disposed || scene != State.Current) return;
             await JS.InvokeVoidAsync("preview.phase", "Creating app window");
             RefreshHost();
+            if (DesktopBenchmarks.Find(scene) is { } benchmark && !_winFormsHost.HasScene(scene))
+                throw new InvalidOperationException($"{benchmark.Label} could not create its real window. See App errors and the benchmark setup notes.");
             if (SyncfusionDemos.Find(scene) is { } demo && !_winFormsHost.HasScene(scene))
                 throw new InvalidOperationException($"Syncfusion {demo.Label} could not create its window. See App errors for the compatibility failure.");
             await RepaintAsync();
