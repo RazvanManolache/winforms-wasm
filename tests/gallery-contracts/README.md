@@ -8,16 +8,13 @@ Generation pinned per run (TransformRevision + binary head hashes);
 
 ## Oracles used today
 - Console lifecycle markers (`constructed`, `first-painted`, `[Scene]`
-  bounds, `[Host] OnClick hit=`) â€” semantic routing proof.
+  bounds, `[Host] OnClick hit=`) — semantic routing proof.
 - Region pixel diffs before/after real pointer/keyboard input.
 - cv2.QRCodeDetector independent decode (barcode).
 - Inventory count-based delta per case window (log dir is shared between
   :5210 and :5213; time/count attribution, limitation noted).
 
 ## Known gaps (do not weaken cases to green these)
-
-**22 October follow-up:** a fresh manual Paint.NET brush/Ctrl+Z/Ctrl+Y roundtrip succeeded and was checked using saved document pixels. The older modifier observations below describe an earlier run. The gallery runner has not been rerun to establish its current automated behavior; see [the review](../../docs/review-2026-10-22.md).
-
 - Modifier chords broken (2 witnesses): Ctrl+A types literal 'a' in
   fork TextBox (barcode input); Ctrl+Z does nothing in paint.net.
   Plain keys (Space/Enter/typing) work. Root cause in key dispatch or

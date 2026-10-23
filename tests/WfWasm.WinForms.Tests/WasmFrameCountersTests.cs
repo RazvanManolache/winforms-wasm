@@ -74,6 +74,12 @@ public sealed class WasmFrameCountersTests
             Assert.Equal(3, WasmFrameCounters.ExtractTicks);
             Assert.Equal(5, WasmFrameCounters.HashTicks);
             Assert.Equal(7, WasmFrameCounters.StoreTicks);
+            // Retained scroll-shift reuse counts live, resets per frame.
+            WasmFrameCounters.ResetFrame();
+            Assert.Equal(0, WasmFrameCounters.NScrollShift);
+            WasmFrameCounters.CountScrollShift();
+            WasmFrameCounters.CountScrollShift();
+            Assert.Equal(2, WasmFrameCounters.NScrollShift);
         }
         finally
         {

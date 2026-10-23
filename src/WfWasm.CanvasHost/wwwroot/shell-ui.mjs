@@ -72,6 +72,7 @@ function select(app, push = true) {
         showPreparation(app);
         return;
     }
+    diagnosticsOn = false; renderDiagnostics();
     try { sessions.select(app); } catch (error) { status('App could not start', error.message, 'error', true); }
 }
 function fromUrl() {
@@ -82,10 +83,25 @@ function fromUrl() {
     if (app) select(app, false);
     else { sessions.stop(); selected = null; renderLibrary(); status('Unknown app', 'Choose an app from your library.'); }
 }
-function command(type) {
+function command(type, extra) {
     const s = sessions?.current;
-    s?.frame.contentWindow.postMessage({channel, type, session:s.id, app:s.app.slug}, s.origin);
+    s?.frame.contentWindow.postMessage({channel, type, session:s.id, app:s.app.slug, ...(extra ?? {})}, s.origin);
 }
+// Diagnostics toggle (item 1): explicit enable/disable for A/B runs.
+// State is shell-owned; a fresh session starts off and resets the button.
+let diagnosticsOn = false;
+function renderDiagnostics() {
+    const b = document.getElementById('diagnostics-app');
+    if (!b) return;
+    b.setAttribute('aria-pressed', String(diagnosticsOn));
+    b.classList.toggle('selected', diagnosticsOn);
+    b.textContent = diagnosticsOn ? '●' : '◐';
+}
+document.getElementById('diagnostics-app').addEventListener('click', () => {
+    diagnosticsOn = !diagnosticsOn;
+    renderDiagnostics();
+    command('diagnostics', {enabled: diagnosticsOn});
+});
 $('app-search').addEventListener('input', renderLibrary);
 for (const tab of document.querySelectorAll('[data-group]')) tab.addEventListener('click', () => {
     group = tab.dataset.group;

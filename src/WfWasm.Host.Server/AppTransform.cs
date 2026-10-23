@@ -26,6 +26,7 @@ public static class AppTransform
     private static string Setting(string variable, string fallback) =>
         Environment.GetEnvironmentVariable(variable) ?? Repo(fallback);
 
+
     // Syncfusion grids implement UI Automation providers: Grid.Windows
     // references UIAutomationProvider v9 at load, and without it the Mono
     // interpreter FailFasts in mint_type (transform.c:347) right after the
@@ -69,7 +70,7 @@ public static class AppTransform
     }
     static AppTransform()
     {
-        foreach (var benchmark in DesktopBenchmarks.Entries)
+        foreach (var benchmark in WfWasm.CanvasHost.DesktopBenchmarks.Entries)
             if (!benchmark.RequiresManualInput)
                 Apps.Add(benchmark.Slug, DesktopBenchmarkInputs.CreateSpec(benchmark));
         string root = Environment.GetEnvironmentVariable("WF_SYNCFUSION_APPS_ROOT") ?? Repo(@"external-apps\syncfusion");
@@ -90,6 +91,10 @@ public static class AppTransform
             foreach (var kv in DiagramContent())
                 if (File.Exists(kv.Value))
                     diagram.ContentFiles[kv.Key] = kv.Value;
+        if (Apps.TryGetValue("syncfusion-auto-complete", out var autoComplete) && autoComplete is not null)
+            foreach (var kv in AutoCompleteContent())
+                if (File.Exists(kv.Value))
+                    autoComplete.ContentFiles[kv.Key] = kv.Value;
     }
 
     // NodesDemo.Form1_Load builds a BitmapNode from image3.png via a
@@ -103,6 +108,56 @@ public static class AppTransform
         {
             ["image3.png"] = Repo(@"external-apps\syncfusion-sources\common\images\Diagram\OrgChart Layout\image3.png"),
         };
+
+    // AutoComplete GettingStarted binds flag images from ../../../Flags/*.jpg|png
+    // (Form1.cs:410-421: Image.FromFile per country name); the build output
+    // ships no content, so the VFS has no tails to match and every flag
+    // lookup misses (empty flag thumbnails). Serve all upstream Flags as VFS
+    // content (lookups match by tail, so "Flags/X.jpg" answers the dev-layout
+    // relative walk). Missing dir => empty map, never a manifest 500.
+    private static Dictionary<string, string> AutoCompleteContent()
+    {
+        string flags = Repo(@"external-apps\syncfusion-sources\autocomplete\GettingStarted\CS\Flags");
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (!Directory.Exists(flags)) return map;
+        foreach (string file in Directory.EnumerateFiles(flags))
+        {
+            string ext = Path.GetExtension(file);
+            if (!ext.Equals(".png", StringComparison.OrdinalIgnoreCase) &&
+                !ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase) &&
+                !ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase)) continue;
+            map["Flags/" + Path.GetFileName(file)] = file;
+        }
+        return map;
+    }
+
+    // Benchmark loose content: prepared folders ship images + data next to
+    // the exe (e.g. ADGV's flag-*.png, lang*.json) that dev-layout code
+    // reads via Image.FromFile/File.ReadAllText. Benchmark specs declare no
+    // ContentFiles, so every such read misses. Serve the safe set (images +
+    // data JSON, never DLLs/configs/caches/receipts); VFS matches by tail,
+    // so rooted ("/flag-green_24.png") and relative walks both hit.
+    // Top-level only: benchmark outputs are flat (dll/ holds dependencies,
+    // excluded by extension). Missing dir => empty map, never a 500.
+    public static Dictionary<string, string> BenchmarkContent(string folder)
+    {
+        var files = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (!Directory.Exists(folder)) return files;
+        var images = new HashSet<string>([".png", ".jpg", ".jpeg", ".bmp", ".gif", ".ico"], StringComparer.OrdinalIgnoreCase);
+        foreach (string file in Directory.EnumerateFiles(folder, "*", SearchOption.TopDirectoryOnly))
+        {
+            string name = Path.GetFileName(file);
+            string ext = Path.GetExtension(file);
+            if (images.Contains(ext)) { files[name] = file; continue; }
+            if (!ext.Equals(".json", StringComparison.OrdinalIgnoreCase)) continue;
+            if (name.EndsWith(".deps.json", StringComparison.OrdinalIgnoreCase)
+                || name.EndsWith(".runtimeconfig.json", StringComparison.OrdinalIgnoreCase)
+                || name.EndsWith(".dll.config", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("preparation.json", StringComparison.OrdinalIgnoreCase)) continue;
+            files[name] = file;
+        }
+        return files;
+    }
 
     private static Dictionary<string, string> SyncfusionContent(string folder)
     {
@@ -145,14 +200,29 @@ public static class AppTransform
     // calls headless (UIA provider slots on RadForm). Served pristine from
     // the GAC (real IL: Mono rejects both Cecil-processed and pristine
     // metadata-only reference assemblies at Assembly.Load).
-        // Most GAC system assemblies carry the framework key; the ECMA-key
-    // System.* assemblies (Composition) carry b77a5c561934e089 instead.
-    private static string GacPublicKey(string name) =>
-        name.Equals("System.ComponentModel.Composition", StringComparison.OrdinalIgnoreCase)
-            ? "b77a5c561934e089"
-            : "31bf3856ad364e35";
-    private static string GacMsil(string name) =>
-        @"C:\Windows\Microsoft.NET\assembly\GAC_MSIL\" + name + @"\v4.0_4.0.0.0__" + GacPublicKey(name) + @"\" + name + ".dll";
+    // Most GAC system assemblies carry the framework key; ECMA-key
+    // System.* assemblies (Composition, Xaml) carry b77a5c561934e089
+    // instead. Probe both and take whichever exists (callers check
+    // File.Exists; a missing file must not 500 the manifest).
+    // PresentationCore has no GAC_MSIL copy on this machine (only
+    // GAC_64/GAC_32): fall back to GAC_64. The GAC_64 copy is pure IL
+    // (CorFlags ILOnly, verified) with an Amd64 machine flag Mono-WASM
+    // ignores; the targets/paint.net copy is mixed-mode (ILLibrary)
+    // and would abort the interp, so it must never be served here.
+    private static string GacMsil(string name)
+    {
+        foreach (string key in new[] { "31bf3856ad364e35", "b77a5c561934e089" })
+        {
+            string candidate = @"C:\Windows\Microsoft.NET\assembly\GAC_MSIL\" + name + @"\v4.0_4.0.0.0__" + key + @"\" + name + ".dll";
+            if (File.Exists(candidate)) return candidate;
+        }
+        foreach (string key in new[] { "31bf3856ad364e35", "b77a5c561934e089" })
+        {
+            string candidate = @"C:\Windows\Microsoft.NET\assembly\GAC_64\" + name + @"\v4.0_4.0.0.0__" + key + @"\" + name + ".dll";
+            if (File.Exists(candidate)) return candidate;
+        }
+        return @"C:\Windows\Microsoft.NET\assembly\GAC_MSIL\" + name + @"\v4.0_4.0.0.0__31bf3856ad364e35\" + name + ".dll";
+    }
     private static readonly string[] TelerikSystemAssemblies = new[]
     {
         "UIAutomationProvider.dll",
@@ -163,6 +233,29 @@ public static class AppTransform
         // and die with FileNotFoundException without it. Pure managed, so
         // the pristine GAC copy loads under Mono-WASM.
         "System.ComponentModel.Composition.dll",
+        // Telerik.Windows.Documents.Core carries assembly-level
+        // XmlnsDefinition/XmlnsPrefix attributes whose ctors live in
+        // System.Xaml. Mono decodes assembly attrs at load (load_friends,
+        // ignore_missing=FALSE): an unresolvable ctor warns at
+        // custom-attrs.c:1980 then FailFasts at assembly.c:1673
+        // (ERP Work-Orders tree click killed the session). The pristine
+        // GAC copy lets the ctor resolve; only decode runs, no code.
+        "System.Xaml.dll",
+        // Telerik fixed-doc font model declares virtuals over
+        // System.Windows.Media.FontFamily (PresentationCore):
+        // SimpleFontObject.TryGetFontFamily(FontFamily&). With no
+        // PresentationCore in the closure Mono fails the whole class
+        // vtable setup ("Parent class vtable failed ... SimpleFontObject"),
+        // killing DefaultPdfObjectDescriptorProvider..cctor and the ERP
+        // viewer LoadDocument path. The pristine GAC_64 copy (pure IL)
+        // lets the signatures resolve; only the type forwards load.
+        "PresentationCore.dll",
+        // FixedDocumentDefaults.DefaultCellPadding is
+        // System.Windows.Thickness (PresentationFramework): without it
+        // the field token never resolves (BadImageFormatException) and
+        // PageObject..cctor dies next on the same viewer path. Pristine
+        // GAC_MSIL copy is pure IL (CorFlags ILOnly, verified).
+        "PresentationFramework.dll",
     };
     // WinRT contract stubs built from src/WfWasm.WinRtStubs.* (referenced
     // by this project so the DLLs sit beside the server). Served to every
@@ -200,6 +293,11 @@ public static class AppTransform
             "Vendor.json", "WorkOrder.json",
         })
             map[$"Data/{file}"] = Path.Combine(data, file);
+        // InfoControl viewer LoadDocuments "..\\..\\ERP.Client\\Documents\\<doc>";
+        // the tail-match resolves these registry keys (backslash + .. spellings).
+        string docs = Repo(@"telerik\Telerik UI for WinForms demos\ExamplesProjects\ERP\ERP.Client\Documents");
+        foreach (string file in new[] { "Documentation.pdf", "Instructions.pdf" })
+            map[$"Documents/{file}"] = Path.Combine(docs, file);
         return map;
     }
 
@@ -560,7 +658,7 @@ public static class AppTransform
     };
 
 
-    // Regenerable scratch belongs in E:/tmp (and %TEMP% is where
+    // Regenerable scratch belongs in the ignored artifact directory (and %TEMP% is where
     // on-access scanners race file creation, observed as flaky
     // Access-denied on freshly-written outputs).
     public static string CacheRoot => Setting("WFWASM_CACHE", @".artifacts\transform-cache");
@@ -578,7 +676,7 @@ public static class AppTransform
     // changing (a new code path must not reuse bytes cached by the
     // old one, e.g. pristine fallbacks cached before sibling
     // hardlinks fixed third-party stubbing).
-    private const int TransformRevision = 174; // Thumbnail half-float uploads, inline delivery and retained effect inputs; invalidate older transformed copies.
+    private const int TransformRevision = 194; // rev194: TEMP-DIAG strip (REDIR/FILL/FWD/DRAW logs + nonzero scan removed after palette verified) // rev193: proxy-branch Properties.Source forward (palette CreateRef answers concrete IColorManagementEffectProxy with its own non-generic get_Properties; the plain-Ret dropped the fills) // rev192: TEMP-DIAG DrawImage entry log (palette i=1 draw missing) + haveCme-after-proxy fix // rev191: CME forward uses the CLASS DeviceEffect<Props> token (the vendor's own OnRenderAdvanced shape; the IDeviceEffect<Props> interface token trips Mono class loading per the checker pin) // rev190: CME forward via Properties.Source (GetInput(0) NREs headless on the never-created inner D2D effect, swallowing the whole palette composite; the vendor Sets the list through Properties.Source) // rev189: CME-wrapped list forward (palette wraps its filled list in a ColorManagementEffect and draws the wrapper into another list: the identity no-op Ret dropped the fills, so the wrapper draw now pulls the list via GetInput(0) and blits its redirect scratch) // rev188: consume-on-draw + finalizer backstop (vendor disposes the command list BEFORE the final DrawImage composite: eager Dispose-free orphaned the redirected scratch, so DrawImage blit+consumes the scratch on first playback and the finalizer frees never-drawn leftovers; test-host finalizer crash fixed by nested-frame collect before ALC unload) // rev187: command-list target redirect (SetTarget(list) swaps the dc target to a scratch surface sized to the live target with its matrix; DrawImage(list) blits it back in desktop order; Dispose frees; fixes PDN Colors palette wells buried under the checkers blit when fills ran direct) // rev186: FillRectangle synth also accepts PDN UI SolidColorBrush (Color/Opacity read off the concrete type; palette wells use the static cache, not CPU brushes) // rev185: FillRectangle synth accepts ISolidColorBrush via get_Color/get_Opacity (PDN palette wells use SolidColorBrushCache, not CPU brushes) // rev184: Cyotek ColorGrid GetColor/GetColorSource/SetColor `> count` guards corrected to `>=` (one-opcode ble->blt; empty-custom-well click IOOREd, selection never committed) // rev183: ControlPaint.DrawScrollButton retargeted to the fork's GDI+ scroll painter (classic arrows died in the stubbed DrawFrameControl P/Invoke; PDN Colors spin chips painted white with no arrows) // rev182: VisualStyleRenderer.DrawBackground retargeted to the fork's GDI+ spin painter (themed spin arrows vanished into the S_OK UxTheme stub, leaving PDN's Violet debug fill) // rev181: ColorManagementEffect null-unwrap Retains as identity no-op (gradient content painted by the preceding FillRectangle; the throw magenta-placeholdered ColorGradient/Rectangle controls) // rev180: FileVersionInfo getters/ToString also redirected to WasmFileVersion readers (browser framework ships the type as a field-less throwing stub: factory redirect alone still PNSEd on the first property read) // rev179: FileVersionInfo.GetVersionInfo redirected to fork WasmFileVersion (native version API missing headless killed Cyotek AboutDialog/MainForm OnLoad, blank panel) // rev178: PresentationFramework pristine from GAC_MSIL for Telerik apps (FixedDocumentDefaults.DefaultCellPadding is System.Windows.Thickness -> BadImageFormatException killed PageObject cctor on ERP viewer path) // rev177: PresentationCore pristine from GAC_64 for Telerik apps (SimpleFontObject virtuals over System.Windows.Media.FontFamily failed Mono vtable setup -> DefaultPdfObjectDescriptorProvider cctor TypeLoad killed ERP viewer LoadDocument) // rev176: File.ReadAllBytes VFS redirect (ERP InfoControl RadPdfViewer.LoadDocument backslash path; AttachInfoControl NRE with no staged doc) + Documents/*.pdf staged // rev175: GpuEffect quality default answers 1/1..8 (DefaultQualityLevelGpu lookup null headless: RotateZoom/Bulge NREd in OnCreatePropertyCollection) // rev174: TEMP-DIAG cleanup (mixer movie, SetDiag, note-visit, thumb-inv/cap logs removed; Scratch probes deleted; no rule change) // rev173: Set reroute also notes (bag,index)->image into CpuPaint (ReplaceRef-swapped husks lose inputs; strip crop->opacity->composite chain walks the note table); // rev172: value-type field scan (object-field sources); TEMP markers livenk bands: the icon path leaves no usable text rect; text-only rows paint, matching our Levels precedent); // rev127: PersistedObject<T>.Flush retained as ret (PushNewMemento flushes at push: with disk persist stubbed that eviction loses the only copy, so our replicated Levels memento is born unreadable and every effect-undo IOEs; memory stays bounded by the stack via the rev126 pin); // rev126: SoftReference<T> pinned strongly headless (rev125's async-race theory was wrong: PersistToDisk is a stubbed ret by the older settings-persist rule, so NOTHING ever reaches disk; the soft target demotes at gen-2 GC and every undo IOEs at get_Object's session-file read); // rev125: synchronous history persist (async save task never completes headless: every undo IOEd at get_Object); // rev124: linearize sRGB token black/white points at the LUT boundary (v1 fed them as linear: white=100 mapped 85 to 132, correct is 220); // rev123: defuse abandoned kernel event handles at construction (finalize-crash of the browser PAL at first gen-2 GC: the ~4-stroke-move tab death); // rev122: history row named from IEffect.EffectInfo via the interface map + null row icon (a resolved ImageResource blanks the whole row headless: pixel-less device image; text-only rows paint); // rev121: resume passes real full-surface render scans (nulls NREd the queued memento builder + copy phase, absorbed as applied=True with no undo push); // rev120: permanent [FXAPPLY] resume-result log (rev119 probe: dialog settles, zero canvas/history delta, silent catch — result now observable); // rev119: TEMP-DIAG fully reverted (gray-force/census/trace gone; Levels live path back to bona-fide identity no-op pending real dialog input routing); // rev118: TEMP-DIAG force moved into the tile path (owner Token is null at Resume time: "must be configurable"; it is set by tile time); // rev117: TEMP-DIAG force-failure inner logging (the gray-force TIE hides its cause); // rev116: TEMP-DIAG forced constant-gray owner token (dialog input routing dead, no non-default token producible by hand; proves the LUT path live; REVERT IMMEDIATELY); // rev115: Token lookup walks most-derived first (GpuEffect<TToken> shadows EffectBase.Token with new: flat lookup died AmbiguousMatch, tiles fell through); // rev114: read EffectBase.Token with non-public flags (protected: public-only lookup missed, every tile fell through to the null-context base); // rev113: TEMP-DIAG tile dispatch reasons (FXTILE no:* + stash lines; the fallthrough NREs in base OnCopyPixels with no tile line, so which gate misses is unknown); // rev112: CPU Levels tiles (EnsureBitmapSourceCpuTolerant skips the device span on null factory; EnsureGpuTileCpuRender routes OnCopyPixels through CpuPaint.TryRenderGpuTileCpu: linear-light LUT from the token over the stashed surface); // rev111: EnsureEffectDriverInline dooms the Thread construction too (leftover newobj Thread/ThreadStart unbalanced Start's stack at ret: InvalidProgram, observed as Levels DoEffect Shown-handler death with the caller blamed); // rev110: ResumeEffectApply walks the menu hierarchy for private base DoEffect (derived AdjustmentsMenu hides it: "needs EffectMenuBase.DoEffect" after OK); // rev109: CloneEffectToken scans loaded PaintDotNet assemblies for CloneableExtensions (LevelsGpuEffectToken lives in Effects.Gpu, the helper does not: resume died with NSE after OK); // rev108: NoteEffectMenu also notes the hosted inner form (the noted dialog is an EffectConfigFormWrapper but FormClosed fires on the inner LevelsGpuEffectForm: CWT missed by instance); // rev107: TEMP-DIAG FXRESUME note-side trace with instance ids (FormClosed adapter runs but the CWT lookup misses: was the note skipped or a different instance); // rev106: TEMP-DIAG FXRESUME trace in ResumeEffectApply (Levels OK opens/closes, hook fires, but no history entry: which resume step says no); // rev105: ResumeEffectApplyAdap is public (generic EffectConfigForm<T,E> binds it cross-class: private died with MethodAccessException on GPU dialog show); // rev104: EnsureEffectDialogResume hooks the generic EffectConfigForm<T,E>.ShowDialog too (GPU dialogs override it with a direct Form.ShowDialog call: Levels opened/closed with no FormClosed resume and no apply); // rev103: EnsureEffectApplyResume anchors its insert (re-reading seq[at+1] per InsertBefore emitted the note sequence reversed: call on empty stack = InvalidProgram in RunEffectImpl when opening Adjustments/Levels); // rev102: CpuCommandList answers IObjectRef (AddCpuObjectRef: SetInput->CreateRef(IObjectRef) ODEd every Colors crop input although nothing was disposed); // rev101: TEMP-DIAG SetInput refcount trace; // rev100: TEMP-DIAG block-site census (NoteBlock); // rev99: census list adds Slim/RW locks; // rev98: TEMP-DIAG wait-handle census (NoteWaitHandle) to find the per-stroke abandoned event; revert after diagnosis; // rev97: fx gates re-enabled (driver inline/menu-note/dialog-resume for effect OK-apply) + update checks neutered (abandoned boot events finalize-crash the browser PAL at first gen-2 GC, killing strokes ~4 moves in); // rev96: BISECT guards off (effect inline/menu-note/dialog-resume disabled) to isolate the stroke crash; // rev95: effect OK-apply resume (EffectDriver.Start runs the worker inline, tile Enqueue inline + Joins pop, RunEffectImpl notes the menu, FormClosed adapter reruns the product DoEffect with a fresh snapshot: ShowDialog-None-immediate + neutered threads made every Levels OK a silent no-op); // rev94: DrawTextLayout raster-first (TextLayoutRaster reads the layout font by name through the browser text engine, CpuPaint.BlitRaster tints/blits; null raster keeps the 5x7 DrawText fallback: panel headers/menus/palette text instead of black blocks); // rev93: CpuDeviceEffect.SetInput retains the grant in a side table and stores the ORIGINAL in _inputs (v4: v1 stored the grant and broke GetInput casts with InvalidCast, and PDN disposing GetInput results underflowed the effect's ref into ObjectDisposed; originals keep rev91 identity, grants pair +1/-1 privately) // rev92: CpuDeviceEffect.SetInput retains its input via ObjectRefExtensions.CreateRef and releases the overwritten input (desktop D2D AddRefs through COM; without it CreateImpl's tile loop freed the shared bitmap while the processed effect still referenced it: zero-handle upload, blank wheel with only the nub painted) // rev91: GetCachedOrCreateResource matches concrete color-profile carriers (ColorProfile/SimpleColorProfile), not just the IColorProfileProxy interface name: ColorProfiles.Srgb/ScRgb singletons NSEd (blank Colors wheel, paint never reached DrawImage) // rev90: real ReinterpretedBitmapSource wrapper restored (identity shortcut removed: it answered the caller-owned bitmap and CreateImpl disposed it as an owned tile clip, pool-returning live single-ref sources to 0x0 + freeing wrappers the pipeline still read/NRE); WIC imaging clips/color-transforms now answer COUNTED refs via CreateRef (callers own+dispose the returned clip: CreateImpl tile loop, usings, RefHandles) // rev89: GetProxySourceImage fixpoint unwraps BitmapImage.image/proxy/InnerRef shells to the raw CpuDeviceBitmap (color-wheel DrawImage(ColorManagementEffect) blanked with zero errors; effect->image->proxy->PrecisionEffect->bitmap now blits) // rev88: DrawImage ColorManagementEffect falls through to the proxy-source blit (the identity no-op blanked primary blits: color wheel painted nothing with zero errors; GetProxySourceImage already allowlists it) // rev87: BitmapImage.CreateImpl reinterpret branch keeps ownsRef:false custody (identity shortcut answers the caller-owned bitmap: ownsRef:true dispose pool-returned live sources so tile locks read empty; wheel-sized uploads NSEd while small ones survived on spare refs) // rev86: CpuDrawingContext TryGetResourceCache<T> rebuilds its IObjectRef generic constraint via ImportReference (sharing the contract's foreign TypeReference re-scoped it to System.Numerics.Vectors at write time: live TypeLoad 010002E7 killed paint brush strokes + GPU-effect dialogs) // rev85: CpuDrawingContext device union (IDeviceContext/ICompatibleDeviceContext/IResourceCacheHolder slots, RefTrackedObject base, FromBitmap/BeginDraw CPU bodies with copy-in/write-back, CreateCompatible/EndDraw/Dispose(bool) cores) // rev84: paintdotnet ChunkedReadStream prefetch continuations take the ExecuteSynchronously overload (headless single thread has no pump: queued chunk reads never ran, so TryGetNextChunkWhileLocked .Result blocked forever; chained reads always have a complete antecedent, so every prefetch now runs inline) // rev83: paintdotnet ChunkedReadStream.Dispose prefetch drain drops its blocking Task.Wait (headless prefetches never complete: every history-undo died with PNSE ObjWait; pop swaps the void call in place, same stack effect) // rev82: DrawText bridge reports CALCRECT extents through the out pair (tree labels are measured with CALCRECT and painted into the measured rect; stub-zero extents squeezed every label to slivers) // rev81: app-private gdi32 DrawText P/Invokes retarget to fork WasmGdiText.DrawText (generic stub zero dropped all TreeViewAdv node text; vendor RECT& decomposes through the signature's own struct, field casing varies) // rev80: GetScrollBarInfo stub materializes SCROLLBARINFO.rgstate (native marshaller parity: virgin structs NREd vendor ScrollersFrame.UpdateScrollerSettings during TreeViewAdv parenting) // rev79: rev78 Draw trampoline fixed to reuse the module's own type references (hand-built struct refs default IsValueType=false and misbound at runtime: MissingMethod on desktop, TypeLoad in wasm) // rev78: diagram RichText paint headless (ForceDiagramBitmapText defaults m_bUseBitmap in RichTextNode ctors; RichTextBoxDrawing.Draw(Graphics, Rectangle) trampolines to managed WasmRtfDraw; native EM_FORMATRANGE/metafile shells unreached) // rev77: RichTextBox.StreamIn/StreamOut(Stream) bodies replaced with trampolines to managed WasmRtf (GetFunctionPointerForDelegate EDITSTREAM thunks OOB-trapped the wasm interp with no managed frame: diagram RichTextNode boot) // rev75: kernel32 LoadLibraryEx/GetModuleHandle retarget to WasmNativeLibrary null-handle stubs (MsftEdit absent headless: RichTextBox.CreateParams OOB-trapped the session with no managed frame; null keeps the Win32Exception path) // rev74: guard in-try returns rewritten to Leave done (raw Ret inside a guard try is unverifiable: desktop InvalidProgramException, wasm unwind-frame trap; killed syncfusion-calendar/diagram ctors) // rev73: ctor-guard also wraps parameterless instance .ctors (base-ctor/field-init/post-Init throws died identically outside InitializeComponent) // rev72: // rev72: InitializeComponent ctor-guard (uncaught designer throws crossed the reflection-invoke LMF and OOB-trapped the session with zero managed frames: stash + host fallback) // rev71: // rev71: GetResourceSet retarget to fork-shim SafeGetResourceSet (Syncfusion SR SetResources/GetLocalizedResourceManager called BCL direct: same NSE death) // rev70: // rev70: ResourceManager/ComponentResourceManager.GetString+GetStream retarget to fork-shim SafeGetString/SafeGetStream (raw BCL reads of v1-header/DeserializingResourceReader vendor .resources threw NSE with no managed catch: silent OOB trap killed calendar+diagram ctors) + Drawing ResourceHelper opens .resources with the header-named reader (verbatim values from modern streams) // rev69: // rev69: fork RichTextBox.UpdateOleCallback keeps only its DragAcceptFiles(false) tail (COM OLE callback absent headless: GetComPointer PNS killed every RichTextBox handle creation, worker instance OOB-trapped the session) // rev68: Syncfusion.Shared.Base SfForm.CheckIsWindows11 -> false (registry build number missing headless: int.Parse(null) killed every Syncfusion demo form) // rev67: PaintDotNet.Framework PdnCheckBox.GetPreferredSize -> CPU measure (null DWrite text layout threw inside layout/show and aborted dialog presentation) // rev66: PaintDotNet.SystemLayer ShellUtil.GetVirtualPath -> /vfs layout (SHGetFolderPath answers "" headless: Save-As died on empty path, app-data/cache/crash dirs vanished) // rev65: PaintDotNet.Data FileType.GetLastSaveConfigToken -> CreateDefaultSaveConfigToken (persisted per-filetype tokens need the user settings store unavailable headless: Save-As died in set_FileType before the dialog) // rev64: paintdotnet WicHelpers.GetLoad/SaveExtensions -> desktop extension table for Microsoft built-ins (empty WIC headless nulled every built-in DefaultSaveExtension: Save-As died before any dialog) // rev63: // rev63: paintdotnet DiagnosticsGenerator.GetFormattedText -> WfWasm.Drawing.PdnDiagnostics browser-safe fallback (headless inventory probes fault + wrap the original save error in AggregateException: Save-As failure invisibly fatal) // rev62: // rev62: TextBlock.DrawGdi -> DrawGdiPlus managed retarget (GDI DrawTransparentText DIB pipeline has no headless backend: no span glyph ever painted) // rev61: app-private GDI text extents (GetTextExtentPoint32/ExPoint + NativeTextRenderer SelectObject) retarget to fork WasmGdiText (zeroed extents measured every RTE span 0x0: typed glyphs invisible + perpetual relayout) // rev60: InvokeLayoutCallback's BeginInvoke retargets to fork WasmLayoutQueue (handle-less BeginInvoke throws; rev59 guard alone wedged form creation) // rev59: RadControl.InvokeLayoutCallback IsHandleCreated guard neutralized (TPF layout queue starvation: RTE glyph-paint staleness) // rev58: WindowsBase verbatim-plus micro-pass neutralizes Assembly.ReflectionOnly guard (paint MONO cascade: NIE escaping resolve handler kills runtime) // rev57: app resolution closure (spec.Folder + AssemblySearchFolders) threads into RewriteToBytes extraDirs (DiagramFirstLook RadDiagram 500: pool UI.dll invisible to Cecil) // rev56: Telerik ThemeResolutionService.AllowAnimations -> false (Thread.Start neutering deadlocks the popup AnimationEngine handshake: grid right-click wedge) // rev55: System.IO.IsolatedStorage.* retarget to headless stub (spellchecker dictionary PNSE) // rev54: System.Media.* retarget to headless System.Windows.Extensions stub (hub RadMessageBox SystemSounds TypeLoad) // rev53: Environment.GetFolderPath -> fork WasmEnvironment virtual /vfs layout (RTE FontsManager cctor empty-path death) // rev52: coherent FrameworkResolver (real-binds-local, facades-unify-to-fx; pool-facade forwarder cycle SO at write) + dead-ref trim last with reachability (F-bounded visited set) // rev51: assemblyref trim keeps used scopes (DWF self-ref CoreLib corruption) + DWF Verbatim (stub-only fake) // rev50: namespaceless nested typeref remap (Interop+/WMExtensions SWF 500) + fnptr/exotic-sig gap identity (Analyze NRE) // rev49: GetDpiForMonitor stub reports S_OK + 96/96 outs, GetDpiForWindow/System answer 96 (Telerik RadForm boot COMException) // rev48: CpuDrawingContext SystemColor-case stray Ldloc removed (stack-merge InvalidProgram) + FileSystem.CreateTempFile managed redirect (stub null-handle cctor death) // rev47: module cctor preserves same-module ModuleInitializer calls (hook wiring) // rev46: GetObject redirect retargets to fork WasmResourceShim (imagelist hydration) // rev45: generic GetTextMetrics stub fills coherent TEXTMETRIC (NaN-layout fix) // rev44: Telerik RTE Uniscribe.ContainsComplexScript -> false (no usp10 headless) // rev43: PDN Direct2DControl.OnHandleCreatedInternal neutralized (device impl bypassed) // rev42: GetWindowThreadProcessId stub returns UI thread 1 (thread-affinity coherence) // rev41: System.Data.OleDb.* -> headless stub assembly // rev40: UWP Toolkit headless-init stubs // rev39: WindowsRuntimeMarshal -> WinRT stub remap // rev38: EventRegistrationToken -> WinRT stub remap
 
     // Cache key covers every transform input: pristine bytes, the
     // fork and drawing assemblies a rewrite remaps onto, the handmap

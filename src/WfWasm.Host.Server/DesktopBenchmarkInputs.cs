@@ -22,11 +22,15 @@ public static class DesktopBenchmarkInputs
     {
         if (benchmark.RequiresManualInput)
             throw new InvalidOperationException($"{benchmark.Label} has no verified managed input or startup metadata.");
-        return new(Path.Combine(root ?? Root, benchmark.Slug), [benchmark.EntryFile], benchmark.Assembly)
+        string folder = Path.Combine(root ?? Root, benchmark.Slug);
+        return new(folder, [benchmark.EntryFile], benchmark.Assembly)
         {
             // BizHawk's portable distribution keeps dependencies in dll/. This is
             // a lookup root, never an instruction to send every file to the client.
-            AssemblySearchFolders = [Path.Combine(root ?? Root, benchmark.Slug, "dll")],
+            AssemblySearchFolders = [Path.Combine(folder, "dll")],
+            // Loose images/data next to the exe (ADGV flags, lang files):
+            // served as VFS content so FromFile/ReadAllText hits by tail.
+            ContentFiles = AppTransform.BenchmarkContent(folder),
         };
     }
 

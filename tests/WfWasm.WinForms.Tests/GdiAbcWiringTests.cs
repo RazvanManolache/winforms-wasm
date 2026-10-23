@@ -87,4 +87,46 @@ public sealed class GdiAbcWiringTests : IDisposable
         WfPoint end = ForkForms::WasmEditLayout.PositionFromChar(_box, 6);
         Assert.True(end.X - start.X > 0);
     }
+
+    [Fact]
+    public unsafe void GetTextExtent_EdgeBlanks_CountSymmetricAdvance()
+    {
+        // GDI counts leading blanks the same as trailing (desktop parity).
+        using var font = new WfFont("Arial", 20f);
+        var hfont = (HFONT)font.ToHfont();
+        HDC hdc = new((nint)0x3A7F2C10);
+        PInvokeCore.SelectObject(hdc, hfont);
+        Fork::Windows.Win32.Foundation.SIZE bare, lead, trail;
+        fixed (char* p = "a")
+            PInvoke.GetTextExtentPoint32W(hdc, p, 1, &bare);
+        fixed (char* p = " a")
+            PInvoke.GetTextExtentPoint32W(hdc, p, 2, &lead);
+        fixed (char* p = "a ")
+            PInvoke.GetTextExtentPoint32W(hdc, p, 2, &trail);
+        Assert.True(bare.cx > 0);
+        Assert.Equal(lead.cx, trail.cx);
+        Assert.True(lead.cx > bare.cx);
+        Assert.True(trail.cx > bare.cx);
+    }
+
+    [Fact]
+    public unsafe void GetTextExtent_SpaceEscape_CountsSpaceAdvance()
+    {
+        // Telerik Documents escapes inter-word spaces as space+ZWJ; the
+        // escape must measure a space advance, not ~zero (RTE zero-spaces).
+        // Arial 20pt misses the ABC oracle (only em 12 is tabled), so this
+        // exercises the tight fallback exactly like the RTE's em 100.
+        using var font = new WfFont("Arial", 20f);
+        var hfont = (HFONT)font.ToHfont();
+        HDC hdc = new((nint)0x3A7F2D11);
+        PInvokeCore.SelectObject(hdc, hfont);
+        Fork::Windows.Win32.Foundation.SIZE zwj, escaped;
+        string z = "\u200D";
+        string e = " \u200D";
+        fixed (char* p = z)
+            PInvoke.GetTextExtentPoint32W(hdc, p, z.Length, &zwj);
+        fixed (char* p = e)
+            PInvoke.GetTextExtentPoint32W(hdc, p, e.Length, &escaped);
+        Assert.True(escaped.cx > zwj.cx);
+    }
 }

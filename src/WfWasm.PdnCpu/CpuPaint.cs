@@ -21,6 +21,10 @@ public static unsafe class CpuPaint
         public int Stride;
         // Bytes per pixel: 1 = coverage mask (alpha only), 4 = BGRA.
         public int Bpp = 1;
+        // Scratch surfaces pin their managed pixel buffer; only
+        // FreeScratchTarget releases the pin (FreeContext would leak it).
+        public GCHandle Pin;
+        public bool IsPinned;
         public float M11 = 1f;
         public float M12;
         public float M21;
@@ -151,6 +155,79 @@ public static unsafe class CpuPaint
             b.IsPinned = false;
         }
         FreeHandle(bmp);
+    }
+
+    // Command-list redirect scratch: a pinned managed BGRA surface
+    // collecting the fills issued while a command list is the dc
+    // target (headless SetTarget redirect). DrawImage(list) blits it
+    // back, Dispose frees it. Identity matrix on creation; the
+    // SetTarget rewrite copies the live matrix in (GetTransform /
+    // SetTransform) so redirected fills map exactly like direct ones.
+    public static long CreateScratchTarget(int width, int height)
+    {
+        if (width <= 0 || height <= 0)
+        {
+            return 0;
+        }
+        var pixels = new uint[width * height];
+        var gch = GCHandle.Alloc(pixels, GCHandleType.Pinned);
+        var t = new Target
+        {
+            Ptr = (byte*)gch.AddrOfPinnedObject().ToPointer(),
+            Width = width,
+            Height = height,
+            Stride = width * 4,
+            Bpp = 4,
+            Pin = gch,
+            IsPinned = true
+        };
+        long h = ToHandle(t);
+        return h;
+    }
+
+    // SourceOver blit of a scratch surface onto a BGRA target
+    // (identity mapping; same-size by construction, clipped to the
+    // overlap). Non-BGRA targets skip: mask/scratch mismatches stay
+    // inert rather than mispaint.
+    public static void BlitScratchOver(long dst, long src)
+    {
+        if (dst == 0 || src == 0)
+        {
+            return;
+        }
+        var d = FromHandle<Target>(dst);
+        var s = FromHandle<Target>(src);
+        if (d.Bpp != 4 || s.Bpp != 4)
+        {
+            return;
+        }
+        int w = Math.Min(d.Width, s.Width);
+        int h = Math.Min(d.Height, s.Height);
+        for (int y = 0; y < h; y++)
+        {
+            uint* srow = (uint*)(s.Ptr + (nint)y * s.Stride);
+            for (int x = 0; x < w; x++)
+            {
+                uint p = srow[x];
+                float sa = ((p >> 24) & 0xFF) / 255f;
+                if (sa <= 0f)
+                    continue;
+                BlendPixelBgra(d, x, y, p, sa);
+            }
+        }
+    }
+
+    public static void FreeScratchTarget(long scratch)
+    {
+        if (scratch == 0)
+            return;
+        var t = FromHandle<Target>(scratch);
+        if (t.IsPinned)
+        {
+            t.Pin.Free();
+            t.IsPinned = false;
+        }
+        FreeHandle(scratch);
     }
 
     // Pins the pixel buffer and answers its address so PDN source

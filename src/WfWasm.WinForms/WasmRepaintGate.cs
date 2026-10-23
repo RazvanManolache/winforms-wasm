@@ -37,6 +37,12 @@ public static class WasmRepaintGate
     // (app Invalidates vs host backstops vs layout Wake calls).
     private static readonly ConcurrentDictionary<string, int> s_markCaller = new(StringComparer.Ordinal);
     private static int s_markSample;
+    // Cheap monotonic mark counter for the layout-drain invalidation
+    // linkage (item 3): gated like every other census line so default-off
+    // pays one predictable branch per mark, nothing more.
+    private static int s_totalMarks;
+
+    internal static int TotalMarks => System.Threading.Volatile.Read(ref s_totalMarks);
 
     // First marker per drain window (unsampled: one StackTrace per
     // window is negligible). Names the steady-state single marker
@@ -186,7 +192,7 @@ public static class WasmRepaintGate
     // change may repaint through.
     public static void MarkDirty(Control? control)
     {
-        if (WasmFrameCounters.PerfEnabled) { WasmFrameCounters.NoteMark(control, -1, -1); NoteMarkCaller(); }
+        if (WasmFrameCounters.PerfEnabled) { WasmFrameCounters.NoteMark(control, -1, -1); NoteMarkCaller(); System.Threading.Interlocked.Increment(ref s_totalMarks); }
         if (control is not null)
             s_dirty[control] = null;
     }
@@ -196,6 +202,7 @@ public static class WasmRepaintGate
         if (WasmFrameCounters.PerfEnabled) { WasmFrameCounters.NoteMark(control, -1, -1); NoteMarkCaller(); }
         while (control is not null)
         {
+            if (WasmFrameCounters.PerfEnabled) System.Threading.Interlocked.Increment(ref s_totalMarks);
             s_dirty[control] = null;
             control = control.Parent;
         }
@@ -236,7 +243,36 @@ public static class WasmRepaintGate
     public static void MarkGlobalDirty()
     {
         Interlocked.Exchange(ref s_globalDirty, 1);
-        if (WasmFrameCounters.PerfEnabled) { WasmFrameCounters.NoteGlobal(); NoteMarkCaller(); }
+        if (WasmFrameCounters.PerfEnabled) { WasmFrameCounters.NoteGlobal(); NoteMarkCaller(); System.Threading.Interlocked.Increment(ref s_totalMarks); }
+    }
+
+    // Retained scroll reuse (item 4): a scrolled control records its pixel
+    // delta here (SetDisplayRectLocation and friends); the next frame shifts
+    // the retained surface by (dx,dy) and repaints only the exposed strip.
+    // Consumed once (Take clears); a second scroll before the frame
+    // accumulates (still a pure shift). Dropped silently when the frame
+    // cannot use it (resize, diagonal, rect-dirty mismatch) — the existing
+    // full/region paths run unchanged.
+    private static readonly ConcurrentDictionary<Control, (int dx, int dy)> s_scrollShift = new();
+
+    public static void NoteScroll(Control? control, int dx, int dy)
+    {
+        if (control is null || (dx == 0 && dy == 0))
+            return;
+        s_scrollShift.AddOrUpdate(control, (dx, dy), (_, old) => (old.dx + dx, old.dy + dy));
+    }
+
+    public static bool TakeScrollShift(Control control, out int dx, out int dy)
+    {
+        if (s_scrollShift.TryRemove(control, out var shift))
+        {
+            dx = shift.dx;
+            dy = shift.dy;
+            return true;
+        }
+        dx = 0;
+        dy = 0;
+        return false;
     }
 
     // Peek without draining (lets the pump skip fully-idle frames).
@@ -263,6 +299,7 @@ public static class WasmRepaintGate
 
     private static void UnionInto(Control control, DrawingRectangle? rect)
     {
+        if (WasmFrameCounters.PerfEnabled) System.Threading.Interlocked.Increment(ref s_totalMarks);
         if (rect is null)
         {
             s_dirty[control] = null;

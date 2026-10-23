@@ -376,6 +376,40 @@ public sealed class AppFileSystemTests
     }
 
     [Fact]
+    public void ReadAllBytes_Serves_Vfs_With_Backslash_Spelling()
+    {
+        // ERP InfoControl viewer LoadDocuments GetFullPath(dir) +
+        // "..\\..\\ERP.Client\\Documents\\Instructions.pdf": the binary
+        // twin of the JSON-seed read must hit the registry. Regression:
+        // AttachInfoControl NRE with no staged doc (no redirect at all).
+        byte[] pdf = new byte[] { 0x25, 0x50, 0x44, 0x46 };
+        try
+        {
+            WfVfs.Register("Documents/Instructions.pdf", pdf);
+            byte[] back = WfVfs.ReadAllBytes("..\\..\\ERP.Client\\Documents\\Instructions.pdf");
+            Assert.Equal(pdf, back);
+            Assert.NotSame(pdf, back);
+            string temp = Path.Combine(Path.GetTempPath(), $"vfsrb_{Guid.NewGuid()}.bin");
+            try
+            {
+                File.WriteAllBytes(temp, pdf);
+                Assert.Equal(pdf, WfVfs.ReadAllBytes(temp));
+                Assert.Throws<System.IO.FileNotFoundException>(() =>
+                    WfVfs.ReadAllBytes(Path.Combine(Path.GetTempPath(), $"vfsnb_{Guid.NewGuid()}.bin")));
+                Assert.Throws<System.ArgumentNullException>(() => WfVfs.ReadAllBytes(null));
+            }
+            finally
+            {
+                try { File.Delete(temp); } catch { }
+            }
+        }
+        finally
+        {
+            WfVfs.Clear();
+        }
+    }
+
+    [Fact]
     public void MirrorPath_Accepts_Safe_Relative_Names()
     {
         // Unrewritten framework readers (System.Data, XmlReader) open

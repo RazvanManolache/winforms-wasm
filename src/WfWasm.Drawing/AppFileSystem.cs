@@ -258,6 +258,17 @@ public static class AppFileSystem
         return System.IO.File.ReadAllText(path!, encoding ?? System.Text.Encoding.UTF8);
     }
 
+    // File.ReadAllBytes shape (rewriter redirect): ERP InfoControl's PDF
+    // viewer LoadDocuments a backslash-spelled VFS path; served content
+    // answers from the registry (fresh copy per call, BCL parity);
+    // misses read for real (FileNotFound semantics preserved).
+    public static byte[] ReadAllBytes(string? path)
+    {
+        if (TryGetBytes(path, out byte[]? bytes) && bytes is not null)
+            return (byte[])bytes.Clone();
+        return System.IO.File.ReadAllBytes(path!);
+    }
+
     // Drops every entry a path would resolve to (exact + tail matches):
     // lookups are tail-based, so exact-key removal would leave stale hits.
     private static void ForgetMatches(string path)

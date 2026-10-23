@@ -75,6 +75,7 @@ public static class WasmFrameCounters
     public static long NRasterFull;
     public static long NRasterRegion;
     public static long NBlitClean;
+    public static long NScrollShift;
     public static long RasterPx;
     public static long BytesExtracted;
     public static long BytesHashed;
@@ -146,6 +147,11 @@ public static class WasmFrameCounters
     }
 
     public static void CountBlitClean() => Interlocked.Increment(ref NBlitClean);
+
+    // Retained scroll-shift reuse: frames that moved the retained
+    // surface in place and repainted only the narrowed union instead
+    // of a full raster.
+    public static void CountScrollShift() => Interlocked.Increment(ref NScrollShift);
 
     // Mark-source attribution (who keeps a frame dirty). Counts every
     // mark call; the first marked control + rect per frame is kept
@@ -231,6 +237,7 @@ public static class WasmFrameCounters
         NRasterFull = 0;
         NRasterRegion = 0;
         NBlitClean = 0;
+        NScrollShift = 0;
         RasterPx = 0;
         BytesExtracted = 0;
         BytesHashed = 0;

@@ -343,9 +343,61 @@ def case_mdi(ctx):
     return finalize(row)
 
 
+def case_tile_layout(ctx):
+    """Load regression for the tile-layout resource-reader chain (red until
+    the DeserializingResourceReader-format .resources streams in
+    TileLayoutDemo_2008.dll are readable by the browser stack).
+    Chain under test: 16x NotSupportedException 'should not be read with
+    this reader' during Form1 ctor -> NullReferenceException -> ctor-guard
+    stash -> 'No form created for scene' -> window-create fallback.
+    Boot-only: interaction stays untested by design."""
+    row = ctx.new_row('tile-layout-load', 'syncfusion-tile-layout')
+    inv0 = ctx.inv()
+    pg, consoles, errors, form, controls = ctx.launch(row, 'syncfusion-tile-layout')
+    try:
+        base = ctx.shot(row, pg, 'base')
+        text = '\n'.join(consoles or [])
+        ctx.check(row, 'load:form-created', form is not None, f'form={form}')
+        if form is None:
+            row['dims']['launch'] = 'failed'
+        else:
+            row['dims']['launch'] = 'passed' if not errors else 'failed'
+        ctx.check(row, 'launch:no-pageerrors', not errors, f'pageerrors={len(errors)}')
+        failed_shell = ('could not create its window' in text) or ('could not continue' in text)
+        ctx.check(row, 'load:no-fallback-shell', not failed_shell,
+                  'fallback marker present' if failed_shell else 'no fallback markers')
+        bad_reader = 'should not be read with this reader' in text
+        ctx.check(row, 'load:resources-readable', not bad_reader,
+                  'DeserializingResourceReader rejected' if bad_reader else 'no reader rejection')
+        painted = any('first-painted' in c for c in (consoles or []))
+        ctx.check(row, 'pixels:any-first-painted', painted,
+                  'first paint observed' if painted else 'canvas stayed blank')
+        row['dims']['usefulPixels'] = 'passed' if painted else 'failed'
+        row['dims']['interaction'] = 'untested'
+        row['untested'].append('click/drag workflows: boot-only regression, no controls painted pre-fix')
+        row['untested'].append('menu/nav discovery: unreachable while the window cannot be created')
+        unexp = ctx.err_delta(row, inv0, ['syncfusion-tile-layout'], row['artifacts']['t0'])
+        ctx.check(row, 'errors:no-unexpected', not unexp, f'unexpected={len(unexp)}')
+    finally:
+        pg.close()
+    return finalize(row)
+
+
 def case_failed_ctor(ctx):
     row = ctx.new_row('failed-ctor-contained', 'syncfusion-auto-complete')
-    row['expectedErrors'] = True  # the failure under test IS the error report
+    # The failure under test IS the error report: expect exactly the
+    # app-load window-create report, nothing else. Boolean True is banned
+    # (verifier rejects it); each entry names app+phase+signature.
+    row['expectedErrors'] = [
+        {'app': 'syncfusion-auto-complete', 'phase': 'app-load',
+         'signature': 'could not create its window'},
+    ]
+    # launch fails BY DESIGN here (window never created); isolation is the
+    # dimension under test. Declared so the verifier's passed-with-failed-dim
+    # rule accepts this row while rejecting undeclared ones.
+    row['allowedFailedDims'] = {
+        'launch': 'failure under test: window never created by design',
+    }
     inv0 = ctx.inv()
     pg, consoles, errors, form, controls = ctx.launch(row, 'syncfusion-auto-complete', wait_s=15)
     try:
@@ -498,4 +550,5 @@ def case_todo_scroll(ctx):
     return finalize(row)
 
 
-CASES = [case_smoke, case_todo, case_barcode, case_mdi, case_failed_ctor, case_paint, case_todo_scroll]
+CASES = [case_smoke, case_todo, case_barcode, case_mdi, case_failed_ctor, case_paint, case_todo_scroll,
+       case_tile_layout]

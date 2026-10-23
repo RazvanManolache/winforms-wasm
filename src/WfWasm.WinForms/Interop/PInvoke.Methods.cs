@@ -776,7 +776,30 @@ namespace Windows.Win32
                     return new global::System.Drawing.Size(abc, height);
                 using var scratch = new global::System.Drawing.Bitmap(1, 1);
                 using var graphics = global::System.Drawing.Graphics.FromImage(scratch);
-                global::System.Drawing.SizeF size = graphics.MeasureStringTight(text, font);
+                string edgeTrimmed = text.TrimStart(' ');
+                int leading = text.Length - edgeTrimmed.Length;
+                global::System.Drawing.SizeF size = string.IsNullOrWhiteSpace(text)
+                    ? graphics.MeasureString(text, font, global::System.Drawing.SizeF.Empty)
+                    : graphics.MeasureStringTight(edgeTrimmed, font);
+                // GDI parity: GetTextExtentPoint32 counts every blank advance,
+                // leading as well as trailing. The tight raster drops them:
+                // TrimEnd strips trailing, and the JS wrap-split turns a
+                // leading blank into a separator with no advance (Telerik
+                // escapes inter-word spaces as space+ZWJ, which measured
+                // width 1 instead of a space advance, joining RTE words).
+                // Leading blanks are stripped above (as TrimEnd already does
+                // for trailing); every edge blank is added back at the
+                // measured space advance. Interior blanks stay in the tight
+                // span (no double count). Bare whitespace keeps the
+                // whitespace-only branch.
+                int trailing = 0;
+                for (int i = text.Length - 1; i >= 0 && text[i] == ' '; i--) trailing++;
+                int blanks = leading + trailing;
+                if (blanks > 0 && blanks < text.Length)
+                {
+                    float spaceW = graphics.MeasureString(" ", font, global::System.Drawing.SizeF.Empty).Width;
+                    if (spaceW > 0f) size.Width += blanks * spaceW;
+                }
                 return new global::System.Drawing.Size(Math.Max(0, (int)Math.Ceiling(size.Width)), height);
             }
 

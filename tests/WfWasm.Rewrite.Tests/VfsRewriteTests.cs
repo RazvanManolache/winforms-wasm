@@ -278,4 +278,48 @@ public sealed class VfsRewriteTests
             try { if (File.Exists(tempOut)) File.Delete(tempOut); } catch { }
         }
     }
+
+    [Fact]
+    public void Rewrite_PdfViewer_ReadAllBytes_Redirects_To_Vfs()
+    {
+        // ERP InfoControl viewer: RadPdfViewer.LoadDocument(backslash
+        // path) -> File.ReadAllBytes must consult the VFS registry
+        // (Documents/*.pdf staged as content). Regression:
+        // AttachInfoControl NRE with no redirect and no staged doc.
+        string input = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release\Telerik.WinControls.PdfViewer.dll");
+        if (!File.Exists(input)) return;
+        string tempOut = Path.Combine(Path.GetTempPath(), $"PdfViewer_ReadBytes_{Guid.NewGuid()}.dll");
+        try
+        {
+            string formsDll = ShimDll("WfWasm.WinForms", "WfWasm.WinForms");
+            string drawingDll = ShimDll("WfWasm.Drawing", "WfWasm.Drawing");
+            var map = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["System.Windows.Forms"] = formsDll,
+                ["System.Windows.Forms.Primitives"] = formsDll,
+                ["System.Drawing"] = drawingDll,
+                ["System.Drawing.Common"] = drawingDll,
+                ["System.Drawing.Primitives"] = drawingDll,
+            };
+            var typeMap = GapAnalyzer.AutoMap(input, map);
+            AssemblyRewriter.Rewrite(input, tempOut, map, typeMap);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut);
+            var calls = WalkTypes(asm.MainModule.Types)
+                .SelectMany(t => t.Methods)
+                .Where(m => m.HasBody)
+                .SelectMany(m => m.Body.Instructions)
+                .Select(i => i.Operand as Mono.Cecil.MethodReference)
+                .Where(mr => mr is not null)
+                .ToList();
+            Assert.DoesNotContain(calls, mr =>
+                mr!.DeclaringType.FullName == "System.IO.File" && mr.Name == "ReadAllBytes");
+            Assert.Contains(calls, mr =>
+                mr!.DeclaringType.FullName == "WfWasm.Drawing.AppFileSystem" && mr.Name == "ReadAllBytes"
+                && mr.Parameters.Count == 1);
+        }
+        finally
+        {
+            try { if (File.Exists(tempOut)) File.Delete(tempOut); } catch { }
+        }
+    }
 }

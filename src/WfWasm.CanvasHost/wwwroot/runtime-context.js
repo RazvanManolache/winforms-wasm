@@ -34,5 +34,10 @@
             d.channel !== 'wfwasm-runtime-v1' || d.session !== session || d.app !== app) return;
         if (d.type === 'snapshot') window.preview?.snapshot();
         if (d.type === 'reference') document.getElementById('runtime-reference-toggle')?.click();
+        if (d.type === 'diagnostics') {
+            // Shell diagnostics toggle: explicit enable/disable for A/B
+            // runs. _dotNet is the Home component ref stored by fitCanvas.
+            try { window.wfwasm._dotNet?.invokeMethodAsync('PerfSetEnabled', !!d.enabled); } catch { }
+        }
     });
 })();

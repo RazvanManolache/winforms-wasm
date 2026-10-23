@@ -72,6 +72,20 @@ public static class TextRenderer
         Draw.SizeF size = proposedSize.Width > 0 || proposedSize.Height > 0
             ? graphics.MeasureString(text, DefaultFont(font), new Draw.SizeF(proposedSize.Width, proposedSize.Height), format)
             : graphics.MeasureString(text, DefaultFont(font), new Draw.SizeF(0, 0), format);
+        // GDI parity: TextRenderer.MeasureText includes trailing spaces
+        // (DT_CALCRECT does); Graphics.MeasureString drops them unless
+        // MeasureTrailingSpaces is set. Without the add-back, space-carrying
+        // runs ("word ") measure as their trimmed word and positioned words
+        // butt together (Telerik RTE document: every inter-word gap gone).
+        // Bare whitespace keeps the whitespace-only branch (TPF gap
+        // elements measure exactly as before).
+        int trailing = 0;
+        for (int i = text.Length - 1; i >= 0 && text[i] == ' '; i--) trailing++;
+        if (trailing > 0 && trailing < text.Length)
+        {
+            float spaceW = graphics.MeasureString(" ", DefaultFont(font), new Draw.SizeF(0, 0), format).Width;
+            if (spaceW > 0f) size.Width += trailing * spaceW;
+        }
         return Draw.Size.Ceiling(size);
     }
 

@@ -452,6 +452,14 @@ public static class AssemblyRewriter
             {
             }
 
+            // The GPU quality default lookup is missing headless (see
+            // method): every GPU effect NREs building its property
+            // collection. Answer the device-less-desktop default.
+            try { EnsureGpuQualitySettingFallback(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+
             // Effect render-info validation resolves through WIC's
             // per-format info (null factory headless): see
             // EnsureCpuVerifyOutputPixelFormat for the CPU-table port.
@@ -702,6 +710,30 @@ public static class AssemblyRewriter
         // assembly (play verbs are silent no-ops).
         RedirectMediaTypeReferences(module);
 
+        // VisualStyleRenderer.DrawBackground is a UxTheme P/Invoke stubbed
+        // to S_OK (HDC is null headless), so themed spin arrows vanish and
+        // PDN's UpDownButtons keeps its Violet debug fill. Retarget both
+        // overloads to the fork's GDI+ spin painter; every other
+        // class/part stays a silent no-op inside the helper.
+        RedirectSpinDrawBackground(module);
+
+        // ControlPaint.DrawScrollButton classic ends in stubbed
+        // DrawFrameControl: retarget both static overloads to the
+        // fork's GDI+ scroll painter (PDN Colors spin chips).
+        // RE-ENABLED: the kind-17 TLEs reproduce with this hook OFF and
+        // with byte-identical app modules (4DDA==258F) and fork (c9sw);
+        // victims include types with no rewritten calls; pre-session log
+        // rows (10-19 PDN, 10-20 Syncfusion, today 14:38-15:28 PDN) prove
+        // the pathology predates and is flaky independent of this rule.
+        // The emitted MemberRef fully resolves under Cecil.
+        RedirectScrollButtonDraw(module);
+
+        // Cyotek ColorGrid GetColor/GetColorSource/SetColor off-by-one
+        // guards (`> count` instead of `>=`): clicking the empty custom
+        // well throws IndexOutOfRangeException and the selection never
+        // commits. One-opcode ble->blt swap at the guarded sites.
+        FixCyotekColorGridBounds(module);
+
         // DISABLED rev76: the pass retargets LoadLibraryEx/GetModuleHandle to
         // WasmNativeLibrary null-handle stubs, but that type was never shipped
         // in the fork, so every retargeted site TypeLoads (diagram
@@ -739,6 +771,8 @@ public static class AssemblyRewriter
         MethodReference? vfsCreationTime = null;
         MethodReference? vfsReadText1 = null;
         MethodReference? vfsReadText2 = null;
+        MethodReference? vfsReadBytes1 = null;
+        MethodReference? wasmFileVersionGetInfo = null;
         MethodReference? baseDirStatic = null;
         MethodReference? baseDirInstance = null;
         Mono.Cecil.TypeReference? formsGateType = null;
@@ -877,6 +911,15 @@ public static class AssemblyRewriter
                     new ParameterDefinition(module.ImportReference(typeof(System.Text.Encoding)))
                 }
             };
+            // Binary twin of the JSON-seed read (ERP InfoControl viewer:
+            // RadPdfViewer.LoadDocument(backslash path) -> ReadAllBytes):
+            // same registry-first, disk-fallback semantics.
+            vfsReadBytes1 = new MethodReference("ReadAllBytes",
+                new ArrayType(module.TypeSystem.Byte), vfsType)
+            {
+                HasThis = false,
+                Parameters = { new ParameterDefinition(module.TypeSystem.String) }
+            };
         }
 
         // Headless Invalidate() is a silent no-op (IsHandleCreated is never
@@ -911,6 +954,18 @@ public static class AssemblyRewriter
         formsGateType = new TypeReference("System.Windows.Forms", "WasmRepaintGate", module, formsScope);
         formsControlType = new TypeReference("System.Windows.Forms", "Control", module, formsScope);
         wasmRegistryType = new TypeReference("System.Windows.Forms", "WasmRegistry", module, formsScope);
+        // The browser framework ships FileVersionInfo as a throwing stub
+        // (every member PNSEs, no backing fields). GetVersionInfo and all
+        // getters/ToString are redirected to the fork's metadata-backed
+        // WasmFileVersion readers (PlatformNotSupportedException aborts
+        // OnLoad chains otherwise).
+        var wasmFileVersionType = new TypeReference("System.Windows.Forms", "WasmFileVersion", module, formsScope);
+        wasmFileVersionGetInfo = new MethodReference("GetVersionInfo",
+            module.ImportReference(typeof(System.Diagnostics.FileVersionInfo)), wasmFileVersionType)
+        {
+            HasThis = false,
+            Parameters = { new ParameterDefinition(module.TypeSystem.String) }
+        };
 
         // ResourceManager.GetObject retargets to the fork shim (not the
         // Drawing helper directly): designer ".ImageStream" entries hydrate
@@ -5096,6 +5151,53 @@ public static class AssemblyRewriter
                                     instruction.Operand = vfsReadText2;
                                 }
                             }
+                            else if (mr.Name == "ReadAllBytes"
+                                && mr.DeclaringType.FullName == "System.IO.File"
+                                && mr.Parameters.Count == 1 && vfsReadBytes1 != null)
+                            {
+                                instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                                instruction.Operand = vfsReadBytes1;
+                            }
+                            else if (mr.Name == "GetVersionInfo"
+                                && mr.DeclaringType.FullName == "System.Diagnostics.FileVersionInfo"
+                                && mr.Parameters.Count == 1 && wasmFileVersionGetInfo != null)
+                            {
+                                // Browser ships FileVersionInfo as a throwing
+                                // stub (every member PNSEs): the factory must
+                                // be answered from loaded-assembly metadata.
+                                // Aborting whole OnLoad chains otherwise
+                                // (Cyotek AboutDialog/MainForm: the
+                                // Demonstrations tab is never built).
+                                instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                                instruction.Operand = wasmFileVersionGetInfo;
+                            }
+                            else if (mr.HasThis && mr.Parameters.Count == 0
+                                && mr.DeclaringType.FullName == "System.Diagnostics.FileVersionInfo"
+                                && (mr.Name == "ToString" || mr.Name.StartsWith("get_", StringComparison.Ordinal))
+                                && wasmFileVersionGetInfo != null)
+                            {
+                                // The stub has no backing fields, so property
+                                // reads on the shim-returned instance would
+                                // still throw: route every getter/ToString to
+                                // the metadata-backed readers (same name with
+                                // a Read prefix, Describe for ToString). The
+                                // instance becomes the first static arg.
+                                string readerName = mr.Name == "ToString"
+                                    ? "Describe"
+                                    : "Read" + mr.Name.Substring(4);
+                                string retFull = mr.ReturnType.FullName;
+                                if (retFull == "System.String" || retFull == "System.Int32" || retFull == "System.Boolean")
+                                {
+                                    var reader = new MethodReference(readerName,
+                                        module.ImportReference(mr.ReturnType), wasmFileVersionGetInfo.DeclaringType)
+                                    {
+                                        HasThis = false,
+                                        Parameters = { new ParameterDefinition(module.ImportReference(typeof(System.Diagnostics.FileVersionInfo))) },
+                                    };
+                                    instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                                    instruction.Operand = reader;
+                                }
+                            }
                             else if (mr.Name == "get_ClientsAreListening"
                                 && mr.DeclaringType.FullName == "System.Windows.Automation.Provider.AutomationInteropProvider"
                                 && mr.Parameters.Count == 0)
@@ -6059,12 +6161,14 @@ public static class AssemblyRewriter
         marker.Body.GetILProcessor().Emit(OpCodes.Ret);
         type.Methods.Add(marker);
     }
-    // CpuCommandList: deferred recordings are meaningless headless
-    // (draws execute immediately), so the list is an inert token that
-    // survives Close/Stream and lets DrawImage skip it â€” the pixels
-    // are already in the target. Anything returning a value fails
-    // loudly: a real recording would be needed there.
-    private static TypeDefinition SynthesizeCpuCommandList(ModuleDefinition module)
+    // CpuCommandList: SetTarget(list) redirects dc fills into a scratch
+    // surface (the vendor CommandListDrawingScope saves/restores the
+    // target around direct draws); DrawImage(list) blits the scratch
+    // back in desktop order, Dispose frees it. Without the redirect,
+    // immediate fills land early and a later opaque DrawImage buries
+    // them (observed: PDN Colors palette wells under the checkers
+    // layer). Anything else returning a value fails loudly.
+    private static TypeDefinition SynthesizeCpuCommandList(ModuleDefinition module, MethodReference freeScratch)
     {
         TypeReference iface = LocalOrOwnedCpuRef(module, "PaintDotNet.Direct2D1.ICommandList");
         TypeDefinition ifaceDef = ResolveCpuDef(iface);
@@ -6073,6 +6177,28 @@ public static class AssemblyRewriter
             TypeAttributes.Class | TypeAttributes.Public | TypeAttributes.Sealed,
             module.TypeSystem.Object);
         type.Interfaces.Add(new InterfaceImplementation(iface));
+        // Vendor ICommandList extends IDeviceImage, so recorded lists can
+        // travel through SetTarget/DrawImage as images. The contract walk
+        // below already emits IDeviceImage member defaults (inheritance
+        // walk); only the declaration is missing. Fixture modules without
+        // the imaging universe keep today's shape (casts there never run
+        // PDN paint).
+        try
+        {
+            TypeReference imageIface = LocalOrOwnedCpuRef(module, "PaintDotNet.Direct2D1.IDeviceImage");
+            type.Interfaces.Add(new InterfaceImplementation(imageIface));
+        }
+        catch (Exception ex) when (ex is InvalidOperationException
+            || ex is Mono.Cecil.ResolutionException || ex is ArgumentException) { }
+        // Redirect capture: SetTarget(list) swaps the dc target to a
+        // scratch surface (created on first redirect, sized to the live
+        // target) and remembers the displaced target here; DrawImage(list)
+        // blits the scratch back; Dispose frees it. Per-paint lists are
+        // disposed right after DrawImage, so nothing leaks in that flow.
+        var scratchField = new FieldDefinition("_scratch", FieldAttributes.Public, module.TypeSystem.Int64);
+        var savedField = new FieldDefinition("_saved", FieldAttributes.Public, module.TypeSystem.Int64);
+        type.Fields.Add(scratchField);
+        type.Fields.Add(savedField);
         MethodReference objectCtor = module.ImportReference(typeof(object).GetConstructor(Type.EmptyTypes)!);
         var ctor = new MethodDefinition(
             ".ctor",
@@ -6116,6 +6242,35 @@ public static class AssemblyRewriter
             impl.Body.MaxStackSize = 32;
             type.Methods.Add(impl);
         }
+        // Scratch lifetime: vendor code disposes the command list BEFORE
+        // the final composite (palette wraps the list in the effect,
+        // disposes it, then draws), so Dispose must NOT free the scratch
+        // (desktop Dispose only drops a reference; the recording stays
+        // alive through the effect). DrawImage consumes the scratch on
+        // first playback (blit+free+zero, single-playback headless); this
+        // finalizer backstops lists that are never drawn.
+        var finalizer = new MethodDefinition(
+            "Finalize",
+            MethodAttributes.Family | MethodAttributes.Virtual | MethodAttributes.HideBySig,
+            module.TypeSystem.Void);
+        {
+            var fil = finalizer.Body.GetILProcessor();
+            var finDone = fil.Create(OpCodes.Nop);
+            fil.Emit(OpCodes.Ldarg_0);
+            fil.Emit(OpCodes.Ldfld, scratchField);
+            fil.Emit(OpCodes.Brfalse, finDone);
+            fil.Emit(OpCodes.Ldarg_0);
+            fil.Emit(OpCodes.Ldfld, scratchField);
+            fil.Emit(OpCodes.Call, freeScratch);
+            fil.Emit(OpCodes.Ldarg_0);
+            fil.Emit(OpCodes.Ldc_I4_0);
+            fil.Emit(OpCodes.Conv_I8);
+            fil.Emit(OpCodes.Stfld, scratchField);
+            fil.Append(finDone);
+            fil.Emit(OpCodes.Ret);
+        }
+        finalizer.Body.MaxStackSize = 32;
+        type.Methods.Add(finalizer);
         // IObjectRef answers: EffectInputAccessor.Set routes every crop
         // input through SetInput -> CreateRef(IObjectRef), which throws
         // ObjectDisposed when TryCreateRef answers null (observed live:
@@ -7587,6 +7742,104 @@ public static class AssemblyRewriter
         TypeDefinition effect = module.GetType("PaintDotNet.Effects.Gpu.GpuEffect")
             ?? throw new InvalidOperationException("CpuPaint: GpuEffect missing");
         MethodDefinition getter = effect.Methods.First(m => m.Name == "get_RenderingGpuChoice" && m.Parameters.Count == 0);
+        getter.Body.ExceptionHandlers.Clear();
+        getter.Body.Instructions.Clear();
+        var gil = getter.Body.GetILProcessor();
+        gil.Emit(OpCodes.Newobj, settingCtor);
+        gil.Emit(OpCodes.Ret);
+        if (getter.Body.MaxStackSize < 8)
+            getter.Body.MaxStackSize = 8;
+    }
+
+    // The GPU quality default comes from a settings lookup that is
+    // missing headless (the Effects section registers it with a
+    // GPU-probing lazy default that never resolves without a device):
+    // every GPU effect NREs in OnCreatePropertyCollection dereferencing
+    // it (live: RotateZoom, Bulge during Ctrl+Z/menu traffic). Answer the
+    // device-less-desktop default (1, range 1..8) — the same value
+    // GetDefaultQualityLevelGpu produces for a non-Good GPU. Public so
+    // the rewrite tests pin it directly, like the Redirect* rules.
+    public static void EnsureGpuQualitySettingFallback(ModuleDefinition module)
+    {
+        TypeDefinition scalarOpen = ResolveExternalDef(module, "PaintDotNet.Core", "PaintDotNet.AppModel.IScalarAppSetting`1");
+        var closed = new GenericInstanceType(module.ImportReference(scalarOpen));
+        closed.GenericArguments.Add(module.TypeSystem.Int32);
+        TypeReference isettingRef = module.ImportReference(
+            ResolveExternalDef(module, "PaintDotNet.Core", "PaintDotNet.AppModel.ISetting"));
+        TypeReference iinternalRef = module.ImportReference(
+            ResolveExternalDef(module, "PaintDotNet.ComponentModel", "PaintDotNet.IInternalImpl"));
+        MethodReference objectCtor =
+            module.ImportReference(typeof(object).GetConstructor(Type.EmptyTypes)!);
+        MethodReference typeFromHandle = module.ImportReference(
+            typeof(Type).GetMethod("GetTypeFromHandle", new[] { typeof(RuntimeTypeHandle) })!);
+        var type = module.GetType("PaintDotNet.Gpu.CpuGpuQualitySetting");
+        if (type is null)
+        {
+            type = new TypeDefinition(
+                "PaintDotNet.Gpu", "CpuGpuQualitySetting",
+                TypeAttributes.Class | TypeAttributes.Public | TypeAttributes.Sealed,
+                module.TypeSystem.Object);
+            type.Interfaces.Add(new InterfaceImplementation(closed));
+            type.Interfaces.Add(new InterfaceImplementation(isettingRef));
+            type.Interfaces.Add(new InterfaceImplementation(iinternalRef));
+            var ctor = new MethodDefinition(
+                ".ctor",
+                MethodAttributes.Public | MethodAttributes.HideBySig
+                    | MethodAttributes.SpecialName | MethodAttributes.RTSpecialName,
+                module.TypeSystem.Void);
+            var ccil = ctor.Body.GetILProcessor();
+            ccil.Emit(OpCodes.Ldarg_0);
+            ccil.Emit(OpCodes.Call, objectCtor);
+            ccil.Emit(OpCodes.Ret);
+            ctor.Body.MaxStackSize = 32;
+            type.Methods.Add(ctor);
+            MethodAttributes implAttrs = MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.Final
+                | MethodAttributes.HideBySig | MethodAttributes.NewSlot;
+            void LdcInt(Mono.Cecil.Cil.ILProcessor il, int value)
+            {
+                switch (value)
+                {
+                    case 0: il.Emit(OpCodes.Ldc_I4_0); break;
+                    case 1: il.Emit(OpCodes.Ldc_I4_1); break;
+                    case 8: il.Emit(OpCodes.Ldc_I4_8); break;
+                    default: il.Emit(OpCodes.Ldc_I4, value); break;
+                }
+            }
+            TypeReference intRef = module.TypeSystem.Int32;
+            TypeReference obj = module.TypeSystem.Object;
+            void Impl(string name, TypeReference ret, TypeReference[] ps, Action<Mono.Cecil.Cil.ILProcessor> emit)
+            {
+                var md = new MethodDefinition(name, implAttrs, ret);
+                foreach (var p in ps)
+                    md.Parameters.Add(new ParameterDefinition(p));
+                emit(md.Body.GetILProcessor());
+                md.Body.MaxStackSize = 32;
+                md.Body.InitLocals = true;
+                type.Methods.Add(md);
+            }
+            Impl("get_Value", intRef, Array.Empty<TypeReference>(), il => { LdcInt(il, 1); il.Emit(OpCodes.Ret); });
+            Impl("set_Value", module.TypeSystem.Void, new[] { intRef }, il => il.Emit(OpCodes.Ret));
+            Impl("get_DefaultValue", intRef, Array.Empty<TypeReference>(), il => { LdcInt(il, 1); il.Emit(OpCodes.Ret); });
+            Impl("get_MinValue", intRef, Array.Empty<TypeReference>(), il => { LdcInt(il, 1); il.Emit(OpCodes.Ret); });
+            Impl("get_MaxValue", intRef, Array.Empty<TypeReference>(), il => { LdcInt(il, 8); il.Emit(OpCodes.Ret); });
+            Impl("get_Value", obj, Array.Empty<TypeReference>(), il => { LdcInt(il, 1); il.Emit(OpCodes.Box, intRef); il.Emit(OpCodes.Ret); });
+            Impl("set_Value", module.TypeSystem.Void, new[] { obj }, il => il.Emit(OpCodes.Ret));
+            Impl("get_DefaultValue", obj, Array.Empty<TypeReference>(), il => { LdcInt(il, 1); il.Emit(OpCodes.Box, intRef); il.Emit(OpCodes.Ret); });
+            Impl("get_Path", module.TypeSystem.String, Array.Empty<TypeReference>(),
+                il => { il.Emit(OpCodes.Ldstr, "Effects/DefaultQualityLevelGpu"); il.Emit(OpCodes.Ret); });
+            Impl("get_IsReadOnly", module.TypeSystem.Boolean, Array.Empty<TypeReference>(),
+                il => { LdcInt(il, 0); il.Emit(OpCodes.Ret); });
+            Impl("get_ValueType", module.ImportReference(typeof(Type)), Array.Empty<TypeReference>(),
+                il => { il.Emit(OpCodes.Ldtoken, intRef); il.Emit(OpCodes.Call, typeFromHandle); il.Emit(OpCodes.Ret); });
+            Impl("InternalImplementationOnly", module.TypeSystem.Void, Array.Empty<TypeReference>(),
+                il => il.Emit(OpCodes.Ret));
+            module.Types.Add(type);
+        }
+        MethodDefinition settingCtor = type.Methods.First(m => m.Name == ".ctor" && m.Parameters.Count == 0);
+        TypeDefinition effect = module.GetType("PaintDotNet.Effects.Gpu.GpuEffect")
+            ?? throw new InvalidOperationException("CpuPaint: GpuEffect missing");
+        MethodDefinition getter = effect.Methods.FirstOrDefault(m => m.Name == "get_DefaultQualityLevelGpu" && m.Parameters.Count == 0 && m.HasBody)
+            ?? throw new InvalidOperationException("CpuPaint: GpuEffect quality getter missing");
         getter.Body.ExceptionHandlers.Clear();
         getter.Body.Instructions.Clear();
         var gil = getter.Body.GetILProcessor();
@@ -11413,6 +11666,11 @@ public static class AssemblyRewriter
         MethodReference drawBitmapCpu = Cpu("DrawBitmap", 14);
         MethodReference fillRectCpu = Cpu("FillRect", 10);
         MethodReference fillEllipseCpu = Cpu("FillEllipse", 10);
+        MethodReference createScratchCpu = Cpu("CreateScratchTarget", 2);
+        MethodReference blitScratchCpu = Cpu("BlitScratchOver", 2);
+        MethodReference freeScratchCpu = Cpu("FreeScratchTarget", 1);
+        MethodReference getTransformCpu = Cpu("GetTransform", 7);
+        MethodReference getTargetSizeRedirectCpu = Cpu("GetTargetSize", 3);
         RewriteIdentityFormatConverter(
             module,
             Cpu("PremultiplyInPlace", 4),
@@ -11436,7 +11694,7 @@ public static class AssemblyRewriter
         TypeDefinition cpuBmp = SynthesizeCpuDeviceBitmap(module, createBitmapEmpty, freeBitmap);
         TypeDefinition cpuBrush = SynthesizeCpuDeviceBrush(module);
         TypeDefinition cpuGradient = SynthesizeCpuLinearGradientBrush(module);
-        TypeDefinition cpuCmdList = SynthesizeCpuCommandList(module);
+        TypeDefinition cpuCmdList = SynthesizeCpuCommandList(module, freeScratchCpu);
         MethodDefinition cmdListCtor = cpuCmdList.Methods.First(m => m.Name == ".ctor");
         FieldDefinition bmpHandleField = cpuBmp.Fields.First(f => f.Name == "_handle");
         FieldDefinition bmpWidthField = cpuBmp.Fields.First(f => f.Name == "_width");
@@ -11505,6 +11763,11 @@ public static class AssemblyRewriter
         // DrawingContext .ctor installs via TrySet (null until then).
         var holderCacheField = new FieldDefinition("_holderCache", FieldAttributes.Private, module.TypeSystem.Object);
         ctx.Fields.Add(holderCacheField);
+        // Active command-list redirect (SetTarget(list) swaps _target to
+        // the list scratch; null when direct). GetTarget answers it so
+        // the vendor save/restore scope round-trips.
+        var redirField = new FieldDefinition("_redirList", FieldAttributes.Private, module.TypeSystem.Object);
+        ctx.Fields.Add(redirField);
 
         // Corlib glue (Hashtable cache, reflection reads, messages) goes
         // through ImportReference like the rest of this file: host and
@@ -12864,15 +13127,130 @@ public static class AssemblyRewriter
             il.Emit(OpCodes.Newobj, cmdListCtor);
             il.Emit(OpCodes.Ret);
         }
-        // -- GetTarget(): no device target exists headless; null is the
-        // honest answer (lets the command-list scope save/restore pass
-        // through without touching pixels).
+        // -- GetTarget(): the active redirect list, else null (no device
+        // target exists headless). The vendor CommandListDrawingScope
+        // saves this and restores it via SetTarget, round-tripping the
+        // redirect below.
         MethodDefinition contractGetTarget = Contract("GetTarget", m => m.Parameters.Count == 0);
         var getTarget = Impl(contractGetTarget);
         {
             var il = getTarget.Body.GetILProcessor();
-            il.Emit(OpCodes.Ldnull);
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldfld, redirField);
+            il.Emit(OpCodes.Castclass, MapCpuType(module, contractGetTarget.ReturnType));
             il.Emit(OpCodes.Ret);
+        }
+        // -- SetTarget(image): command-list redirect. SetTarget(list)
+        // swaps the fill target to the list scratch (created on first
+        // redirect, sized to the live target, live matrix copied in);
+        // the vendor scope restore SetTarget(null) swaps back. Nested
+        // redirects and foreign images keep today's no-op. Fixture
+        // modules without the contract keep the tail-loop default.
+        MethodDefinition? setTargetContract = contracts.FirstOrDefault(
+            m => m.Name == "SetTarget" && m.Parameters.Count == 1);
+        if (setTargetContract != null)
+        {
+            implemented.Add(setTargetContract);
+            var setTarget = new MethodDefinition(
+                "SetTarget",
+                MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.Final
+                    | MethodAttributes.HideBySig | MethodAttributes.NewSlot,
+                module.TypeSystem.Void);
+            foreach (var p in setTargetContract.Parameters)
+                setTarget.Parameters.Add(new ParameterDefinition(
+                    p.Name, p.Attributes, MapCpuType(module, p.ParameterType)));
+            setTarget.Body.MaxStackSize = 32;
+            ctx.Methods.Add(setTarget);
+            var sil = setTarget.Body.GetILProcessor();
+            var listLoc = new VariableDefinition(cpuCmdList);
+            var stwLoc = new VariableDefinition(module.TypeSystem.Int32);
+            var sthLoc = new VariableDefinition(module.TypeSystem.Int32);
+            var stmpLoc = new VariableDefinition(module.TypeSystem.Int64);
+            var stm11Loc = new VariableDefinition(module.TypeSystem.Single);
+            var stm12Loc = new VariableDefinition(module.TypeSystem.Single);
+            var stm21Loc = new VariableDefinition(module.TypeSystem.Single);
+            var stm22Loc = new VariableDefinition(module.TypeSystem.Single);
+            var st31Loc = new VariableDefinition(module.TypeSystem.Single);
+            var st32Loc = new VariableDefinition(module.TypeSystem.Single);
+            foreach (var v in new[] { listLoc, stwLoc, sthLoc, stmpLoc, stm11Loc, stm12Loc, stm21Loc, stm22Loc, st31Loc, st32Loc })
+                setTarget.Body.Variables.Add(v);
+            setTarget.Body.InitLocals = true;
+            FieldDefinition scratchF = cpuCmdList.Fields.First(f => f.Name == "_scratch");
+            FieldDefinition savedF = cpuCmdList.Fields.First(f => f.Name == "_saved");
+            var notList = sil.Create(OpCodes.Nop);
+            var haveScratch = sil.Create(OpCodes.Nop);
+            var doneST = sil.Create(OpCodes.Nop);
+            sil.Emit(OpCodes.Ldarg_1);
+            sil.Emit(OpCodes.Isinst, cpuCmdList);
+            sil.Emit(OpCodes.Stloc, listLoc);
+            sil.Emit(OpCodes.Ldloc, listLoc);
+            sil.Emit(OpCodes.Brfalse, notList);
+            sil.Emit(OpCodes.Ldarg_0);
+            sil.Emit(OpCodes.Ldfld, redirField);
+            sil.Emit(OpCodes.Brtrue, doneST);
+            sil.Emit(OpCodes.Ldloc, listLoc);
+            sil.Emit(OpCodes.Ldarg_0);
+            sil.Emit(OpCodes.Ldfld, targetField);
+            sil.Emit(OpCodes.Stfld, savedF);
+            sil.Emit(OpCodes.Ldloc, listLoc);
+            sil.Emit(OpCodes.Ldfld, scratchF);
+            sil.Emit(OpCodes.Brtrue, haveScratch);
+            sil.Emit(OpCodes.Ldarg_0);
+            sil.Emit(OpCodes.Ldfld, targetField);
+            sil.Emit(OpCodes.Ldloca_S, stwLoc);
+            sil.Emit(OpCodes.Ldloca_S, sthLoc);
+            sil.Emit(OpCodes.Call, getTargetSizeRedirectCpu);
+            sil.Emit(OpCodes.Ldloc, stwLoc);
+            sil.Emit(OpCodes.Ldloc, sthLoc);
+            sil.Emit(OpCodes.Call, createScratchCpu);
+            sil.Emit(OpCodes.Stloc, stmpLoc);
+            sil.Emit(OpCodes.Ldloc, listLoc);
+            sil.Emit(OpCodes.Ldloc, stmpLoc);
+            sil.Emit(OpCodes.Stfld, scratchF);
+            sil.Emit(OpCodes.Ldarg_0);
+            sil.Emit(OpCodes.Ldfld, targetField);
+            sil.Emit(OpCodes.Ldloca_S, stm11Loc);
+            sil.Emit(OpCodes.Ldloca_S, stm12Loc);
+            sil.Emit(OpCodes.Ldloca_S, stm21Loc);
+            sil.Emit(OpCodes.Ldloca_S, stm22Loc);
+            sil.Emit(OpCodes.Ldloca_S, st31Loc);
+            sil.Emit(OpCodes.Ldloca_S, st32Loc);
+            sil.Emit(OpCodes.Call, getTransformCpu);
+            sil.Emit(OpCodes.Ldloc, stmpLoc);
+            sil.Emit(OpCodes.Ldloc, stm11Loc);
+            sil.Emit(OpCodes.Ldloc, stm12Loc);
+            sil.Emit(OpCodes.Ldloc, stm21Loc);
+            sil.Emit(OpCodes.Ldloc, stm22Loc);
+            sil.Emit(OpCodes.Ldloc, st31Loc);
+            sil.Emit(OpCodes.Ldloc, st32Loc);
+            sil.Emit(OpCodes.Call, setTransformCpu);
+            sil.Append(haveScratch);
+            sil.Emit(OpCodes.Ldarg_0);
+            sil.Emit(OpCodes.Ldloc, listLoc);
+            sil.Emit(OpCodes.Ldfld, scratchF);
+            sil.Emit(OpCodes.Stfld, targetField);
+            sil.Emit(OpCodes.Ldarg_0);
+            sil.Emit(OpCodes.Ldloc, listLoc);
+            sil.Emit(OpCodes.Stfld, redirField);
+            sil.Emit(OpCodes.Br, doneST);
+            sil.Append(notList);
+            sil.Emit(OpCodes.Ldarg_1);
+            sil.Emit(OpCodes.Brtrue, doneST);
+            sil.Emit(OpCodes.Ldarg_0);
+            sil.Emit(OpCodes.Ldfld, redirField);
+            sil.Emit(OpCodes.Isinst, cpuCmdList);
+            sil.Emit(OpCodes.Stloc, listLoc);
+            sil.Emit(OpCodes.Ldloc, listLoc);
+            sil.Emit(OpCodes.Brfalse, doneST);
+            sil.Emit(OpCodes.Ldarg_0);
+            sil.Emit(OpCodes.Ldloc, listLoc);
+            sil.Emit(OpCodes.Ldfld, savedF);
+            sil.Emit(OpCodes.Stfld, targetField);
+            sil.Emit(OpCodes.Ldarg_0);
+            sil.Emit(OpCodes.Ldnull);
+            sil.Emit(OpCodes.Stfld, redirField);
+            sil.Append(doneST);
+            sil.Emit(OpCodes.Ret);
         }
         // -- Clear(color?): fills the whole target (transparent when the
         // color is absent). Fresh bitmaps start zeroed, but reused ones
@@ -12941,7 +13319,8 @@ public static class AssemblyRewriter
         // -- DrawImage(image, destPoint?, srcRect?, interp, composite):
         // effect/command-list output composited back (sprite dab). CPU
         // bitmaps blit like DrawBitmap at full opacity; command lists
-        // are already painted (no-op); anything else names its type.
+        // with a redirect scratch blit it back and consume it
+        // (single-playback headless); anything else names its type.
         MethodDefinition contractDrawImage = Contract("DrawImage",
             m => m.Parameters.Count == 5
                 && m.Parameters[0].ParameterType.FullName == "PaintDotNet.Direct2D1.IDeviceImage");
@@ -13023,9 +13402,43 @@ public static class AssemblyRewriter
             il.Emit(OpCodes.Ldloc, imgLoc);
             il.Emit(OpCodes.Brtrue, hasBmp);
             var imgDone = il.Create(OpCodes.Nop);
+            // Direct DrawImage(list): blit a recorded redirect scratch
+            // back in desktop order (the palette replays its layer this
+            // way). Lists without a scratch painted direct (or stayed
+            // empty): today's skip. Long branches: short forms here
+            // silently truncated once the method grew (rev187 gap target).
+            var earlyListLoc = new VariableDefinition(cpuCmdList);
+            var earlyScratchLoc = new VariableDefinition(module.TypeSystem.Int64);
+            drawImage.Body.Variables.Add(earlyListLoc);
+            drawImage.Body.Variables.Add(earlyScratchLoc);
+            FieldDefinition earlyScratchF = cpuCmdList.Fields.First(f => f.Name == "_scratch");
+            var notListEarly = il.Create(OpCodes.Nop);
             il.Emit(OpCodes.Ldarg_1);
             il.Emit(OpCodes.Isinst, cpuCmdList);
-            il.Emit(OpCodes.Brtrue, imgDone);
+            il.Emit(OpCodes.Stloc, earlyListLoc);
+            il.Emit(OpCodes.Ldloc, earlyListLoc);
+            il.Emit(OpCodes.Brfalse, notListEarly);
+            il.Emit(OpCodes.Ldloc, earlyListLoc);
+            il.Emit(OpCodes.Ldfld, earlyScratchF);
+            il.Emit(OpCodes.Stloc, earlyScratchLoc);
+            il.Emit(OpCodes.Ldloc, earlyScratchLoc);
+            il.Emit(OpCodes.Brfalse, imgDone);
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldfld, targetField);
+            il.Emit(OpCodes.Ldloc, earlyScratchLoc);
+            il.Emit(OpCodes.Call, blitScratchCpu);
+            // Consume on first playback (single-playback headless): the
+            // vendor palette draws the same list again right after (raw
+            // list after the wrapped effect); a second blit would double-
+            // paint. Leftovers die in the finalizer.
+            il.Emit(OpCodes.Ldloc, earlyScratchLoc);
+            il.Emit(OpCodes.Call, freeScratchCpu);
+            il.Emit(OpCodes.Ldloc, earlyListLoc);
+            il.Emit(OpCodes.Ldc_I4_0);
+            il.Emit(OpCodes.Conv_I8);
+            il.Emit(OpCodes.Stfld, earlyScratchF);
+            il.Emit(OpCodes.Br, imgDone);
+            il.Append(notListEarly);
             if (hasCheckerPath)
             {
                 var fxLoc = new VariableDefinition(cropFxRef!);
@@ -13147,6 +13560,194 @@ public static class AssemblyRewriter
             il.Emit(OpCodes.Brfalse, hasBmp);
             il.Emit(OpCodes.Br, hasBmp);
             il.Append(noProxy);
+            // ColorManagementEffect identity no-op (gradient strips): the
+            // source was already painted into the target by the preceding
+            // FillRectangle, so a failed unwrap Retains instead of throwing
+            // (the throw magenta-placeholders the whole control). Other
+            // effects keep the loud unknown-image throw. Guarded: modules
+            // without the Windows.Core reference keep today's behavior.
+            TypeReference? colorMgmtRef = module.GetType("PaintDotNet.Direct2D1.Effects.ColorManagementEffect");
+            TypeReference? colorMgmtProxyRef = module.GetType("PaintDotNet.Direct2D1.Effects.Proxies.IColorManagementEffectProxy");
+            if (colorMgmtRef == null || colorMgmtProxyRef == null)
+            {
+                var coreScope = module.AssemblyReferences.FirstOrDefault(r => r.Name == "PaintDotNet.Windows.Core");
+                if (coreScope != null)
+                {
+                    colorMgmtRef ??= new TypeReference("PaintDotNet.Direct2D1.Effects", "ColorManagementEffect", module, coreScope);
+                    colorMgmtProxyRef ??= new TypeReference("PaintDotNet.Direct2D1.Effects.Proxies", "IColorManagementEffectProxy", module, coreScope);
+                }
+            }
+            if (colorMgmtRef != null || colorMgmtProxyRef != null)
+            {
+                var doRet = il.Create(OpCodes.Ret);
+                var realThrow = il.Create(OpCodes.Nop);
+                // Forward (palette wells): a ColorManagementEffect
+                // wrapping a redirected command list must replay the
+                // list scratch into the current target. The old bare
+                // Ret dropped it: palette fills sit in the list scratch
+                // (never on the live surface), so the no-op composited
+                // an empty wrapper list. Non-list sources keep the
+                // no-op (gradient strips). Long branches: this method
+                // outgrew short range (rev187 gap target).
+                // rev190: read the wrapped list through
+                // Properties.Source (the vendor's own channel) instead
+                // of GetInput(0): the device-effect input slot is null
+                // headless (the inner D2D effect is never created), so
+                // GetInput NREs and the vendor render guard swallows the
+                // whole composite. The proxy keeps the no-op (its
+                // property shape is unknown).
+                // rev191: the get_Properties call goes through the
+                // NON-GENERIC DeviceEffect base (exactly what the
+                // generic DeviceEffect<Props>.get_Properties does
+                // internally: base call + unbox; here base call +
+                // Castclass to Props). No generic token appears in the
+                // emitted IL at all: generic-interface dispatch trips
+                // Mono class loading on WASM, and the suite's nested
+                // module-scope check rejects hand-built generic
+                // instantiations (both pinned by the checker test).
+                TypeDefinition? cmePropsDef = module.GetType("PaintDotNet.Direct2D1.Effects.ColorManagementEffect/Props");
+                TypeDefinition? fxAccDef = module.GetType("PaintDotNet.Direct2D1.Effects.EffectInputAccessor");
+                TypeDefinition? devFxBaseDef = module.GetType("PaintDotNet.Direct2D1.Effects.DeviceEffect");
+                MethodDefinition? baseGetPropsDef = devFxBaseDef?.Methods.FirstOrDefault(
+                    m => m.Name == "get_Properties" && m.Parameters.Count == 0);
+                MethodDefinition? getSourceDef = cmePropsDef?.Methods.FirstOrDefault(
+                    m => m.Name == "get_Source" && m.Parameters.Count == 0);
+                MethodDefinition? accGetDef = fxAccDef?.Methods.FirstOrDefault(
+                    m => m.Name == "Get" && m.Parameters.Count == 0);
+                MethodDefinition? accIsSetDef = fxAccDef?.Methods.FirstOrDefault(
+                    m => m.Name == "get_IsSet" && m.Parameters.Count == 0);
+                bool canForward = colorMgmtRef != null && cmePropsDef != null && fxAccDef != null
+                    && baseGetPropsDef != null && getSourceDef != null && accGetDef != null && accIsSetDef != null;
+                TypeReference? propsRef = null;
+                MethodReference? getPropsRef = null;
+                MethodReference? getSourceRef = null;
+                MethodReference? accGetRef = null;
+                MethodReference? accIsSetRef = null;
+                VariableDefinition? cmeAccLoc = null;
+                {
+                    var cmeListLoc = new VariableDefinition(cpuCmdList);
+                    var cmeScrLoc = new VariableDefinition(module.TypeSystem.Int64);
+                    drawImage.Body.Variables.Add(cmeListLoc);
+                    drawImage.Body.Variables.Add(cmeScrLoc);
+                    if (canForward)
+                    {
+                        propsRef = module.ImportReference(cmePropsDef);
+                        var accRef = module.ImportReference(fxAccDef);
+                        getPropsRef = module.ImportReference(baseGetPropsDef);
+                        getSourceRef = module.ImportReference(getSourceDef);
+                        accGetRef = module.ImportReference(accGetDef);
+                        accIsSetRef = module.ImportReference(accIsSetDef);
+                        cmeAccLoc = new VariableDefinition(accRef);
+                        drawImage.Body.Variables.Add(cmeAccLoc);
+                    }
+                    // haveCme is appended AFTER the proxy check: the
+                    // failed-CME fallthrough must reach the proxy
+                    // check (or realThrow), never the forward. (Appending
+                    // it right after Brtrue let non-CME images fall into
+                    // the forward with a null effect: FWD fx=null, NRE
+                    // on get_Properties, composite swallowed.)
+                    Instruction? haveCme = null;
+                    VariableDefinition? cmeLoc = null;
+                    if (colorMgmtRef != null)
+                    {
+                        cmeLoc = new VariableDefinition(colorMgmtRef);
+                        drawImage.Body.Variables.Add(cmeLoc);
+                        haveCme = il.Create(OpCodes.Nop);
+                        il.Emit(OpCodes.Ldarg_1);
+                        il.Emit(OpCodes.Isinst, colorMgmtRef);
+                        il.Emit(OpCodes.Stloc, cmeLoc);
+                        il.Emit(OpCodes.Ldloc, cmeLoc);
+                        il.Emit(OpCodes.Brtrue, haveCme);
+                        if (colorMgmtProxyRef == null)
+                            il.Emit(OpCodes.Br, realThrow);
+                    }
+                    // rev193: the palette wraps its filled list in a
+                    // PROXY (CreateRef answers IColorManagementEffectProxy,
+                    // a concrete class with its own non-generic
+                    // get_Properties), so the proxy draw needs the same
+                    // Properties.Source forward as the concrete effect.
+                    // The old plain Ret dropped the fills.
+                    MethodDefinition? proxyGetPropsDef =
+                        (colorMgmtProxyRef as TypeDefinition)?.Methods.FirstOrDefault(
+                            m => m.Name == "get_Properties" && m.Parameters.Count == 0);
+                    bool canForwardProxy = canForward && proxyGetPropsDef != null;
+                    MethodReference? proxyGetPropsRef = canForwardProxy
+                        ? module.ImportReference(proxyGetPropsDef) : null;
+                    if (colorMgmtProxyRef != null)
+                    {
+                        var proxyLoc = new VariableDefinition(colorMgmtProxyRef);
+                        drawImage.Body.Variables.Add(proxyLoc);
+                        var haveProxy = il.Create(OpCodes.Nop);
+                        il.Emit(OpCodes.Ldarg_1);
+                        il.Emit(OpCodes.Isinst, colorMgmtProxyRef);
+                        il.Emit(OpCodes.Stloc, proxyLoc);
+                        il.Emit(OpCodes.Ldloc, proxyLoc);
+                        il.Emit(OpCodes.Brtrue, haveProxy);
+                        il.Emit(OpCodes.Br, realThrow);
+                        il.Append(haveProxy);
+                        if (canForwardProxy)
+                        {
+                            il.Emit(OpCodes.Ldloc, proxyLoc);
+                            il.Emit(OpCodes.Callvirt, proxyGetPropsRef);
+                            il.Emit(OpCodes.Castclass, propsRef);
+                            il.Emit(OpCodes.Callvirt, getSourceRef);
+                            il.Emit(OpCodes.Stloc, cmeAccLoc);
+                            il.Emit(OpCodes.Ldloca_S, cmeAccLoc);
+                            il.Emit(OpCodes.Call, accIsSetRef);
+                            il.Emit(OpCodes.Brfalse, doRet);
+                            il.Emit(OpCodes.Ldloca_S, cmeAccLoc);
+                            il.Emit(OpCodes.Call, accGetRef);
+                            il.Emit(OpCodes.Isinst, cpuCmdList);
+                            il.Emit(OpCodes.Stloc, cmeListLoc);
+                            il.Emit(OpCodes.Ldloc, cmeListLoc);
+                            il.Emit(OpCodes.Brfalse, doRet);
+                            il.Emit(OpCodes.Ldloc, cmeListLoc);
+                            il.Emit(OpCodes.Ldfld, earlyScratchF);
+                            il.Emit(OpCodes.Stloc, cmeScrLoc);
+                            il.Emit(OpCodes.Ldloc, cmeScrLoc);
+                            il.Emit(OpCodes.Brfalse, doRet);
+                            il.Emit(OpCodes.Ldarg_0);
+                            il.Emit(OpCodes.Ldfld, targetField);
+                            il.Emit(OpCodes.Ldloc, cmeScrLoc);
+                            il.Emit(OpCodes.Call, blitScratchCpu);
+                        }
+                        il.Emit(OpCodes.Br, doRet);
+                    }
+                    if (haveCme != null)
+                    {
+                        il.Append(haveCme);
+                        if (canForward)
+                        {
+                            il.Emit(OpCodes.Ldloc, cmeLoc);
+                            il.Emit(OpCodes.Callvirt, getPropsRef);
+                            il.Emit(OpCodes.Castclass, propsRef);
+                            il.Emit(OpCodes.Callvirt, getSourceRef);
+                            il.Emit(OpCodes.Stloc, cmeAccLoc);
+                            il.Emit(OpCodes.Ldloca_S, cmeAccLoc);
+                            il.Emit(OpCodes.Call, accIsSetRef);
+                            il.Emit(OpCodes.Brfalse, doRet);
+                            il.Emit(OpCodes.Ldloca_S, cmeAccLoc);
+                            il.Emit(OpCodes.Call, accGetRef);
+                            il.Emit(OpCodes.Isinst, cpuCmdList);
+                            il.Emit(OpCodes.Stloc, cmeListLoc);
+                            il.Emit(OpCodes.Ldloc, cmeListLoc);
+                            il.Emit(OpCodes.Brfalse, doRet);
+                            il.Emit(OpCodes.Ldloc, cmeListLoc);
+                            il.Emit(OpCodes.Ldfld, earlyScratchF);
+                            il.Emit(OpCodes.Stloc, cmeScrLoc);
+                            il.Emit(OpCodes.Ldloc, cmeScrLoc);
+                            il.Emit(OpCodes.Brfalse, doRet);
+                            il.Emit(OpCodes.Ldarg_0);
+                            il.Emit(OpCodes.Ldfld, targetField);
+                            il.Emit(OpCodes.Ldloc, cmeScrLoc);
+                            il.Emit(OpCodes.Call, blitScratchCpu);
+                        }
+                        il.Emit(OpCodes.Br, doRet);
+                    }
+                }
+                il.Append(doRet);
+                il.Append(realThrow);
+            }
             il.Emit(OpCodes.Ldstr, "CpuDrawingContext.DrawImage has no headless backend for ");
             il.Emit(OpCodes.Ldarg_1);
             il.Emit(OpCodes.Callvirt, module.ImportReference(typeof(object).GetMethod("GetType", Type.EmptyTypes)!));
@@ -13224,7 +13825,10 @@ public static class AssemblyRewriter
             il.Append(blit);
             var doBlit = il.Create(OpCodes.Nop);
             il.Emit(OpCodes.Ldloc, imgLoc);
-            il.Emit(OpCodes.Brtrue_S, doBlit);
+            // Long form: the doBlit target sits past the composite /
+            // procedural / proxy section, out of short-branch range
+            // (an explicit _S here silently truncated to a gap target).
+            il.Emit(OpCodes.Brtrue, doBlit);
             var tryProc = il.Create(OpCodes.Nop);
             // Composite item images (checker + thumbnail): draw both
             // before the procedural fallback swallows the thumbnail.
@@ -13244,11 +13848,36 @@ public static class AssemblyRewriter
             il.Emit(OpCodes.Call, drawCompositeCpu);
             il.Emit(OpCodes.Brfalse, tryProc);
             il.Emit(OpCodes.Ret);
+            var listLoc2 = new VariableDefinition(cpuCmdList);
+            var scratchHLoc = new VariableDefinition(module.TypeSystem.Int64);
+            drawImage.Body.Variables.Add(listLoc2);
+            drawImage.Body.Variables.Add(scratchHLoc);
+            drawImage.Body.InitLocals = true;
+            FieldDefinition scratchF2 = cpuCmdList.Fields.First(f => f.Name == "_scratch");
             il.Emit(OpCodes.Ldloc, srcLoc);
             il.Emit(OpCodes.Isinst, cpuCmdList);
-            il.Emit(OpCodes.Brfalse_S, tryProc);
-            // Unwrapped command lists already executed into the target: skip.
-            il.Emit(OpCodes.Ret);
+            il.Emit(OpCodes.Stloc, listLoc2);
+            il.Emit(OpCodes.Ldloc, listLoc2);
+            il.Emit(OpCodes.Brfalse, tryProc);
+            // Redirected lists carry their fills in the scratch surface:
+            // blit it back in desktop order. Lists without a scratch
+            // painted direct (or stayed empty): today's skip.
+            il.Emit(OpCodes.Ldloc, listLoc2);
+            il.Emit(OpCodes.Ldfld, scratchF2);
+            il.Emit(OpCodes.Stloc, scratchHLoc);
+            il.Emit(OpCodes.Ldloc, scratchHLoc);
+            il.Emit(OpCodes.Brfalse, imgDone);
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldfld, targetField);
+            il.Emit(OpCodes.Ldloc, scratchHLoc);
+            il.Emit(OpCodes.Call, blitScratchCpu);
+            il.Emit(OpCodes.Ldloc, scratchHLoc);
+            il.Emit(OpCodes.Call, freeScratchCpu);
+            il.Emit(OpCodes.Ldloc, listLoc2);
+            il.Emit(OpCodes.Ldc_I4_0);
+            il.Emit(OpCodes.Conv_I8);
+            il.Emit(OpCodes.Stfld, scratchF2);
+            il.Emit(OpCodes.Br, imgDone);
             il.Append(tryProc);
             il.Emit(OpCodes.Ldarg_0);
             il.Emit(OpCodes.Ldfld, targetField);
@@ -13997,8 +14626,8 @@ public static class AssemblyRewriter
         il.Emit(OpCodes.Isinst, cpuBrush);
         il.Emit(OpCodes.Stloc, brushLoc);
         il.Emit(OpCodes.Ldloc, brushLoc);
-        var doneLabel = il.Create(OpCodes.Nop);
-        il.Emit(OpCodes.Brfalse, doneLabel);
+        var notCpu = il.Create(OpCodes.Nop);
+        il.Emit(OpCodes.Brfalse, notCpu);
 
         il.Emit(OpCodes.Ldarg_0);
         il.Emit(OpCodes.Ldfld, targetField);
@@ -14106,6 +14735,141 @@ public static class AssemblyRewriter
             il.Emit(OpCodes.Ldfld, f);
         }
         il.Emit(OpCodes.Call, cpuFill);
+        var doneLabel = il.Create(OpCodes.Nop);
+        il.Emit(OpCodes.Br, doneLabel);
+        il.Append(notCpu);
+        if (!isEllipse)
+        {
+            // PDN's own SolidColorBrush (e.g. from SolidColorBrushCache,
+            // which bypasses the dc resource cache, as the Colors-window
+            // palette wells do) implements ISolidColorBrush but is not
+            // the synthesized CPU type: read it through the interface
+            // exactly like FillGeometry/FillEllipse instead of silently
+            // skipping. Other brush kinds keep today's silent skip.
+            TypeReference solidRef = OwnedCpuRef(module, "PaintDotNet.Direct2D1.ISolidColorBrush");
+            MethodReference getColor = VirtualCpuCall(module, "PaintDotNet.Direct2D1.ISolidColorBrush", "get_Color", 0);
+            MethodReference getOpacity = VirtualCpuCall(module, "PaintDotNet.Direct2D1.IDeviceBrush", "get_Opacity", 0);
+            MethodReference fillR = StructCpuGetter(module, "PaintDotNet.Imaging.ColorRgba128Float", "get_R");
+            MethodReference fillG = StructCpuGetter(module, "PaintDotNet.Imaging.ColorRgba128Float", "get_G");
+            MethodReference fillB = StructCpuGetter(module, "PaintDotNet.Imaging.ColorRgba128Float", "get_B");
+            MethodReference fillA = StructCpuGetter(module, "PaintDotNet.Imaging.ColorRgba128Float", "get_A");
+            TypeReference colorRef = LocalOrOwnedCpuRef(module, "PaintDotNet.Imaging.ColorRgba128Float");
+            var solidLoc = new VariableDefinition(solidRef);
+            var colorLoc = new VariableDefinition(colorRef);
+            var opLoc = new VariableDefinition(module.TypeSystem.Single);
+            var srLoc = new VariableDefinition(module.TypeSystem.Single);
+            var sgLoc = new VariableDefinition(module.TypeSystem.Single);
+            var sbLoc = new VariableDefinition(module.TypeSystem.Single);
+            var saLoc = new VariableDefinition(module.TypeSystem.Single);
+            foreach (var v in new[] { solidLoc, colorLoc, opLoc, srLoc, sgLoc, sbLoc, saLoc })
+                fill.Body.Variables.Add(v);
+            il.Emit(OpCodes.Ldarg_2);
+            il.Emit(OpCodes.Isinst, solidRef);
+            il.Emit(OpCodes.Stloc, solidLoc);
+            il.Emit(OpCodes.Ldloc, solidLoc);
+            var tryUi = il.Create(OpCodes.Nop);
+            il.Emit(OpCodes.Brfalse, tryUi);
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldfld, targetField);
+            MethodReference getX = StructCpuGetter(module, "PaintDotNet.Rendering.RectFloat", "get_X");
+            MethodReference getY = StructCpuGetter(module, "PaintDotNet.Rendering.RectFloat", "get_Y");
+            MethodReference getW = StructCpuGetter(module, "PaintDotNet.Rendering.RectFloat", "get_Width");
+            MethodReference getH = StructCpuGetter(module, "PaintDotNet.Rendering.RectFloat", "get_Height");
+            foreach (var g in new[] { getX, getY, getW, getH })
+            {
+                il.Emit(OpCodes.Ldarga_S, fill.Parameters[0]);
+                il.Emit(OpCodes.Call, g);
+            }
+            il.Emit(OpCodes.Ldloc, solidLoc);
+            il.Emit(OpCodes.Callvirt, getOpacity);
+            il.Emit(OpCodes.Stloc, opLoc);
+            il.Emit(OpCodes.Ldloc, solidLoc);
+            il.Emit(OpCodes.Callvirt, getColor);
+            il.Emit(OpCodes.Stloc, colorLoc);
+            il.Emit(OpCodes.Ldloca_S, colorLoc);
+            il.Emit(OpCodes.Call, fillR);
+            il.Emit(OpCodes.Stloc, srLoc);
+            il.Emit(OpCodes.Ldloca_S, colorLoc);
+            il.Emit(OpCodes.Call, fillG);
+            il.Emit(OpCodes.Stloc, sgLoc);
+            il.Emit(OpCodes.Ldloca_S, colorLoc);
+            il.Emit(OpCodes.Call, fillB);
+            il.Emit(OpCodes.Stloc, sbLoc);
+            il.Emit(OpCodes.Ldloca_S, colorLoc);
+            il.Emit(OpCodes.Call, fillA);
+            il.Emit(OpCodes.Stloc, saLoc);
+            il.Emit(OpCodes.Ldloc, opLoc);
+            il.Emit(OpCodes.Ldloc, srLoc);
+            il.Emit(OpCodes.Ldloc, sgLoc);
+            il.Emit(OpCodes.Ldloc, sbLoc);
+            il.Emit(OpCodes.Ldloc, saLoc);
+            il.Emit(OpCodes.Call, cpuFill);
+            il.Emit(OpCodes.Br, doneLabel);
+            il.Append(tryUi);
+            // PDN's own SolidColorBrush (UI.Media, e.g. from
+            // SolidColorBrushCache, which bypasses the dc resource
+            // cache) is neither the CPU type nor an ISolidColorBrush:
+            // read Color/Opacity straight off it. Fixture/small-app
+            // modules may lack the UI.Media universe entirely; skip the
+            // branch then (silent skip, as before) instead of failing
+            // the transform.
+            TypeReference? uiBrushRef = null;
+            MethodReference? getUiColor = null;
+            MethodReference? getUiOpacity = null;
+            try
+            {
+                uiBrushRef = OwnedCpuRef(module, "PaintDotNet.UI.Media.SolidColorBrush");
+                getUiColor = VirtualCpuCall(module, "PaintDotNet.UI.Media.SolidColorBrush", "get_Color", 0);
+                getUiOpacity = VirtualCpuCall(module, "PaintDotNet.UI.Media.Brush", "get_Opacity", 0);
+            }
+            catch (System.Exception) { }
+            if (uiBrushRef is null || getUiColor is null || getUiOpacity is null)
+            {
+                il.Emit(OpCodes.Br, doneLabel);
+            }
+            else
+            {
+            var uiLoc = new VariableDefinition(uiBrushRef);
+            fill.Body.Variables.Add(uiLoc);
+            il.Emit(OpCodes.Ldarg_2);
+            il.Emit(OpCodes.Isinst, uiBrushRef);
+            il.Emit(OpCodes.Stloc, uiLoc);
+            il.Emit(OpCodes.Ldloc, uiLoc);
+            il.Emit(OpCodes.Brfalse, doneLabel);
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldfld, targetField);
+            foreach (var g in new[] { getX, getY, getW, getH })
+            {
+                il.Emit(OpCodes.Ldarga_S, fill.Parameters[0]);
+                il.Emit(OpCodes.Call, g);
+            }
+            il.Emit(OpCodes.Ldloc, uiLoc);
+            il.Emit(OpCodes.Callvirt, getUiOpacity);
+            il.Emit(OpCodes.Conv_R4);
+            il.Emit(OpCodes.Stloc, opLoc);
+            il.Emit(OpCodes.Ldloc, uiLoc);
+            il.Emit(OpCodes.Callvirt, getUiColor);
+            il.Emit(OpCodes.Stloc, colorLoc);
+            il.Emit(OpCodes.Ldloca_S, colorLoc);
+            il.Emit(OpCodes.Call, fillR);
+            il.Emit(OpCodes.Stloc, srLoc);
+            il.Emit(OpCodes.Ldloca_S, colorLoc);
+            il.Emit(OpCodes.Call, fillG);
+            il.Emit(OpCodes.Stloc, sgLoc);
+            il.Emit(OpCodes.Ldloca_S, colorLoc);
+            il.Emit(OpCodes.Call, fillB);
+            il.Emit(OpCodes.Stloc, sbLoc);
+            il.Emit(OpCodes.Ldloca_S, colorLoc);
+            il.Emit(OpCodes.Call, fillA);
+            il.Emit(OpCodes.Stloc, saLoc);
+            il.Emit(OpCodes.Ldloc, opLoc);
+            il.Emit(OpCodes.Ldloc, srLoc);
+            il.Emit(OpCodes.Ldloc, sgLoc);
+            il.Emit(OpCodes.Ldloc, sbLoc);
+            il.Emit(OpCodes.Ldloc, saLoc);
+            il.Emit(OpCodes.Call, cpuFill);
+            }
+        }
         il.Append(doneLabel);
         il.Emit(OpCodes.Ret);
     }
@@ -14987,6 +15751,187 @@ public static class AssemblyRewriter
                 module.AssemblyReferences.Add(oleDbScope);
             }
             typeRef.Scope = oleDbScope;
+        }
+    }
+
+    public static void RedirectSpinDrawBackground(Mono.Cecil.ModuleDefinition module)
+    {
+        Mono.Cecil.AssemblyNameReference? formsScope = module.AssemblyReferences
+            .FirstOrDefault(r => r.Name == "WfWasm.WinForms" || r.Name == "System.Windows.Forms");
+        if (formsScope is null)
+            return;
+        Mono.Cecil.AssemblyNameReference? drawingScope = module.AssemblyReferences
+            .FirstOrDefault(r => r.Name == "WfWasm.Drawing" || r.Name == "System.Drawing" || r.Name == "System.Drawing.Common");
+        if (drawingScope is null)
+            return;
+        var painterType = new Mono.Cecil.TypeReference("System.Windows.Forms.VisualStyles", "VisualStyleSpinPainter", module, formsScope);
+        var rectType = new Mono.Cecil.TypeReference("System.Drawing", "Rectangle", module, drawingScope);
+        Mono.Cecil.MethodReference spin2 = new Mono.Cecil.MethodReference("DrawSpinBackground", module.TypeSystem.Void, painterType)
+        {
+            HasThis = false,
+        };
+        spin2.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Object));
+        spin2.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Object));
+        spin2.Parameters.Add(new Mono.Cecil.ParameterDefinition(rectType));
+        Mono.Cecil.MethodReference spin3 = new Mono.Cecil.MethodReference("DrawSpinBackground", module.TypeSystem.Void, painterType)
+        {
+            HasThis = false,
+        };
+        spin3.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Object));
+        spin3.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Object));
+        spin3.Parameters.Add(new Mono.Cecil.ParameterDefinition(rectType));
+        spin3.Parameters.Add(new Mono.Cecil.ParameterDefinition(rectType));
+        foreach (Mono.Cecil.TypeDefinition type in module.GetTypes())
+        {
+            if (type.FullName == "System.Windows.Forms.VisualStyles.VisualStyleSpinPainter")
+                continue;
+            foreach (Mono.Cecil.MethodDefinition method in type.Methods)
+            {
+                if (!method.HasBody)
+                    continue;
+                foreach (Mono.Cecil.Cil.Instruction instruction in method.Body.Instructions)
+                {
+                    if (instruction.OpCode != Mono.Cecil.Cil.OpCodes.Callvirt
+                        && instruction.OpCode != Mono.Cecil.Cil.OpCodes.Call)
+                        continue;
+                    if (instruction.Operand is not Mono.Cecil.MethodReference mr)
+                        continue;
+                    if (mr.Name != "DrawBackground"
+                        || mr.DeclaringType is null
+                        || mr.DeclaringType.FullName != "System.Windows.Forms.VisualStyles.VisualStyleRenderer")
+                        continue;
+                    if (mr.Parameters.Count == 2)
+                    {
+                        instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                        instruction.Operand = spin2;
+                    }
+                    else if (mr.Parameters.Count == 3)
+                    {
+                        instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                        instruction.Operand = spin3;
+                    }
+                }
+            }
+        }
+    }
+
+    public static void RedirectScrollButtonDraw(Mono.Cecil.ModuleDefinition module)
+    {
+        // ControlPaint.DrawScrollButton's classic branch ends in User32
+        // DrawFrameControl, a success-stubbed P/Invoke headless, so every
+        // classic scroll arrow paints nothing (PDN Colors-window numeric
+        // chips render white with no arrows; RenderWithVisualStyles is
+        // false headless so the themed path never runs). Retarget both
+        // static overloads to the fork's GDI+ scroll painter. The helper
+        // reference reuses the original call site's own parameter scopes,
+        // so the emitted signature is expressed in exactly the type
+        // identities the caller already resolves (same assemblies that
+        // let the original call bind); only the declaring type moves to
+        // the fork helper, which ships in that same forms assembly.
+        foreach (Mono.Cecil.TypeDefinition type in module.GetTypes())
+        {
+            if (type.FullName == "System.Windows.Forms.ControlPaintScrollPainter")
+                continue;
+            foreach (Mono.Cecil.MethodDefinition method in type.Methods)
+            {
+                if (!method.HasBody)
+                    continue;
+                foreach (Mono.Cecil.Cil.Instruction instruction in method.Body.Instructions)
+                {
+                    if (instruction.OpCode != Mono.Cecil.Cil.OpCodes.Call
+                        && instruction.OpCode != Mono.Cecil.Cil.OpCodes.Callvirt)
+                        continue;
+                    if (instruction.Operand is not Mono.Cecil.MethodReference mr)
+                        continue;
+                    if (mr.Name != "DrawScrollButton"
+                        || mr.DeclaringType is null
+                        || mr.DeclaringType.FullName != "System.Windows.Forms.ControlPaint")
+                        continue;
+                    int count = mr.Parameters.Count;
+                    if (count != 4 && count != 7)
+                        continue;
+                    var painterType = new Mono.Cecil.TypeReference(
+                        "System.Windows.Forms", "ControlPaintScrollPainter", module, mr.DeclaringType.Scope);
+                    var helper = new Mono.Cecil.MethodReference("DrawScrollButton", module.TypeSystem.Void, painterType)
+                    {
+                        HasThis = false,
+                    };
+                    foreach (var p in mr.Parameters)
+                        helper.Parameters.Add(new Mono.Cecil.ParameterDefinition(p.ParameterType));
+                    instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                    instruction.Operand = helper;
+                }
+            }
+        }
+    }
+
+    public static void FixCyotekColorGridBounds(Mono.Cecil.ModuleDefinition module)
+    {
+        // Cyotek ColorGrid GetColor/GetColorSource/SetColor guard
+        // `index > count` instead of `index >= count`: a click on the
+        // empty custom well (index == Colors.Count + CustomColors.Count)
+        // reports Source=Custom (not None), flows through the ColorIndex
+        // setter into GetColor(count) and throws IndexOutOfRangeException,
+        // so the selection never commits (0px change, caught IOORE).
+        // The vendored IL expresses the guard as
+        //   ldarg.1, <count>, <custom>, add, ble.s REAL
+        // falling through to the Empty/None/throw block; swapping ble to
+        // blt (same size, short form preserved) corrects the boundary.
+        // Only the guard ble is touched: it is identified by its
+        // fall-through block shape (Empty load / None+ret / throw of
+        // ArgumentOutOfRangeException), so the SetColor dispatch ble
+        // (fall-through = custom set_Item) is left alone.
+        if (module.GetType("Cyotek.Windows.Forms.ColorGrid") is null)
+            return;
+        foreach (Mono.Cecil.TypeDefinition type in module.GetTypes())
+        {
+            if (type.FullName != "Cyotek.Windows.Forms.ColorGrid")
+                continue;
+            foreach (Mono.Cecil.MethodDefinition method in type.Methods)
+            {
+                if (!method.HasBody)
+                    continue;
+                bool isGetColor = method.Name == "GetColor" && method.Parameters.Count == 1
+                    && method.Parameters[0].ParameterType.MetadataType == Mono.Cecil.MetadataType.Int32;
+                bool isGetSource = method.Name == "GetColorSource" && method.Parameters.Count == 1
+                    && method.Parameters[0].ParameterType.MetadataType == Mono.Cecil.MetadataType.Int32;
+                bool isSetColor = method.Name == "SetColor" && method.Parameters.Count == 2;
+                if (!isGetColor && !isGetSource && !isSetColor)
+                    continue;
+                var ins = method.Body.Instructions;
+                for (int k = 0; k < ins.Count; k++)
+                {
+                    var op = ins[k].OpCode;
+                    bool isBle = op == Mono.Cecil.Cil.OpCodes.Ble || op == Mono.Cecil.Cil.OpCodes.Ble_S;
+                    if (!isBle)
+                        continue;
+                    if (k + 1 >= ins.Count)
+                        continue;
+                    var next = ins[k + 1];
+                    bool guardFail = false;
+                    if (isGetColor && next.OpCode == Mono.Cecil.Cil.OpCodes.Ldsfld)
+                        guardFail = next.Operand is Mono.Cecil.FieldReference fr
+                            && fr.Name == "Empty"
+                            && fr.DeclaringType.FullName == "System.Drawing.Color";
+                    else if (isSetColor && next.OpCode == Mono.Cecil.Cil.OpCodes.Ldstr)
+                        guardFail = next.Operand is string s && s == "colorIndex";
+                    else if (isGetSource && next.OpCode == Mono.Cecil.Cil.OpCodes.Ldc_I4_0
+                        && k + 3 < ins.Count
+                        && ins[k + 2].OpCode == Mono.Cecil.Cil.OpCodes.Stloc_0
+                        && (ins[k + 3].OpCode == Mono.Cecil.Cil.OpCodes.Br_S || ins[k + 3].OpCode == Mono.Cecil.Cil.OpCodes.Br))
+                    {
+                        if (ins[k + 3].Operand is Mono.Cecil.Cil.Instruction end
+                            && ins[k].Operand is Mono.Cecil.Cil.Instruction target
+                            && ins.IndexOf(end) > ins.IndexOf(target))
+                            guardFail = true;
+                    }
+                    if (!guardFail)
+                        continue;
+                    ins[k].OpCode = op == Mono.Cecil.Cil.OpCodes.Ble_S
+                        ? Mono.Cecil.Cil.OpCodes.Blt_S
+                        : Mono.Cecil.Cil.OpCodes.Blt;
+                }
+            }
         }
     }
 

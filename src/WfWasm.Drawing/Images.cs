@@ -654,6 +654,49 @@ namespace System.Drawing
             PaintVersion++;
         }
 
+        // Retained scroll reuse (item 4): moves surface content by (dx,dy),
+        // so a scrolled control repaints only the exposed strip instead of
+        // the full surface. Pixel (x,y) moves to (x+dx,y+dy); exposed strips
+        // keep their old bytes (the caller repaints them). Array.Copy is
+        // memmove-safe for the overlapping same-array ranges. No-op for
+        // (0,0) with no version bump; callers must keep |dx|<width and
+        // |dy|<height (a fully-exposed surface has nothing to reuse).
+        public void ShiftPixels(int dx, int dy)
+        {
+            if (dx == 0 && dy == 0)
+                return;
+            int w = _width, h = _height;
+            if (w <= 0 || h <= 0)
+                return;
+            if (dy != 0)
+            {
+                if (dy > 0)
+                {
+                    for (int y = h - 1; y >= dy; y--)
+                        Array.Copy(_pixels, (y - dy) * w, _pixels, y * w, w);
+                }
+                else
+                {
+                    for (int y = 0; y < h + dy; y++)
+                        Array.Copy(_pixels, (y - dy) * w, _pixels, y * w, w);
+                }
+            }
+            if (dx != 0)
+            {
+                if (dx > 0)
+                {
+                    for (int y = 0; y < h; y++)
+                        Array.Copy(_pixels, y * w, _pixels, y * w + dx, w - dx);
+                }
+                else
+                {
+                    for (int y = 0; y < h; y++)
+                        Array.Copy(_pixels, y * w - dx, _pixels, y * w, w + dx);
+                }
+            }
+            PaintVersion++;
+        }
+
         // Single-pass int[] -> RGBA bytes (canvas upload path): no
         // LockBits pin/roundtrip, no BGRA intermediate, one read +
         // one write per pixel. Used by the host's layer extractor and

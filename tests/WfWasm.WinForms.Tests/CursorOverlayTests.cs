@@ -69,6 +69,26 @@ public sealed class CursorOverlayTests
     }
 
     [Fact]
+    public void Zero_Handle_Answers_Sentinel_Not_Throw()
+    {
+        // Browser emulation: third-party controls materialize cursors
+        // from native handles that do not exist headless (Telerik
+        // viewer cctor path); a zero handle must degrade to the
+        // sentinel, not abort construction into the ctor-guard path.
+        using var cursor = new System.Windows.Forms.Cursor(IntPtr.Zero);
+
+        Assert.Equal(new IntPtr(1), cursor.Handle);
+    }
+
+    [Fact]
+    public void Nonzero_Handle_Passes_Through()
+    {
+        using var cursor = new System.Windows.Forms.Cursor(new IntPtr(42));
+
+        Assert.Equal(new IntPtr(42), cursor.Handle);
+    }
+
+    [Fact]
     public void Stock_Cursors_Still_Resolve()
     {
         // Upstream Cursors.cs is untouched: IDC_* via LoadCursor plus

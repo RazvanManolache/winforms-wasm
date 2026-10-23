@@ -13,3 +13,8 @@ This project is a work in progress. The goal is to use AI to help adapt the plat
 There are no compatibility guarantees or release dates attached to this list. Small examples that expose a real behavior gap are especially useful contributions.
 
 The [22 October implementation review](review-2026-10-22.md#ordered-work-for-the-next-agent) orders the next work around real input/rendering correctness, text transforms, a production GPU-control pilot, platform persistence/dialogs, measured latency and reproducible acceptance.
+
+The [24 October checkpoint](update-2026-10-24-colors-and-panels.md) prioritizes
+command-list scratch ownership/finalization, exact-build layer/undo acceptance,
+portable full-suite fixtures and measured rich-text scrolling. Palette rendering
+progress and passing native contracts do not close those application tasks.

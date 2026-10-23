@@ -40,6 +40,25 @@ public sealed class IsolatedStorageFile : IDisposable
         return new IsolatedStorageFile(s_stores.GetOrAdd(key, _ => new ConcurrentDictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase)));
     }
 
+    // Legacy evidence-based entry points (control-bars window creation
+    // calls GetStore(scope, Type, Type) at boot; missing overload threw
+    // MissingMethodException and blanked the form). Desktop isolates by
+    // assembly evidence + scope; headless keeps the same separation with
+    // a session-scoped in-memory map keyed by scope, evidence types and
+    // calling assembly. No disk tier exists on WASM; contents live for
+    // the session like the GetUserStore* family above.
+    public static IsolatedStorageFile GetStore(IsolatedStorageScope scope, Type? domainEvidenceType)
+        => GetStore(scope, domainEvidenceType, null);
+
+    public static IsolatedStorageFile GetStore(IsolatedStorageScope scope, Type? domainEvidenceType, Type? assemblyEvidenceType)
+    {
+        string key = "store|" + scope + "|"
+            + (domainEvidenceType?.FullName ?? "null") + "|"
+            + (assemblyEvidenceType?.FullName ?? "null") + "|"
+            + (Assembly.GetCallingAssembly()?.FullName ?? "default");
+        return new IsolatedStorageFile(s_stores.GetOrAdd(key, _ => new ConcurrentDictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase)));
+    }
+
     internal static string Normalize(string path) => path.Replace('\\', '/').TrimStart('/');
 
     internal ConcurrentDictionary<string, byte[]> Files
@@ -65,6 +84,72 @@ public sealed class IsolatedStorageFile : IDisposable
     }
 
     public void Dispose() => _disposed = true;
+
+    public bool DirectoryExists(string path)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        string norm = Normalize(path).TrimEnd('/') + "/";
+        return s_dirs.ContainsKey(norm) || Files.Keys.Any(k => k.StartsWith(norm, StringComparison.OrdinalIgnoreCase));
+    }
+
+    public string[] GetFileNames() => GetFileNames("*");
+
+    public string[] GetFileNames(string searchPattern)
+    {
+        ArgumentNullException.ThrowIfNull(searchPattern);
+        var rx = SearchRegex(Normalize(searchPattern));
+        return Files.Keys
+            .Where(k => k.IndexOf('/') < 0 && rx.IsMatch(k))
+            .Select(k => k)
+            .ToArray();
+    }
+
+    public string[] GetDirectoryNames() => GetDirectoryNames("*");
+
+    public string[] GetDirectoryNames(string searchPattern)
+    {
+        ArgumentNullException.ThrowIfNull(searchPattern);
+        var rx = SearchRegex(Normalize(searchPattern).TrimEnd('/'));
+        var names = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string dir in s_dirs.Keys)
+        {
+            string name = dir.TrimEnd('/').TrimStart('/');
+            if (name.IndexOf('/') < 0 && rx.IsMatch(name))
+                names.Add(name);
+        }
+        foreach (string key in Files.Keys)
+        {
+            int slash = key.IndexOf('/');
+            if (slash > 0)
+            {
+                string top = key.Substring(0, slash);
+                if (rx.IsMatch(top))
+                    names.Add(top);
+            }
+        }
+        return names.ToArray();
+    }
+
+    public void DeleteFile(string path)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        if (!Files.TryRemove(Normalize(path), out _))
+            throw new IsolatedStorageException($"File not found: {path}");
+    }
+
+    public void DeleteDirectory(string path)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        string norm = Normalize(path).TrimEnd('/') + "/";
+        s_dirs.TryRemove(norm, out _);
+        foreach (string k in Files.Keys.Where(k => k.StartsWith(norm, StringComparison.OrdinalIgnoreCase)).ToArray())
+            Files.TryRemove(k, out _);
+    }
+
+    private static System.Text.RegularExpressions.Regex SearchRegex(string pattern) => new System.Text.RegularExpressions.Regex(
+        "^" + System.Text.RegularExpressions.Regex.Escape(pattern)
+            .Replace(@"\*", ".*").Replace(@"\?", ".") + "$",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 }
 
 public sealed class IsolatedStorageFileStream : Stream
@@ -76,6 +161,20 @@ public sealed class IsolatedStorageFileStream : Stream
     private bool _disposed;
 
     public IsolatedStorageFileStream(string path, FileMode mode, IsolatedStorageFile isf)
+        : this(path, mode, FileAccess.ReadWrite, isf)
+    {
+    }
+
+    // Legacy openers (control-bars layout persistence opens its state
+    // file with explicit access+share). FileShare is accepted and
+    // ignored: the session store is single-threaded headless, so there
+    // is no concurrent opener to share with or lock out.
+    public IsolatedStorageFileStream(string path, FileMode mode, FileAccess access, IsolatedStorageFile isf)
+        : this(path, mode, access, FileShare.None, isf)
+    {
+    }
+
+    public IsolatedStorageFileStream(string path, FileMode mode, FileAccess access, FileShare share, IsolatedStorageFile isf)
     {
         ArgumentNullException.ThrowIfNull(path);
         ArgumentNullException.ThrowIfNull(isf);
@@ -83,38 +182,39 @@ public sealed class IsolatedStorageFileStream : Stream
         _path = IsolatedStorageFile.Normalize(path);
         ConcurrentDictionary<string, byte[]> files = isf.Files;
         bool exists = files.TryGetValue(_path, out byte[]? current);
+        bool writable = access != FileAccess.Read;
         switch (mode)
         {
             case FileMode.CreateNew:
                 if (exists)
                     throw new IOException($"File already exists: {path}");
                 _data = new MemoryStream();
-                _writable = true;
+                _writable = writable;
                 break;
             case FileMode.Create:
                 _data = new MemoryStream();
-                _writable = true;
+                _writable = writable;
                 break;
             case FileMode.Open:
                 if (!exists)
                     throw new FileNotFoundException($"File not found: {path}");
                 _data = CopyOf(current!);
-                _writable = true;
+                _writable = writable;
                 break;
             case FileMode.OpenOrCreate:
                 _data = exists ? CopyOf(current!) : new MemoryStream();
-                _writable = true;
+                _writable = writable;
                 break;
             case FileMode.Truncate:
                 if (!exists)
                     throw new FileNotFoundException($"File not found: {path}");
                 _data = new MemoryStream();
-                _writable = true;
+                _writable = writable;
                 break;
             case FileMode.Append:
                 _data = exists ? CopyOf(current!) : new MemoryStream();
                 _data.Seek(0, SeekOrigin.End);
-                _writable = true;
+                _writable = writable;
                 break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(mode));

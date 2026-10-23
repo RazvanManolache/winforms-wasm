@@ -116,6 +116,50 @@ public sealed class WasmLayoutQueueTests
     }
 
     [Fact]
+    public void Post_Coalesce_Increments_TotalCoalesced()
+    {
+        WasmLayoutQueue.Clear();
+        long before = WasmLayoutQueue.TotalCoalesced;
+        using var control = new Control();
+        Action<object?> callback = _ => { };
+        object manager = new();
+        WasmLayoutQueue.Post(control, callback, new object?[] { manager });
+        WasmLayoutQueue.Post(control, callback, new object?[] { manager });
+        Assert.Equal(before + 1, WasmLayoutQueue.TotalCoalesced);
+        // The coalesced twin never reaches the queue.
+        Assert.Equal(1, WasmLayoutQueue.PendingCount);
+        Assert.Equal(1, WasmLayoutQueue.Drain());
+        WasmLayoutQueue.Clear();
+    }
+
+    [Fact]
+    public void Drain_Attributes_Invalidation_To_Callback()
+    {
+        WasmLayoutQueue.Clear();
+        bool saved = WasmFrameCounters.PerfEnabled;
+        WasmLayoutQueue.TakeCallbackInvalidated();
+        try
+        {
+            WasmFrameCounters.PerfEnabled = true;
+            using var control = new Control();
+            WasmLayoutQueue.Post(control, (Action)(() => WasmRepaintGate.MarkGlobalDirty()), null);
+            WasmLayoutQueue.Post(control, (Action)(() => { }), null);
+            Assert.Equal(2, WasmLayoutQueue.Drain());
+            var inv = WasmLayoutQueue.TakeCallbackInvalidated();
+            // The dirtying callback is attributed (marks > 0); the no-op
+            // callback issued no marks and is absent.
+            Assert.Single(inv);
+            Assert.True(inv.Values.Single() >= 1);
+            WasmLayoutQueue.Clear();
+        }
+        finally
+        {
+            WasmFrameCounters.PerfEnabled = saved;
+            WasmLayoutQueue.TakeCallbackInvalidated();
+        }
+    }
+
+    [Fact]
     public void Post_PassesArgs_AndWakesRepaint()
     {
         WasmLayoutQueue.Clear();

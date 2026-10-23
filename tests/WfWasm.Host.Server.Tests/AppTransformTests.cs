@@ -54,6 +54,42 @@ public sealed class AppTransformTests
         Assert.Equal(size, actualSize);
     }
 
+    [Theory]
+    [InlineData("PresentationCore.dll")] // SimpleFontObject virtuals over FontFamily (vtable setup)
+    [InlineData("PresentationFramework.dll")] // FixedDocumentDefaults.DefaultCellPadding is Thickness (field token)
+    public void Erp_Wpf_Prereq_Serves_Pristine_ILOnly(string name)
+    {
+        // Telerik fixed-doc model needs WPF types in the closure or the
+        // ERP viewer LoadDocument path dies in cctors (SimpleFontObject
+        // vtable TypeLoad, PageObject field-token BadImageFormat). Each
+        // pristine copy must be pure IL: a mixed-mode (C++/CLI) pristine
+        // aborts the WASM interp.
+        const string app = "telerik-erp";
+        Assert.True(AppTransform.TryGetSpec(app, out AppTransform.AppSpec? maybe));
+        Assert.True(maybe is not null);
+        AppTransform.AppSpec spec = maybe!;
+        Assert.Contains(name, spec.Pristine);
+        string pristinePath = spec.SourceOverride.TryGetValue(name, out string? alt)
+            ? alt
+            : Path.Combine(spec.Folder, name);
+        Assert.True(File.Exists(pristinePath), $"pristine missing: {pristinePath}");
+        using (var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(pristinePath))
+            Assert.True(asm.MainModule.Attributes.HasFlag(Mono.Cecil.ModuleAttributes.ILOnly),
+                "mixed-mode pristine aborts the WASM interp");
+        try
+        {
+            string dir = Path.Combine(AppTransform.CacheRoot, app);
+            if (Directory.Exists(dir))
+            {
+                foreach (string f in Directory.GetFiles(dir, "*" + Path.GetFileNameWithoutExtension(name) + "*"))
+                    File.Delete(f);
+            }
+        }
+        catch { }
+        byte[] served = AppTransform.TransformOrCached(app, name);
+        Assert.Equal(File.ReadAllBytes(pristinePath), served);
+    }
+
     [Fact]
     public void Erp_Content_Map_Covers_Data_Dir()
     {
@@ -65,13 +101,23 @@ public sealed class AppTransformTests
         var files = maybe!.ContentFiles;
         string data = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\ExamplesProjects\ERP\ERP.Client\Data");
         string[] onDisk = Directory.GetFiles(data, "*.json");
-        Assert.Equal(onDisk.Length, files.Count);
         foreach (string disk in onDisk)
         {
             string key = "Data/" + Path.GetFileName(disk);
             Assert.True(files.TryGetValue(key, out string? mapped), key);
             Assert.True(File.Exists(mapped), mapped);
         }
+        // rev176 staged the viewer Documents alongside the Data caches;
+        // the map must cover both families exactly.
+        string docs = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\ExamplesProjects\ERP\ERP.Client\Documents");
+        foreach (string pdf in new[] { "Documentation.pdf", "Instructions.pdf" })
+        {
+            string key = "Documents/" + pdf;
+            Assert.True(files.TryGetValue(key, out string? mapped), key);
+            Assert.True(File.Exists(mapped), mapped);
+            Assert.True(File.Exists(Path.Combine(docs, pdf)), pdf);
+        }
+        Assert.Equal(onDisk.Length + 2, files.Count);
     }
 
     [Fact]

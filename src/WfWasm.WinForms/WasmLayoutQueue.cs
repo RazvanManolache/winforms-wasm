@@ -16,6 +16,12 @@ public static class WasmLayoutQueue
     private static long s_totalPosted;
     private static long s_totalDrained;
     private static long s_totalFaulted;
+    // Coalesced identical reposts (item 3): the s_queued twin dedupe
+    // drops a repost while its twin is queued; counting proves the
+    // coalescing works and quantifies it. Zero behavior change.
+    private static long s_totalCoalesced;
+
+    public static long TotalCoalesced => Interlocked.Read(ref s_totalCoalesced);
 
     // Lifetime counters (host diagnostics/tests): a layout callback
     // that faults on every drain (Telerik's UpdateLayout reposts
@@ -55,7 +61,10 @@ public static class WasmLayoutQueue
         lock (s_queued)
         {
             if (!s_queued.Add((callback, arg0)))
+            {
+                Interlocked.Increment(ref s_totalCoalesced);
                 return null;
+            }
         }
         s_queue.Enqueue((callback, args));
         Interlocked.Increment(ref s_totalPosted);
@@ -140,11 +149,51 @@ public static class WasmLayoutQueue
                 s_cbCounts.Clear();
             }
             Console.WriteLine("[WasmLayoutQueue] callbacks: " + string.Join(" | ", top.Select(kv => kv.Key + "x" + kv.Value)));
+            KeyValuePair<string, long>[] inv;
+            lock (s_cbInvalidated)
+            {
+                inv = s_cbInvalidated.OrderByDescending(kv => kv.Value).Take(5).ToArray();
+                s_cbInvalidated.Clear();
+            }
+            if (inv.Length > 0)
+                Console.WriteLine("[WasmLayoutQueue] invalidated-by: " + string.Join(" | ", inv.Select(kv => kv.Key + "(+" + kv.Value + ")")));
         }
         catch { }
     }
 
+    // Perf item 3: which drained callbacks invalidate (marks issued
+    // while the callback ran). Same shape as the identity census so the
+    // probe can pair them frame by frame.
+    private static readonly Dictionary<string, long> s_cbInvalidated = new(StringComparer.Ordinal);
+
+    private static void NoteCallbackInvalidated(Delegate callback, int marks)
+    {
+        string name;
+        try
+        {
+            var m = callback.Method;
+            name = (m.DeclaringType is null ? "?" : m.DeclaringType.FullName) + "." + m.Name;
+        }
+        catch { name = "?"; }
+        lock (s_cbInvalidated)
+        {
+            s_cbInvalidated.TryGetValue(name, out long n);
+            s_cbInvalidated[name] = n + marks;
+        }
+    }
+
+    internal static Dictionary<string, long> TakeCallbackInvalidated()
+    {
+        lock (s_cbInvalidated)
+        {
+            var d = new Dictionary<string, long>(s_cbInvalidated, StringComparer.Ordinal);
+            s_cbInvalidated.Clear();
+            return d;
+        }
+    }
+
     // Runs at most maxCallbacks; returns how many ran. Posts made during
+
     // the drain wait for the next frame (desktop posts likewise take a
     // later loop turn), which also bounds the frame.
     public static int Drain(int maxCallbacks = 64)
@@ -159,8 +208,13 @@ public static class WasmLayoutQueue
             }
             ran++;
             Interlocked.Increment(ref s_totalDrained);
-            // Perf item 4 dirt-loop attribution (callback identity).
-            if (WasmFrameCounters.PerfEnabled)
+            // Perf item 3 drain/invalidation linkage: attribute the marks
+            // a callback issues to the callback itself (marks sampled before
+            // and after the invoke; the delta is what it dirtied).
+            // PerfEnabled-gated like every other census line.
+            bool attr = WasmFrameCounters.PerfEnabled;
+            int marksBefore = attr ? WasmRepaintGate.TotalMarks : 0;
+            if (attr)
                 NoteCallbackName(work.Callback);
             try { work.Callback.DynamicInvoke(work.Args); }
             catch (Exception ex)
@@ -177,6 +231,12 @@ public static class WasmLayoutQueue
                     try { Console.WriteLine($"[WasmLayoutQueue] callback fault #{faulted}: {shown.GetType().Name}: {shown.Message.Split('\n')[0]}"); }
                     catch { }
                 }
+            }
+            if (attr)
+            {
+                int dirtied = WasmRepaintGate.TotalMarks - marksBefore;
+                if (dirtied > 0)
+                    NoteCallbackInvalidated(work.Callback, dirtied);
             }
         }
         return ran;

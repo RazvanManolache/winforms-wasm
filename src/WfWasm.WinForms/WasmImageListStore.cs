@@ -206,6 +206,18 @@ internal static class WasmImageListStore
         }
     }
 
+    private static int s_drawMarkCount;
+
+    // Permanent paint-path census (same standing as [DRAWIMG]): who calls
+    // ImageList_Draw, with token/index/dims, and which calls miss.
+    // First 8 + every 128th; silent otherwise.
+    private static void NoteDrawMark(string msg)
+    {
+        int n = System.Threading.Interlocked.Increment(ref s_drawMarkCount);
+        if (n <= 8 || n % 128 == 0)
+            System.Console.WriteLine(msg);
+    }
+
     internal static int GetCount(nint token)
     {
         lock (s_lock)
@@ -264,8 +276,12 @@ internal static class WasmImageListStore
     // behavior for unmapped device contexts); unknown tokens fail.
     internal static bool Draw(nint token, int index, nint hdcValue, int x, int y, int dx, int dy)
     {
+        NoteDrawMark($"[IMGLIST] token=0x{token:X} index={index} dst={dx}x{dy}@({x},{y})");
         if (!TryGetImage(token, index, out System.Drawing.Bitmap? image) || image is null)
+        {
+            NoteDrawMark($"[IMGLIST] miss token=0x{token:X} index={index}");
             return false;
+        }
         System.Drawing.Graphics? graphics;
         try
         {

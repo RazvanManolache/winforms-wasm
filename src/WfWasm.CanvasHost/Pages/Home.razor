@@ -234,12 +234,7 @@
             await JS.InvokeVoidAsync("wfwasm.fitCanvas", "wfcanvas", _self);
             await JS.InvokeVoidAsync("wfwasm.installErrorReporting");
             if (AppContext.TryGetSwitch("WfWasm.PerfTimeline", out bool perfOn) && perfOn)
-                PerfTimeline.Enabled = true;
-                System.Windows.Forms.WasmFrameCounters.PerfEnabled = true;
-                global::System.Drawing.TextRasterCounters.PerfEnabled = true;
-        System.Windows.Forms.WasmFrameCounters.PerfEnabled = true;
-        WinFormsAppHost.HookFirstChance();
-        global::System.Drawing.TextRasterCounters.PerfEnabled = true;
+                SetDiagnosticsEnabled(true);
             _canvasReady = true;
             await LoadSelectionAsync();
         }
@@ -251,11 +246,32 @@
     {
         // Probe-driven gate (the shell iframe does not forward outer
         // query params, so ?perf=1 cannot reach the app).
-        PerfTimeline.Enabled = true;
-        System.Windows.Forms.WasmFrameCounters.PerfEnabled = true;
-        global::System.Drawing.TextRasterCounters.PerfEnabled = true;
-        WinFormsAppHost.HookFirstChance();
+        SetDiagnosticsEnabled(true);
         return Task.CompletedTask;
+    }
+
+    // UI-driven gate (shell diagnostics toggle): explicit enable/disable
+    // for A/B runs. Disable removes the FirstChance tap so the off state
+    // pays nothing per throw.
+    [JSInvokable]
+    public Task PerfSetEnabled(bool on)
+    {
+        SetDiagnosticsEnabled(on);
+        return Task.CompletedTask;
+    }
+
+    [JSInvokable]
+    public bool PerfGetEnabled() => PerfTimeline.Enabled;
+
+    private static void SetDiagnosticsEnabled(bool on)
+    {
+        PerfTimeline.Enabled = on;
+        System.Windows.Forms.WasmFrameCounters.PerfEnabled = on;
+        global::System.Drawing.TextRasterCounters.PerfEnabled = on;
+        if (on)
+            WinFormsAppHost.HookFirstChance();
+        else
+            WinFormsAppHost.UnhookFirstChance();
     }
 
     [JSInvokable]
@@ -418,6 +434,7 @@
             NRasterFull = System.Windows.Forms.WasmFrameCounters.NRasterFull,
             NRasterRegion = System.Windows.Forms.WasmFrameCounters.NRasterRegion,
             NBlit = System.Windows.Forms.WasmFrameCounters.NBlitClean,
+            NScrollShift = System.Windows.Forms.WasmFrameCounters.NScrollShift,
             RasterPx = System.Windows.Forms.WasmFrameCounters.RasterPx,
             UploadBytes = upBytes,
             JsonChars = jsonChars,

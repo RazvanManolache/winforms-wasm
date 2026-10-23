@@ -39,6 +39,43 @@ public sealed class WinFormsAppHost : IDisposable
 	private static readonly MethodInfo? s_onPaintBackgroundMethod = typeof(System.Windows.Forms.Control).GetMethod("OnPaintBackground", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
 	private static readonly ConcurrentDictionary<Type, bool> s_selfPaints = new ConcurrentDictionary<Type, bool>();
+
+	// Paint-routing rule (SfButton style images, 2026-10-23): a control
+	// whose type overrides OnPaint/OnPaintBackground owns its pixels
+	// (vendor theme states, style images); the flat fast-paths are only
+	// for exact framework types and non-overriding subclasses. Shared
+	// with RenderControls so dispatch and self-paint probing agree.
+	internal static bool TypeSelfPaints(Type type)
+	{
+		return s_selfPaints.GetOrAdd(type, delegate(Type type2)
+		{
+			MethodInfo method = type2.GetMethod("OnPaint", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+			if ((object)method != null && method.DeclaringType != typeof(System.Windows.Forms.Control))
+			{
+				return true;
+			}
+			MethodInfo method2 = type2.GetMethod("OnPaintBackground", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+			return (object)method2 != null && method2.DeclaringType != typeof(System.Windows.Forms.Control);
+		});
+	}
+
+	// Narrower routing rule for the flat Button fast-path: Button
+	// itself overrides OnPaint upstream, so the generic self-paint
+	// predicate cannot tell plain Button apart from a self-painted
+	// subclass. Managed paint wins only when the most-derived paint
+	// method is declared STRICTLY below Button (e.g. SfButton, which
+	// carries its images in the vendor style, not ButtonBase.Image).
+	internal static bool ButtonPaintsItself(Type type)
+	{
+		Type btn = typeof(System.Windows.Forms.Button);
+		if (type == null || type == btn || !btn.IsAssignableFrom(type))
+			return false;
+		MethodInfo onPaint = type.GetMethod("OnPaint", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+		if (onPaint != null && onPaint.DeclaringType != null && onPaint.DeclaringType != btn && btn.IsAssignableFrom(onPaint.DeclaringType))
+			return true;
+		MethodInfo onPaintBackground = type.GetMethod("OnPaintBackground", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+		return onPaintBackground != null && onPaintBackground.DeclaringType != null && onPaintBackground.DeclaringType != btn && btn.IsAssignableFrom(onPaintBackground.DeclaringType);
+	}
 	private static readonly ConcurrentDictionary<Type, bool> s_nonFlatPaints = new ConcurrentDictionary<Type, bool>();
 
 	private static readonly ConcurrentDictionary<string, byte> s_selfPaintLogged = new ConcurrentDictionary<string, byte>();
@@ -100,13 +137,30 @@ public sealed class WinFormsAppHost : IDisposable
 		px = System.Threading.Interlocked.Exchange(ref s_slowPx, 0);
 	}
 	private static int s_firstChanceHooked;
+	private static System.EventHandler<System.Runtime.ExceptionServices.FirstChanceExceptionEventArgs>? s_firstChanceHandler;
 
 	internal static void HookFirstChance()
 	{
 		if (System.Threading.Interlocked.Exchange(ref s_firstChanceHooked, 1) != 0)
 		    return;
-		System.AppDomain.CurrentDomain.FirstChanceException += (_, _) =>
-		    System.Threading.Interlocked.Increment(ref s_firstChanceCount);
+		var handler = new System.EventHandler<System.Runtime.ExceptionServices.FirstChanceExceptionEventArgs>((_, _) =>
+		    System.Threading.Interlocked.Increment(ref s_firstChanceCount));
+	s_firstChanceHandler = handler;
+		System.AppDomain.CurrentDomain.FirstChanceException += handler;
+	}
+
+	// Diagnostics off-switch: removes the FirstChance tap so the default-off
+	// state pays nothing per throw (not even the gated increment).
+	internal static void UnhookFirstChance()
+	{
+		if (System.Threading.Interlocked.Exchange(ref s_firstChanceHooked, 0) == 0)
+		    return;
+		try
+		{
+		    var handler = System.Threading.Volatile.Read(ref s_firstChanceHandler);
+		    if (handler is not null)
+		        System.AppDomain.CurrentDomain.FirstChanceException -= handler;
+	} catch { }
 	}
 
 	internal static long TakeFirstChance() =>
@@ -2476,6 +2530,17 @@ public sealed class WinFormsAppHost : IDisposable
 				Console.WriteLine($"{value}   [Item] {item.GetType().Name} '{item.Name}' Text='{item.Text}' Bounds={item.Bounds} Visible={item.Visible}");
 			}
 		}
+		// Palette wells diagnosis (read-only): palette controls expose
+		// Colors; reporting the count makes empty-vs-transparent
+		// decidable from the tree dump.
+		try
+		{
+			object? colors = c.GetType().GetProperty("Colors")?.GetValue(c);
+			int n = (int?)colors?.GetType().GetProperty("Count")?.GetValue(colors) ?? -1;
+			if (n >= 0)
+				Console.WriteLine($"{value}  [Colors] Count={n}");
+		}
+		catch { }
 		foreach (System.Windows.Forms.Control control in c.Controls)
 		{
 			DumpControlTree(control, indent + 1);
@@ -2726,13 +2791,16 @@ public sealed class WinFormsAppHost : IDisposable
 		return num;
 	}
 
-	internal static void RecordBitmap(object layerKey, ICanvas canvas, byte[] rgba, int w, int h, float x, float y, float dw, float dh)
+	internal static void RecordBitmap(object layerKey, ICanvas canvas, byte[] rgba, int w, int h, float x, float y, float dw, float dh, bool keepRetained = false)
 	{
 		if (canvas is ICanvasRenderer { SupportsBitmapLayers: not false } canvasRenderer)
 		{
 			string text = LayerIdFor(layerKey);
 			// A full Def replaces the patch base: drop any retained
-			// self-paint surface (the self-paint path re-stores below).
+			// self-paint surface (the self-paint path re-stores below),
+			// unless the caller just painted over that surface in place
+			// (scroll-shift reuse keeps the object it shifted and repainted).
+			if (!keepRetained)
 			lock (s_retainedPaint)
 			{
 				if (s_retainedPaint.TryGetValue(text, out Bitmap? stale))
@@ -3399,7 +3467,13 @@ public sealed class WinFormsAppHost : IDisposable
 			int num2 = parentAbsY + control.Top;
 			int width = control.Width;
 			int height = control.Height;
-			if (control is System.Windows.Forms.Button button)
+			// Self-painted Button subclasses (SfButton: overrides OnPaint
+			// and carries its images in the vendor style, not
+			// ButtonBase.Image) fall through to the managed-paint path
+			// below; the flat fast-path is only for exact Button and
+			// non-overriding subclasses, which have no managed image
+			// source to lose.
+			if (control is System.Windows.Forms.Button button && !ButtonPaintsItself(control.GetType()))
 			{
 				uint rgba = ((button == _pressedButton) ? 3437557759u : ToRgba(button.BackColor, 3789677055u));
 				canvas.FillRoundedRectangle(num, num2, width, height, 3f, rgba);
@@ -3655,7 +3729,15 @@ public sealed class WinFormsAppHost : IDisposable
 						// back to the raw read; the working path is never
 						// at risk. (Per-frame cost only during drags.)
 						byte[]? array = null;
-						if (_isDrawingOnDocument)
+						// The raw read below returns the ACTIVE layer surface
+						// only: with 2+ layers it shows just the active one,
+						// so a fresh transparent layer (Ctrl+Shift+N) blanks
+						// the canvas and hides the stroke underneath. Prefer
+						// the vendor composite whenever the document has more
+						// than one layer; single-layer reads stay on the
+						// cheap raw path. Any composite failure falls back
+						// to the raw read (working path never at risk).
+						if (_isDrawingOnDocument || GetDocumentLayerCount(activeDocumentWorkspace) > 1)
 						{
 							array = ExtractCompositedRgba(activeDocumentWorkspace, docW, docH);
 						}
@@ -4350,8 +4432,24 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 		try
 		{
-			int controlAbsX = GetControlAbsX(target, _activeForm.Location.X);
-			int controlAbsY = GetControlAbsY(target, _activeForm.Location.Y + ChromeHeight(_activeForm));
+			// Anchor to the target's own top-level window: modal/dock
+			// windows sit at different origins than _activeForm, and the
+			// old anchor shifted every delivered Location by the
+			// inter-form delta (ColorGrid cell clicks indexed outside the
+			// grid and died as swallowed IOOREs). Nested (MDI-child)
+			// targets keep the legacy anchor.
+			int baseX = _activeForm.Location.X;
+			int baseY = _activeForm.Location.Y + ChromeHeight(_activeForm);
+			System.Windows.Forms.Form? ownerForm = target as System.Windows.Forms.Form;
+			for (System.Windows.Forms.Control? c = target.Parent; c != null && ownerForm == null; c = c.Parent)
+				if (c is System.Windows.Forms.Form f) ownerForm = f;
+			if (ownerForm is not null && ownerForm.Parent is null)
+			{
+				baseX = ownerForm.Location.X;
+				baseY = ownerForm.Location.Y + ChromeHeight(ownerForm);
+			}
+			int controlAbsX = GetControlAbsX(target, baseX);
+			int controlAbsY = GetControlAbsY(target, baseY);
 			System.Windows.Forms.MouseEventArgs e = new System.Windows.Forms.MouseEventArgs(buttons, clicks, x - controlAbsX, y - controlAbsY, delta);
 			method.Invoke(target, new object[1] { e });
 		}
@@ -5669,6 +5767,8 @@ public sealed class WinFormsAppHost : IDisposable
 		System.Drawing.Rectangle rc = System.Drawing.Rectangle.Intersect(dirty.Value, new System.Drawing.Rectangle(0, 0, w, h));
 		if (rc.Width <= 0 || rc.Height <= 0)
 			return BlitKnownLayer(canvas, id, absX, absY, w, h);
+		if (TryShiftRetained(canvas, c, retained, absX, absY, w, h, dirty.Value, clearFlag))
+			return true;
 		if ((long)rc.Width * rc.Height * 10 >= (long)w * h * 9)
 		{
 			return false;
@@ -5702,6 +5802,67 @@ public sealed class WinFormsAppHost : IDisposable
 		if (System.Windows.Forms.WasmFrameCounters.PerfEnabled)
 			System.Windows.Forms.WasmFrameCounters.CountRasterRegion((long)rc.Width * rc.Height);
 		return true;
+	}
+
+	// Scroll reuse: when the drain consumed a same-frame scroll shift for
+	// a control whose retained surface matches the current size, the
+	// retained pixels move in place (ShiftPixels memmove) and only the
+	// union of the prior dirty rect, its shifted position, and the fresh
+	// exposed strip repaints. Edit rects are ambiguous-frame (pre- or
+	// post-scroll coordinates), so all three repaint: a superset repaint
+	// is always exact. Whole-control marks, missing or mismatched records,
+	// zero/oversize/diagonal/multi shifts, and empty or near-full unions
+	// return false and the caller runs the full path. The full-surface
+	// re-Def keeps the retained object (keepRetained): disposing here
+	// would strand the reference the paint just used.
+	private static bool TryShiftRetained(ICanvas canvas, System.Windows.Forms.Control c, Bitmap retained, int absX, int absY, int w, int h, System.Drawing.Rectangle dirty, bool clearFlag)
+	{
+		if (!System.Windows.Forms.WasmRepaintGate.TakeScrollShift(c, out int dx, out int dy))
+			return false;
+		System.Drawing.Rectangle? narrow = ComputeScrollNarrow(w, h, dx, dy, dirty);
+		if (narrow is null)
+			return false;
+		System.Drawing.Rectangle rc = narrow.Value;
+		retained.ShiftPixels(dx, dy);
+		if (!PaintRegionPixels(c, retained, rc, clearFlag))
+			return false;
+		byte[]? full = ExtractBitmapRgba(retained);
+		if (full is null)
+			return false;
+		RecordBitmap(c, canvas, full, w, h, absX, absY, w, h, keepRetained: true);
+		if (System.Windows.Forms.WasmFrameCounters.PerfEnabled)
+		{
+			System.Windows.Forms.WasmFrameCounters.CountRasterRegion((long)rc.Width * rc.Height);
+			System.Windows.Forms.WasmFrameCounters.AddBytesExtracted(full.Length);
+			System.Windows.Forms.WasmFrameCounters.CountScrollShift();
+		}
+		return true;
+	}
+
+	internal static System.Drawing.Rectangle? ComputeScrollNarrow(int w, int h, int dx, int dy, System.Drawing.Rectangle dirty)
+	{
+		if ((dx == 0 && dy == 0) || (dx != 0 && dy != 0))
+			return null;
+		if (Math.Abs(dx) >= w || Math.Abs(dy) >= h)
+			return null;
+		// Fresh exposed strip, post-scroll frame coordinates.
+		System.Drawing.Rectangle strip = dx > 0
+			? new System.Drawing.Rectangle(0, 0, dx, h)
+			: dx < 0
+				? new System.Drawing.Rectangle(w + dx, 0, -dx, h)
+				: dy > 0
+					? new System.Drawing.Rectangle(0, 0, w, dy)
+					: new System.Drawing.Rectangle(0, h + dy, w, -dy);
+		System.Drawing.Rectangle moved = dirty;
+		moved.Offset(dx, dy);
+		System.Drawing.Rectangle union = System.Drawing.Rectangle.Union(System.Drawing.Rectangle.Union(dirty, moved), strip);
+		union.Intersect(new System.Drawing.Rectangle(0, 0, w, h));
+		if (union.Width <= 0 || union.Height <= 0)
+			return null;
+		// Near-full unions save nothing over the full path.
+		if ((long)union.Width * union.Height * 10 >= (long)w * h * 9)
+			return null;
+		return union;
 	}
 
 	private static bool PaintRegionPixels(System.Windows.Forms.Control c, Bitmap retained, System.Drawing.Rectangle rc, bool clearFlag)
@@ -6001,16 +6162,7 @@ public sealed class WinFormsAppHost : IDisposable
 			return false;
 		}
 		Type type = c.GetType();
-		if (!s_selfPaints.GetOrAdd(type, delegate(Type type2)
-		{
-			MethodInfo method = type2.GetMethod("OnPaint", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-			if ((object)method != null && method.DeclaringType != typeof(System.Windows.Forms.Control))
-			{
-				return true;
-			}
-			MethodInfo method2 = type2.GetMethod("OnPaintBackground", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-			return (object)method2 != null && method2.DeclaringType != typeof(System.Windows.Forms.Control);
-		}) && c.BackgroundImage == null)
+		if (!TypeSelfPaints(type) && c.BackgroundImage == null)
 		{
 			return false;
 		}
@@ -6542,6 +6694,21 @@ public sealed class WinFormsAppHost : IDisposable
 			}
 		}
 		return null;
+	}
+
+	// Cheap layer census for the canvas read path: the raw surface read
+	// below only sees the active layer, so 2+ layers must take the vendor
+	// composite. Unknown shapes report 1 (raw path, status quo ante).
+	private static int GetDocumentLayerCount(object? activeDw)
+	{
+		try
+		{
+			object? doc = activeDw?.GetType().GetProperty("Document", BindingFlags.Instance | BindingFlags.Public)?.GetValue(activeDw);
+			object? layers = doc?.GetType().GetProperty("Layers", BindingFlags.Instance | BindingFlags.Public)?.GetValue(doc);
+			if (layers is IList list) return list.Count;
+		}
+		catch { }
+		return 1;
 	}
 
 	private static object? GetActiveDocumentSurface(object? activeDw, out int docW, out int docH)

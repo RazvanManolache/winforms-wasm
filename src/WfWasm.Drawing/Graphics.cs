@@ -841,6 +841,11 @@ namespace System.Drawing
             if (!TryBoundRange(x, x + w, fx0, fx1, out int x0, out int x1) ||
                 !TryBoundRange(y, y + h, fy0, fy1, out int y0, out int y1))
                 return;
+            // Empty device clip: the per-pixel loop below would test every
+            // pixel and write none (same for the version bump). Return
+            // before brush resolution.
+            if (_clip is not null && _clip.IsEmpty(null))
+                return;
             // Perf item 4 op census.
             if (TextRasterCounters.PerfEnabled)
             {
@@ -853,13 +858,6 @@ namespace System.Drawing
             {
                 FillTextureFast(tile, x0, y0, x1, y1);
                 return;
-            }
-            // Big-fill attribution (size + color + caller) for flat fills.
-            if (TextRasterCounters.PerfEnabled && prepared.TryGetFlatColor(out Color bigFlat))
-            {
-                long bigPx = (long)(x1 - x0) * (y1 - y0);
-                if (bigPx > 50000)
-                    TextRasterCounters.NoteBigFill(bigPx, TextRasterCounters.CaptureTelerikCaller(), bigFlat.ToArgb());
             }
             // Redundant-fill skip (per-surface, version-guarded): a flat
             // fill whose ARGB exactly matches the surface's own clear color,
@@ -878,29 +876,63 @@ namespace System.Drawing
                     && _target is not null && TextRasterCounters.TrySkipClearFill(_target, skipFlat.ToArgb()))
                     return;
             }
+            // Big-fill attribution (size + color + caller) for flat fills.
+            // Runs after the no-op skips above so skipped fills never pay
+            // a StackTrace walk: only fills that will actually write are
+            // attributed.
+            if (TextRasterCounters.PerfEnabled && prepared.TryGetFlatColor(out Color bigFlat))
+            {
+                long bigPx = (long)(x1 - x0) * (y1 - y0);
+                if (bigPx > 50000)
+                    TextRasterCounters.NoteBigFill(bigPx, TextRasterCounters.CaptureTelerikCaller(), bigFlat.ToArgb());
+            }
             // Perf: flat-color fills (RTE per-block backgrounds: 46M px/frame
             // through per-pixel PutPixel) take a memset path. Transparent
             // SourceOver is a no-op (the old loop rewrote identical pixels);
-            // opaque-or-SourceCopy with no clip is a per-row Array.Fill;
-            // anything else keeps the exact per-pixel loop.
+            // opaque-or-SourceCopy writes the clip intersection: with no
+            // clip (or an infinite one) that is the frame bounds, with a
+            // single integer device rect it is the rect intersection (the
+            // exact set the per-pixel loop would write: same Contains
+            // test per pixel, same half-open bounds). Multi-rect unions
+            // and fractional rects keep the exact per-pixel loop; empty
+            // intersections return with no writes and no version bump.
             if (prepared.TryGetFlatColor(out Color flat) && _target is not null)
             {
                 bool fillCopy = CompositingMode == CompositingMode.SourceCopy;
                 if (flat.A == 0 && !fillCopy)
                     return;
-                if ((flat.A == 255 || fillCopy) && _clip is null)
+                if (flat.A == 255 || fillCopy)
                 {
-                    int[] fillDst = _target.Pixels;
-                    int fillW = _target.Width;
-                    int argb = flat.ToArgb();
-                    int fw = x1 - x0;
-                    if (x0 == 0 && x1 == fillW)
-                        System.Array.Fill(fillDst, argb, y0 * fillW, (y1 - y0) * fillW);
-                    else
-                        for (int fy = y0; fy < y1; fy++)
-                        System.Array.Fill(fillDst, argb, fy * fillW + x0, fw);
-                    _target.PaintVersion += (y1 - y0) * fw;
-                    return;
+                    int mx0 = x0, my0 = y0, mx1 = x1, my1 = y1;
+                    bool flatMemset = true;
+                    if (_clip is not null && !_clip.IsInfinite(null))
+                    {
+                        if (_clip.TryGetIntRect(out int cx0, out int cy0, out int cx1, out int cy1))
+                        {
+                            mx0 = Math.Max(x0, cx0);
+                            mx1 = Math.Min(x1, cx1);
+                            my0 = Math.Max(y0, cy0);
+                            my1 = Math.Min(y1, cy1);
+                            if (mx1 <= mx0 || my1 <= my0)
+                                return;
+                        }
+                        else
+                            flatMemset = false;
+                    }
+                    if (flatMemset)
+                    {
+                        int[] fillDst = _target.Pixels;
+                        int fillW = _target.Width;
+                        int argb = flat.ToArgb();
+                        int fw = mx1 - mx0;
+                        if (mx0 == 0 && mx1 == fillW)
+                            System.Array.Fill(fillDst, argb, my0 * fillW, (my1 - my0) * fillW);
+                        else
+                            for (int fy = my0; fy < my1; fy++)
+                                System.Array.Fill(fillDst, argb, fy * fillW + mx0, fw);
+                        _target.PaintVersion += (my1 - my0) * fw;
+                        return;
+                    }
                 }
             }
 
@@ -1585,6 +1617,21 @@ namespace System.Drawing
             DrawImage(image, new RectangleF(destRect.X, destRect.Y, destRect.Width, destRect.Height),
                 new RectangleF(srcRect.X, srcRect.Y, srcRect.Width, srcRect.Height), srcUnit);
 
+        private static int s_drawImgCount;
+
+        // Permanent paint-path census (same standing as [RESIMG]): which
+        // image draws reach the device funnel, with source and dest sizes.
+        // First 8 + every 128th; silent otherwise.
+        private static void NoteDrawImage(Image image, float dw, float dh)
+        {
+            int n = System.Threading.Interlocked.Increment(ref s_drawImgCount);
+            if (n <= 8 || n % 128 == 0)
+            {
+                string src = image is Bitmap bmp ? bmp.Width + "x" + bmp.Height : image.GetType().Name;
+                System.Console.WriteLine($"[DRAWIMG] src={src} dest={dw}x{dh}");
+            }
+        }
+
         public void DrawImage(Image image, RectangleF destRect, RectangleF srcRect, GraphicsUnit srcUnit)
         {
             ArgumentNullException.ThrowIfNull(image);
@@ -2054,6 +2101,9 @@ namespace System.Drawing
         // clamp to 0 either way.
         private void Blit(Bitmap src, float sx, float sy, float sw, float sh, int dx, int dy, int dw, int dh)
         {
+            // Census first: attempts with empty rects return silently below,
+            // and those are exactly the layout bugs this marker hunts.
+            NoteDrawImage(src, dw, dh);
             if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0)
                 return;
             if (IsDisplay) { RecordDisplayBlit(src, sx, sy, sw, sh, dx, dy, dw, dh); return; }
@@ -2258,6 +2308,9 @@ namespace System.Drawing
             if (!WrapsText(format))
             maxW = 2048;
             BrowserText.Raster? raster = BrowserText.TryRaster(text, font, DpiY, Math.Min(maxW, 2048));
+            // TEMP-DIAG(headtext): remove after the mosaic root cause lands.
+            if (text == "RGB" || text == "HSV" || text == "OPACITY - ALPHA")
+                System.Console.WriteLine("[D2DTXT] text='" + text + "' raster=" + (raster is null ? "null" : raster.Width + "x" + raster.Height) + " dpi=" + DpiY + " maxW=" + Math.Min(maxW, 2048) + " target=" + (_target is null ? "null" : _target.Width + "x" + _target.Height) + " css=" + BrowserText.ToCss(font, DpiY));
             if (raster is null)
                 throw new NotSupportedException("Browser text raster failed.");
             // Perf item 4: blend volume (is the invoke bucket pixel-bound?).

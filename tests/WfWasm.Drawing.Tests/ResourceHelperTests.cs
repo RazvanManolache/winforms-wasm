@@ -98,6 +98,181 @@ public sealed class ResourceHelperTests
         Assert.Equal(1, decoded.Height);
     }
 
+    // Designer Point/Size values ride BinaryFormatter user-type entries
+    // (ResourceWriter cannot emit those on .NET 9+, so the DRR-stamped
+    // V2 stream is crafted by hand, like the bitmap fixtures): the raw
+    // walk must recover the exact values with no deserializer and no
+    // first-chance throw, or daycontainer-style layout collapses to
+    // defaults. Numbers are the live grp2Calendar entries.
+    // Regression: blank Group2 Calendar window with spilled day cells
+    // ([RESMISS] daycontainer.Location/Size, DeserializingResourceReader
+    // NSE xN at boot).
+    [Fact]
+    public void SafeGetObject_Decodes_Point_In_DeserializingReader_Stream()
+    {
+        var rm = new ResourceManager("Fake.NrbfPoint", BuildStampedAssembly("Fake.NrbfPoint",
+            ModernReaderStamp,
+            ("daycontainer.Location", PointType, NrbfFixtures.PointPayload(20, 119), null)));
+        int nse = CountFirstChance<NotSupportedException>(() =>
+        {
+            var decoded = Assert.IsType<Point>(WfResourceHelper.SafeGetObject(rm, "daycontainer.Location"));
+            Assert.Equal(new Point(20, 119), decoded);
+        });
+        Assert.Equal(0, nse);
+    }
+
+    [Fact]
+    public void SafeGetObject_Decodes_Size_In_DeserializingReader_Stream()
+    {
+        var rm = new ResourceManager("Fake.NrbfSize", BuildStampedAssembly("Fake.NrbfSize",
+            ModernReaderStamp,
+            ("daycontainer.Size", SizeType, NrbfFixtures.SizePayload(1104, 711), null)));
+        int nse = CountFirstChance<NotSupportedException>(() =>
+        {
+            var decoded = Assert.IsType<Size>(WfResourceHelper.SafeGetObject(rm, "daycontainer.Size"));
+            Assert.Equal(new Size(1104, 711), decoded);
+        });
+        Assert.Equal(0, nse);
+    }
+
+    // The live shape (captured grp2Calendar blobs: 0x03 + "20, 119").
+    [Fact]
+    public void SafeGetObject_Decodes_ConverterString_Point()
+    {
+        var rm = new ResourceManager("Fake.NrbfPointText", BuildStampedAssembly("Fake.NrbfPointText",
+            ModernReaderStamp,
+            ("daycontainer.Location", PointType, NrbfFixtures.PointText(20, 119), null)));
+        int nse = CountFirstChance<NotSupportedException>(() =>
+        {
+            var decoded = Assert.IsType<Point>(WfResourceHelper.SafeGetObject(rm, "daycontainer.Location"));
+            Assert.Equal(new Point(20, 119), decoded);
+        });
+        Assert.Equal(0, nse);
+    }
+
+    [Fact]
+    public void SafeGetObject_Decodes_ConverterString_Size()
+    {
+        var rm = new ResourceManager("Fake.NrbfSizeText", BuildStampedAssembly("Fake.NrbfSizeText",
+            ModernReaderStamp,
+            ("daycontainer.Size", SizeType, NrbfFixtures.SizeText(1104, 711), null)));
+        int nse = CountFirstChance<NotSupportedException>(() =>
+        {
+            var decoded = Assert.IsType<Size>(WfResourceHelper.SafeGetObject(rm, "daycontainer.Size"));
+            Assert.Equal(new Size(1104, 711), decoded);
+        });
+        Assert.Equal(0, nse);
+    }
+
+    [Fact]
+    public void SafeGetObject_Rejects_WrongClass_Value_Payload()
+    {
+        // Point bytes filed under a Rectangle entry: the class gate must
+        // miss (null like other non-image user types), never fabricate.
+        var rm = new ResourceManager("Fake.NrbfWrongClass", BuildStampedAssembly("Fake.NrbfWrongClass",
+            ModernReaderStamp,
+            ("rect.Box", RectangleType, NrbfFixtures.PointPayload(1, 2), null)));
+        Assert.Null(WfResourceHelper.SafeGetObject(rm, "rect.Box"));
+    }
+
+    [Fact]
+    public void SafeGetObject_Rejects_Truncated_Value_Payload()
+    {
+        byte[] full = NrbfFixtures.SizePayload(10, 20);
+        byte[] cut = new byte[full.Length - 3];
+        Array.Copy(full, cut, cut.Length);
+        var rm = new ResourceManager("Fake.NrbfTruncated", BuildStampedAssembly("Fake.NrbfTruncated",
+            ModernReaderStamp,
+            ("daycontainer.Size", SizeType, cut, null)));
+        Assert.Null(WfResourceHelper.SafeGetObject(rm, "daycontainer.Size"));
+    }
+
+    // Modern vendor streams stamp DeserializingResourceReader (with the
+    // vendor reference-assembly version, here 4.0.0.0 like the real
+    // Syncfusion payloads): the legacy reader throws NSE on them and the
+    // named reader exposes no raw data, so the raw walk must recover the
+    // entry with pixel-identical bytes and no first-chance throw.
+    // Headless cannot resolve the real reader (ASP.NET-only assembly),
+    // which is exactly why the walk exists: no reader is involved.
+    [Fact]
+    public void SafeGetObject_Decodes_Bitmap_In_DeserializingReader_Stream()
+    {
+        byte[] bmp = NrbfFixtures.Bmp1x1(0x44, 0x33, 0x22);
+        var rm = new ResourceManager("Fake.ModernBmp", BuildStampedAssembly("Fake.ModernBmp",
+            ModernReaderStamp,
+            ("pic.Logo", BitmapType, NrbfFixtures.BitmapPayload(bmp), null)));
+        int nse = CountFirstChance<NotSupportedException>(() =>
+        {
+            var decoded = Assert.IsType<WfBitmap>(WfResourceHelper.SafeGetObject(rm, "pic.Logo"));
+            Assert.Equal(1, decoded.Width);
+            Assert.Equal(0x44, decoded.GetPixel(0, 0).R);
+        });
+        Assert.Equal(0, nse);
+    }
+
+    // User-type payload bounds must not depend on the entry position: a
+    // record whose data offset is nonzero truncated to (bound - offset
+    // - offset) until the walk stopped re-adding the data-section base.
+    // Two bitmaps force the second entry off offset zero.
+    [Fact]
+    public void SafeGetObject_Decodes_NonzeroOffset_Bitmap_In_DeserializingReader_Stream()
+    {
+        byte[] first = NrbfFixtures.Bmp1x1(0x11, 0x22, 0x33);
+        byte[] second = NrbfFixtures.Bmp1x1(0x44, 0x55, 0x66);
+        var rm = new ResourceManager("Fake.ModernPair", BuildStampedAssembly("Fake.ModernPair",
+            ModernReaderStamp,
+            ("pic.First", BitmapType, NrbfFixtures.BitmapPayload(first), null),
+            ("pic.Second", BitmapType, NrbfFixtures.BitmapPayload(second), null)));
+        var d1 = Assert.IsType<WfBitmap>(WfResourceHelper.SafeGetObject(rm, "pic.First"));
+        Assert.Equal(0x11, d1.GetPixel(0, 0).R);
+        var d2 = Assert.IsType<WfBitmap>(WfResourceHelper.SafeGetObject(rm, "pic.Second"));
+        Assert.Equal(0x44, d2.GetPixel(0, 0).R);
+    }
+
+    private const string ModernReaderStamp = "System.Resources.Extensions.DeserializingResourceReader, System.Resources.Extensions, Version=4.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51";
+
+    // .NET Core+ writers store Bitmap/Icon with no BinaryFormatter envelope:
+    // 0x02 marker + 7-bit length + raw image-file bytes (observed live in
+    // DRR-stamped Syncfusion streams: 02 + len + PNG). The decoder must
+    // lift the inner file; the NRBF walker alone misses it.
+    private static byte[] PrefixedPayload(byte[] file)
+    {
+        var ms = new MemoryStream();
+        ms.WriteByte(0x02);
+        uint v = (uint)file.Length;
+        while (v >= 0x80) { ms.WriteByte((byte)(v | 0x80)); v >>= 7; }
+        ms.WriteByte((byte)v);
+        ms.Write(file, 0, file.Length);
+        return ms.ToArray();
+    }
+
+    [Fact]
+    public void SafeGetObject_Decodes_PrefixedPng_Bitmap_In_DeserializingReader_Stream()
+    {
+        byte[] bmp = NrbfFixtures.Bmp1x1(0x44, 0x33, 0x22);
+        var rm = new ResourceManager("Fake.ModernPrefixed", BuildStampedAssembly("Fake.ModernPrefixed",
+            ModernReaderStamp,
+            ("pic.Logo", BitmapType, PrefixedPayload(bmp), null)));
+        int nse = CountFirstChance<NotSupportedException>(() =>
+        {
+            var decoded = Assert.IsType<WfBitmap>(WfResourceHelper.SafeGetObject(rm, "pic.Logo"));
+            Assert.Equal(1, decoded.Width);
+            Assert.Equal(0x44, decoded.GetPixel(0, 0).R);
+        });
+        Assert.Equal(0, nse);
+    }
+
+    [Fact]
+    public void SafeGetObject_Decodes_PrefixedIcon_In_DeserializingReader_Stream()
+    {
+        byte[] ico = NrbfFixtures.Ico1x1();
+        var rm = new ResourceManager("Fake.ModernPrefixedIcon", BuildStampedAssembly("Fake.ModernPrefixedIcon",
+            ModernReaderStamp,
+            ("app.Icon", IconType, PrefixedPayload(ico), null)));
+        var decoded = Assert.IsType<WfDraw::System.Drawing.Icon>(WfResourceHelper.SafeGetObject(rm, "app.Icon"));
+        Assert.Equal(1, decoded.Width);
+    }
+
     // Two loaded assemblies share one base name; the entry lives only in
     // the second. The old load-order first-stream-hit scan resolved the
     // first assembly and missed every entry into the 32px placeholder.
@@ -273,11 +448,20 @@ public sealed class ResourceHelperTests
 
     private const string BitmapType = "System.Drawing.Bitmap, System.Drawing, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a";
     private const string IconType = "System.Drawing.Icon, System.Drawing, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a";
+    private const string PointType = "System.Drawing.Point, System.Drawing, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a";
+    private const string SizeType = "System.Drawing.Size, System.Drawing, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a";
+    private const string RectangleType = "System.Drawing.Rectangle, System.Drawing, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a";
     private const string ImageListStreamerType = "System.Windows.Forms.ImageListStreamer, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089";
 
-    private static Assembly BuildNrbfAssembly(string baseName, params (string Name, string? UserType, byte[]? Data, string? Text)[] entries)
+    private static Assembly BuildNrbfAssembly(string baseName, params (string Name, string? UserType, byte[]? Data, string? Text)[] entries) =>
+        BuildStampedAssembly(baseName, null, entries);
+
+    // Vendor modern streams stamp DeserializingResourceReader (with the
+    // vendor reference-assembly version, here 4.0.0.0 like the real
+    // Syncfusion payloads) instead of the legacy mscorlib reader.
+    private static Assembly BuildStampedAssembly(string baseName, string? readerStamp, params (string Name, string? UserType, byte[]? Data, string? Text)[] entries)
     {
-        byte[] resources = CraftV2(entries);
+        byte[] resources = CraftV2(entries, readerStamp);
         var asmName = new Mono.Cecil.AssemblyNameDefinition("FakeNrbf", new Version(1, 0, 0, 0));
         using var asm = Mono.Cecil.AssemblyDefinition.CreateAssembly(asmName, "FakeNrbf", Mono.Cecil.ModuleKind.Dll);
         asm.MainModule.Resources.Add(new Mono.Cecil.EmbeddedResource(
@@ -291,7 +475,7 @@ public sealed class ResourceHelperTests
     // entries without BinaryFormatter): header, type table, hashes,
     // positions, names, then the data pairs. Hash mirrors
     // FastResourceComparer.HashFunction (5381, h * 33 ^ ch).
-    private static byte[] CraftV2((string Name, string? UserType, byte[]? Data, string? Text)[] entries)
+    private static byte[] CraftV2((string Name, string? UserType, byte[]? Data, string? Text)[] entries, string? readerStamp = null)
     {
         var typeIndex = new System.Collections.Generic.Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var e in entries)
@@ -306,7 +490,7 @@ public sealed class ResourceHelperTests
             .Select((e, i) => (Entry: e, Hash: ResourceHash(e.Name), Slot: i))
             .OrderBy(x => x.Hash)
             .ToArray();
-        const string readerName = "System.Resources.ResourceReader, mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089";
+        string readerName = readerStamp ?? "System.Resources.ResourceReader, mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089";
         const string setName = "System.Resources.RuntimeResourceSet";
         byte[] readerBytes;
         byte[] setBytes;

@@ -44,6 +44,45 @@ public static class NrbfImage
         }
     }
 
+    // .NET Core+ ResourceWriter stores Bitmap/Icon user-type values
+    // without any BinaryFormatter envelope: 0x02 marker + 7-bit length +
+    // raw image-file bytes (observed live: DRR-stamped Syncfusion
+    // streams carry 02 + len + PNG). Lift the inner file when the length
+    // fits exactly and the magic matches; anything else is a miss (the
+    // caller keeps its placeholder).
+    public static bool TryExtractPrefixedImageBytes(byte[]? payload, out byte[] image)
+    {
+        image = [];
+        if (payload is null || payload.Length < 5 || payload[0] != 0x02)
+            return false;
+        try
+        {
+            int pos = 1, len = 0, shift = 0;
+            for (int i = 0; i < 5; i++)
+            {
+                if (pos >= payload.Length)
+                    return false;
+                byte b = payload[pos++];
+                len |= (b & 0x7F) << shift;
+                if ((b & 0x80) == 0)
+                    break;
+                shift += 7;
+            }
+            if (len <= 0 || pos + len != payload.Length)
+                return false;
+            byte[] inner = new byte[len];
+            System.Buffer.BlockCopy(payload, pos, inner, 0, len);
+            if (!HasImageMagic(inner))
+                return false;
+            image = inner;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     internal static bool HasImageMagic(byte[] bytes)
     {
         if (bytes.Length >= 8

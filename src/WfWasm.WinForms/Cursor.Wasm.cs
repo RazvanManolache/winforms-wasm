@@ -67,7 +67,16 @@ public sealed class Cursor : IDisposable, ISerializable, IHandle<HICON>, IHandle
         GC.SuppressFinalize(this);
         if (handle == 0)
         {
-            throw new ArgumentException(string.Format(SR.InvalidGDIHandle, (typeof(Cursor)).Name), nameof(handle));
+            // Browser emulation: no Win32 cursor subsystem exists, so a
+            // zero handle means "no native cursor", not caller error.
+            // Desktop throws ArgumentException here; throwing aborts
+            // third-party control construction (Telerik viewer: the
+            // throw escapes into the ctor-guard degraded path and the
+            // half-built control NREs on first use). Answer the sentinel
+            // instead, like the stream/file ctors.
+            _freeHandle = false;
+            _handle = (HCURSOR)(nint)1;
+            return;
         }
 
         _freeHandle = false;

@@ -840,11 +840,19 @@ public sealed class RewriteTests
             Assert.Contains(module.AssemblyReferences, r => r.Name == "WfWasm.PdnCpu");
             var ctx = module.GetType("PaintDotNet.Direct2D1.CpuDrawingContext");
             Assert.NotNull(ctx);
-            // DrawingContext is sealed: the context implements
-            // IDrawingContext over object instead of subclassing.
-            Assert.Equal("System.Object", ctx.BaseType.FullName);
-            Assert.Contains(ctx.Interfaces,
-                i => i.InterfaceType.FullName == "PaintDotNet.Direct2D1.IDrawingContext");
+            // DrawingContext is sealed: the context implements the device
+            // union over RefTrackedObject (managed refcount base) instead
+            // of subclassing. See CpuDrawingContextContractTests for the
+            // proven cast/dispose behavior behind this shape.
+            Assert.Equal("PaintDotNet.ComponentModel.RefTrackedObject", ctx.BaseType.FullName);
+            foreach (string iface in new[]
+            {
+                "PaintDotNet.Direct2D1.IDrawingContext",
+                "PaintDotNet.Direct2D1.IDeviceContext",
+                "PaintDotNet.Direct2D1.IResourceCacheHolder",
+                "PaintDotNet.Direct2D1.ICompatibleDeviceContext",
+            })
+                Assert.Contains(ctx.Interfaces, i => i.InterfaceType.FullName == iface);
             foreach (string name in new[]
                 { "get_Transform", "set_Transform", "set_AntialiasMode", "get_AntialiasMode",
                   "CreateBitmap", "CreateSolidColorBrush", "DrawBitmap",
@@ -1534,6 +1542,18 @@ public sealed class RewriteTests
             int cmdPos = proxyPos < 0 ? -1 : ins.FindIndex(proxyPos, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Isinst
             && i.Operand is Mono.Cecil.TypeReference ctr && ctr.Name == "CpuCommandList");
             Assert.True(proxyPos >= 0 && cmdPos > proxyPos);
+            // ColorManagementEffect identity no-op (gradient strips): a
+            // null unwrap Retains instead of throwing, so the emitted
+            // DrawImage carries an Isinst on the effect type after the
+            // proxy unwrap, guarding the throw path.
+            int colorMgmtPos = proxyPos < 0 ? -1 : ins.FindIndex(proxyPos, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Isinst
+            && i.Operand is Mono.Cecil.TypeReference cmr && cmr.Name == "ColorManagementEffect");
+            Assert.True(colorMgmtPos > proxyPos);
+            // The effect's CreateRef proxy takes the same identity path
+            // (palette strips wrap the effect in a proxy before drawing).
+            int colorMgmtProxyPos = proxyPos < 0 ? -1 : ins.FindIndex(proxyPos, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Isinst
+            && i.Operand is Mono.Cecil.TypeReference pmr && pmr.Name == "IColorManagementEffectProxy");
+            Assert.True(colorMgmtProxyPos > proxyPos);
             // Crop input resolves through the IDeviceEffect interface,
             // never through a MemberRef walk to the generic props: that
             // trips Mono class loading on WASM (null storage reads).
@@ -1542,9 +1562,21 @@ public sealed class RewriteTests
                 && i.Operand is Mono.Cecil.MethodReference iref
                 && iref.Name == "GetInput"
                 && iref.DeclaringType.FullName == "PaintDotNet.Direct2D1.IDeviceEffect");
+            // No generic props token anywhere in the emitted
+            // DrawImage (Mono class-loading trip + the nested
+            // module-scope check): the palette forward reads the bag
+            // through the non-generic DeviceEffect base getter (the
+            // same token the generic getter itself calls internally),
+            // then Castclass to Props. Crop input keeps the
+            // IDeviceEffect.GetInput route.
             Assert.DoesNotContain(drawImage.Body.Instructions, i =>
                 i.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt
-                && i.Operand is Mono.Cecil.MethodReference pref && pref.Name == "get_Properties");
+                && i.Operand is Mono.Cecil.MethodReference pref && pref.Name == "get_Properties"
+                && pref.DeclaringType is Mono.Cecil.GenericInstanceType);
+            Assert.Contains(drawImage.Body.Instructions, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt
+                && i.Operand is Mono.Cecil.MethodReference cref && cref.Name == "get_Properties"
+                && cref.DeclaringType.FullName == "PaintDotNet.Direct2D1.Effects.DeviceEffect");
             Assert.Contains(drawImage.Body.Instructions, i =>
                 i.OpCode == Mono.Cecil.Cil.OpCodes.Call
                 && i.Operand is Mono.Cecil.MethodReference mr2 && mr2.Name == "GetTargetSize");
@@ -1816,18 +1848,24 @@ public sealed class RewriteTests
                 alc.Resolving += (ctx, name) =>
                 {
                     string probe = Path.Combine(paintDir, (name.Name ?? "") + ".dll");
-                    return File.Exists(probe) ? ctx.LoadFromAssemblyPath(probe) : null;
+                    if (File.Exists(probe)) return ctx.LoadFromAssemblyPath(probe);
+                    // The synthesized command list carries a finalizer that
+                    // frees a leftover redirect scratch: its JIT resolves
+                    // WfWasm.PdnCpu, so the CPU bin must probe too, and the
+                    // instance must die while this resolver is still alive.
+                    string cpuProbe = Path.Combine(Path.GetDirectoryName(cpuDll)!, (name.Name ?? "") + ".dll");
+                    if (File.Exists(cpuProbe)) return ctx.LoadFromAssemblyPath(cpuProbe);
+                    return null;
                 };
-                var loaded = alc.LoadFromAssemblyPath(tempOut);
-                var listType = loaded.GetType("PaintDotNet.Direct2D1.CpuCommandList");
-                Assert.NotNull(listType);
-                var ioRef = listType.GetInterfaces().First(t => t.Name == "IObjectRef");
-                var tcr = listType.GetMethod("TryCreateRef")!;
-                var inst = Activator.CreateInstance(listType);
-                Assert.NotNull(inst);
-                var args = new object?[] { ioRef, null };
-                Assert.True((bool?)tcr.Invoke(inst, args) == true);
-                Assert.Same(inst, args[1]);
+                // The instance MUST die in a nested frame that has returned
+                // before we collect: Debug extends local lifetime to the end
+                // of the enclosing frame, so collecting in this frame leaves
+                // the list alive and its finalizer fires after Unload(),
+                // crashing the host with a finalizer-thread
+                // FileNotFoundException instead of a test failure.
+                TouchCommandListOnce(alc, tempOut);
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
             }
             finally { alc.Unload(); }
         }
@@ -1835,6 +1873,21 @@ public sealed class RewriteTests
         {
             try { GC.Collect(); GC.WaitForPendingFinalizers(); if (File.Exists(tempOut)) File.Delete(tempOut); } catch { }
         }
+    }
+
+    private static void TouchCommandListOnce(
+        System.Runtime.Loader.AssemblyLoadContext alc, string asmPath)
+    {
+        var loaded = alc.LoadFromAssemblyPath(asmPath);
+        var listType = loaded.GetType("PaintDotNet.Direct2D1.CpuCommandList");
+        Assert.NotNull(listType);
+        var ioRef = listType.GetInterfaces().First(t => t.Name == "IObjectRef");
+        var tcr = listType.GetMethod("TryCreateRef")!;
+        var inst = Activator.CreateInstance(listType);
+        Assert.NotNull(inst);
+        var args = new object?[] { ioRef, null };
+        Assert.True((bool?)tcr.Invoke(inst, args) == true);
+        Assert.Same(inst, args[1]);
     }
 
     [Fact]
@@ -3609,7 +3662,7 @@ public sealed class RewriteTests
         string input = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release\Microsoft.AnalysisServices.AdomdClient.dll");
         if (!File.Exists(input)) return;
         string forms = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
-        Assert.True(File.Exists(forms), "regenerate via scripts/build.ps1");
+        Assert.True(File.Exists(forms), "regenerate via E:/tmp/rewrite-small.ps1");
         string drawing = ShimDll("WfWasm.Drawing", "WfWasm.Drawing");
         var assemblyMap = new Dictionary<string, string>(StringComparer.Ordinal)
         {
@@ -3638,7 +3691,7 @@ public sealed class RewriteTests
         string pool = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release");
         if (!File.Exists(input) || !Directory.Exists(pool)) return;
         string forms = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
-        Assert.True(File.Exists(forms), "regenerate via scripts/build.ps1");
+        Assert.True(File.Exists(forms), "regenerate via E:/tmp/rewrite-small.ps1");
         string drawing = ShimDll("WfWasm.Drawing", "WfWasm.Drawing");
         var assemblyMap = new Dictionary<string, string>(StringComparer.Ordinal)
         {
@@ -5362,7 +5415,7 @@ public sealed class RewriteTests
     [Fact]
     public void PresentationCore_ModuleInitializer_Is_Nooped()
     {
-        string corePath = TestPaths.Repo(@"external-apps\paintnet-support\PresentationCore.dll");
+        string corePath = @"E:\tmp\rewritten-paint\PresentationCore.dll";
         if (File.Exists(corePath))
         {
             string tempCoreOut = Path.Combine(Path.GetTempPath(), $"PresentationCore_Test_{Guid.NewGuid()}.dll");
@@ -5419,7 +5472,7 @@ public sealed class RewriteTests
         string fwPath = @"C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App\9.0.20\PresentationFramework.dll";
         if (!File.Exists(fwPath))
         {
-            fwPath = TestPaths.Repo(@"external-apps\paintnet-support\PresentationFramework.dll");
+            fwPath = @"E:\tmp\rewritten-paint\PresentationFramework.dll";
             if (!File.Exists(fwPath)) return;
         }
 

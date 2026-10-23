@@ -39,6 +39,10 @@ def main():
     if gen['rev'] is None:
         print('FATAL: could not pin TransformRevision')
         return 2
+    # Negative runs invert oracles on purpose: mark the generation so the
+    # report can never be mistaken for a real acceptance pass (the verifier
+    # rejects negative runs unless --expect-negative is given).
+    gen['negative'] = bool(args.negative)
     json.dump(gen, open(f'{args.out}/generation.json', 'w'), indent=1)
 
     wanted = args.cases.split(',') if args.cases != 'all' else None
@@ -88,8 +92,13 @@ def main():
             r['artifacts'] = arts
             f.write(json.dumps(r) + '\n')
     n_pass = sum(1 for r in rows if r['status'] == 'passed')
-    print(f'run={gen["run_id"]} rev={gen["rev"]} passed={n_pass}/{len(rows)} out={args.out}')
-    return 0
+    n_fail = sum(1 for r in rows if r['status'] == 'failed')
+    n_block = sum(1 for r in rows if r['status'] == 'blocked')
+    print(f'run={gen["run_id"]} rev={gen["rev"]} passed={n_pass}/{len(rows)} '
+          f'failed={n_fail} blocked={n_block} out={args.out}')
+    # A report describing failed/blocked workflows must NOT exit success:
+    # the acceptance command gates on this code.
+    return 0 if (n_fail == 0 and n_block == 0 and rows) else 1
 
 
 if __name__ == '__main__':

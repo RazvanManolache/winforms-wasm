@@ -93,6 +93,63 @@ internal static class NrbfFixtures
         return ms.ToArray();
     }
 
+    // Two inline Int32 members: the BinaryFormatter shape of a
+    // System.Drawing.Point/Size resource value (header, drawing library,
+    // class record, member names ride along, Primitive/Int32 x2, values).
+    internal static byte[] PointPayload(int x, int y) =>
+        ValuePayload("System.Drawing.Point", "x", "y", x, y);
+
+    internal static byte[] SizePayload(int w, int h) =>
+        ValuePayload("System.Drawing.Size", "width", "height", w, h);
+
+    // The SDK converter-string form observed live (grp2Calendar blobs):
+    // 0x03 marker + length-prefixed invariant "x, y" text.
+    internal static byte[] PointText(int x, int y) => ValueText($"{x}, {y}");
+
+    internal static byte[] SizeText(int w, int h) => ValueText($"{w}, {h}");
+
+    private static byte[] ValueText(string text)
+    {
+        using var ms = new MemoryStream();
+        using (var w = new BinaryWriter(ms))
+        {
+            w.Write((byte)3);
+            w.Write(text);
+        }
+        return ms.ToArray();
+    }
+
+    private static byte[] ValuePayload(string className, string first, string second, int a, int b)
+    {
+        using var ms = new MemoryStream();
+        using (var w = new BinaryWriter(ms))
+        {
+            w.Write((byte)0);
+            w.Write(1);
+            w.Write(-1);
+            w.Write(1);
+            w.Write(0);
+            w.Write((byte)12);
+            w.Write(2);
+            w.Write(DrawingLib);
+            w.Write((byte)5);
+            w.Write(1);
+            w.Write(className);
+            w.Write(2);
+            w.Write(first);
+            w.Write(second);
+            w.Write((byte)0);
+            w.Write((byte)0);
+            w.Write((byte)8);
+            w.Write((byte)8);
+            w.Write(2);
+            w.Write(a);
+            w.Write(b);
+            w.Write((byte)11);
+        }
+        return ms.ToArray();
+    }
+
     internal static byte[] Bmp1x1(byte r, byte g, byte b)
     {
         using var ms = new MemoryStream();
