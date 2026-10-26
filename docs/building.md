@@ -78,6 +78,20 @@ The manifest requests the entry assembly only. Further DLLs are resolved by thei
 
 Specialized compatibility experiments may require a full locally supplied `WindowsBase.dll`. They are optional and are disabled in the base build. When needed, set the MSBuild property `WfWasmWindowsBaseSource` to its absolute path; the existing staging script transforms a temporary copy. The project does not redistribute that input or claim all its APIs work in a browser.
 
+For example, after the base build, with the server stopped:
+
+```powershell
+dotnet build src/WfWasm.Host.Server/WfWasm.Host.Server.csproj -p:WfWasmWindowsBaseSource="C:/LocalApps/Paint.NET/WindowsBase.dll"
+dotnet run --no-build --project src/WfWasm.Host.Server -- --urls http://127.0.0.1:5210
+```
+
+Supply the full implementation from your matching local application/framework
+installation, rather than a reference assembly or browser facade. The optional
+build runs the bundle gate for assembly presence, integrity and
+`DependencyObject`. A successful gate establishes bundle consistency; it does
+not establish complete Paint.NET editing behavior. Restart after building and
+use a fresh browser session when checking changed framework assets.
+
 ## Generated files and cache
 
 `bin/`, `obj/`, and `.artifacts/` are ignored. The default transformation cache is `.artifacts/transform-cache`; set `WFWASM_CACHE` to put it elsewhere. `WFWASM_ROOT` can point the server at the repository when running from an unusual deployment directory.

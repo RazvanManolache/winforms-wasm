@@ -3,24 +3,17 @@ using Xunit;
 public sealed class DialogDeferTests
 {
     [Fact]
-    public void Same_Turn_Dispose_Of_Presented_Dialog_Survives()
+    public void Same_Turn_Dispose_Of_NonEffect_Dialog_Disposes()
     {
-        // `using + ShowDialog` disposes synchronously in the presenting turn
-        // (ShowDialog returns None immediately headless). A third-party
-        // modal must survive until a real user close; PDN's own abort flows
-        // keep the old behavior via the assembly gate.
+        // Contract decision (rev204, evidence in P1 triage): deferral is
+        // for effect config dialogs only (the user drives them after the
+        // headless abort; WasmDialogHostTests pins that path). Desktop
+        // Dispose() always tears down synchronously, and PDN's own
+        // non-effect dialogs have always disposed for real without harm,
+        // so a plain presented modal disposes in the presenting turn too.
         var f = new System.Windows.Forms.Form { Text = "ProbeDlg" };
         System.Windows.Forms.WasmDialogHost.NotePresented(f);
         f.Dispose();
-        try
-        {
-            Assert.False(f.IsDisposed);
-        }
-        finally
-        {
-            System.Windows.Forms.WasmDialogHost.AdvanceTurn();
-            f.Dispose();
-        }
         Assert.True(f.IsDisposed);
     }
 

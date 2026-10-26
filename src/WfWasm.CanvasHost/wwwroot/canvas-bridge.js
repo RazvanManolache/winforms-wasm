@@ -495,6 +495,38 @@ window.wfwasmTextMeasure = function (text, fontCss, fontPx, maxW) {
         return 0;
     }
 };
+// Private-font bridge (Syncfusion/Telerik icon fonts via FontFace).
+// Managed AddMemoryFont bytes are registered here on first use so canvas
+// fillText/measureText resolve private families; check() is synchronous
+// (document.fonts.check), registration is fire-and-forget (FontFace.load
+// promise adds to document.fonts; managed purges tofu on confirm).
+window.wfwasmFontCheck = function (name) {
+    try {
+        if (!document.fonts || !document.fonts.forEach) return false;
+        var nm = String(name);
+        var ok = false;
+        document.fonts.forEach(function (f) { if (f.family === nm && f.status === "loaded") ok = true; });
+        return ok;
+    } catch (e) { return false; }
+};
+window.wfwasmRegisterFont = function (name, b64) {
+    try {
+        var bin = atob(String(b64));
+        var arr = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        var face = new FontFace(String(name), arr.buffer);
+        face.load().then(function (f) {
+            try { document.fonts.add(f); } catch (e2) { }
+            try {
+                var dn = window.wfwasm && window.wfwasm._dotNet;
+                var cv = document.querySelector("canvas");
+                var w = cv ? Math.max(1, Math.floor(cv.clientWidth)) : 0;
+                var h = cv ? Math.max(1, Math.floor(cv.clientHeight)) : 0;
+                if (dn && w > 0 && h > 0) dn.invokeMethodAsync("OnCanvasResized", w, h);
+            } catch (e3) { }
+        }).catch(function () { });
+    } catch (e) { }
+};
 window.wfwasm.savePng = function (canvasId, filename) {
     var canvas = document.getElementById(canvasId);
     if (!canvas) return "no-canvas";

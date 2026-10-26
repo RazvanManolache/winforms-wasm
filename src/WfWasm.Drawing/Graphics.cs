@@ -1620,15 +1620,16 @@ namespace System.Drawing
         private static int s_drawImgCount;
 
         // Permanent paint-path census (same standing as [RESIMG]): which
-        // image draws reach the device funnel, with source and dest sizes.
+        // image draws reach the device funnel, with source/dest sizes, dest
+        // position, and target surface size (positional oracle).
         // First 8 + every 128th; silent otherwise.
-        private static void NoteDrawImage(Image image, float dw, float dh)
+        private static void NoteDrawImage(Image image, float dw, float dh, int dx, int dy, Bitmap? target)
         {
             int n = System.Threading.Interlocked.Increment(ref s_drawImgCount);
             if (n <= 8 || n % 128 == 0)
             {
                 string src = image is Bitmap bmp ? bmp.Width + "x" + bmp.Height : image.GetType().Name;
-                System.Console.WriteLine($"[DRAWIMG] src={src} dest={dw}x{dh}");
+                System.Console.WriteLine($"[DRAWIMG] src={src} dest={dw}x{dh} at={dx},{dy} target={(target is null ? "null" : target.Width + "x" + target.Height)}");
             }
         }
 
@@ -2103,7 +2104,7 @@ namespace System.Drawing
         {
             // Census first: attempts with empty rects return silently below,
             // and those are exactly the layout bugs this marker hunts.
-            NoteDrawImage(src, dw, dh);
+            NoteDrawImage(src, dw, dh, dx, dy, _target);
             if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0)
                 return;
             if (IsDisplay) { RecordDisplayBlit(src, sx, sy, sw, sh, dx, dy, dw, dh); return; }
@@ -2313,6 +2314,24 @@ namespace System.Drawing
                 System.Console.WriteLine("[D2DTXT] text='" + text + "' raster=" + (raster is null ? "null" : raster.Width + "x" + raster.Height) + " dpi=" + DpiY + " maxW=" + Math.Min(maxW, 2048) + " target=" + (_target is null ? "null" : _target.Width + "x" + _target.Height) + " css=" + BrowserText.ToCss(font, DpiY));
             if (raster is null)
                 throw new NotSupportedException("Browser text raster failed.");
+            // GDI+ layout trimming: over-wide single-line text fits to the
+            // layout width (ellipsis modes append U+2026). The rasterizer
+            // has no trim concept; without this, NoClip callers (Telerik
+            // grid cells with autoEllipsis) overrun their neighbors.
+            if (format is not null && format.Trimming != StringTrimming.None
+                && dw > 0f && !WrapsText(format) && raster.Width > dw)
+            {
+                string fitted = FitToWidth(text, font, format, dw);
+                if (fitted.Length == 0)
+                    return;
+                if (!ReferenceEquals(fitted, text))
+                {
+                    raster = BrowserText.TryRaster(fitted, font, DpiY, Math.Min(maxW, 2048));
+                    if (raster is null)
+                        throw new NotSupportedException("Browser text raster failed.");
+                    text = fitted;
+                }
+            }
             // Perf item 4: blend volume (is the invoke bucket pixel-bound?).
             if (TextRasterCounters.PerfEnabled)
                 TextRasterCounters.NoteDrawPx((long)raster.Width * raster.Height);
@@ -2410,6 +2429,63 @@ namespace System.Drawing
                 target.PaintVersion++;
             if (tDraw0 != 0)
                 TextRasterCounters.NoteDrawTicks(System.Diagnostics.Stopwatch.GetTimestamp() - tDraw0);
+        }
+
+        // Binary-search fit for layout trimming (single-line only). Returns the
+        // longest display string (with ellipsis where the mode requires it) whose
+        // tight width fits maxDeviceW. Measurement is world-space; the layout
+        // width is device-space, converted via UnitScale.
+        private string FitToWidth(string text, Font font, StringFormat format, float maxDeviceW)
+        {
+            float unit = UnitScale();
+            if (unit == 0f)
+                unit = 1f;
+            float maxWorldW = maxDeviceW / unit;
+            StringTrimming trim = format.Trimming;
+            bool ellipsis = trim == StringTrimming.EllipsisCharacter
+                || trim == StringTrimming.EllipsisWord
+                || trim == StringTrimming.EllipsisPath;
+            bool word = trim == StringTrimming.Word
+                || trim == StringTrimming.EllipsisWord;
+            const string dots = "\u2026";
+            if (MeasureStringTight(text, font).Width <= maxWorldW)
+                return text;
+            if (ellipsis && MeasureStringTight(dots, font).Width > maxWorldW)
+                return string.Empty;
+            int lo = 0, hi = text.Length;
+            while (lo < hi)
+            {
+                int mid = (lo + hi + 1) / 2;
+                string cand = BuildTrimCandidate(text, mid, ellipsis, trim);
+                if (MeasureStringTight(cand, font).Width <= maxWorldW)
+                    lo = mid;
+                else
+                    hi = mid - 1;
+            }
+            string fitted = BuildTrimCandidate(text, lo, ellipsis, trim);
+            if (word)
+            {
+                int sp = fitted.LastIndexOf(' ');
+                if (sp > 0)
+                    fitted = fitted.Substring(0, sp) + (ellipsis ? dots : string.Empty);
+            }
+            return fitted;
+        }
+
+        private static string BuildTrimCandidate(string text, int keep, bool ellipsis, StringTrimming trim)
+        {
+            const string dots = "\u2026";
+            if (keep <= 0)
+                return ellipsis ? dots : string.Empty;
+            if (trim == StringTrimming.EllipsisPath && keep < text.Length)
+            {
+                int head = (keep + 1) / 2;
+                int tail = keep / 2;
+                string tailStr = tail > 0 ? text.Substring(text.Length - tail) : string.Empty;
+                return text.Substring(0, Math.Min(head, text.Length)) + dots + tailStr;
+            }
+            string headStr = text.Substring(0, Math.Min(keep, text.Length));
+            return ellipsis ? headStr + dots : headStr;
         }
 
         public void DrawString(string? text, Font font, Brush brush, float x, float y) =>
@@ -2940,4 +3016,3 @@ namespace System.Drawing
         }
     }
 }
-

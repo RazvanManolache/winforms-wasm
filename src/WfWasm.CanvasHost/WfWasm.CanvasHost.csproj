@@ -64,7 +64,9 @@
        resolve, then swap it in so the pipeline's own WebCIL conversion,
        fingerprinting and boot.json integrity cover the real bytes. -->
   <Target Name="PrepareFullWindowsBase" BeforeTargets="ResolveAssemblyReferences" Condition="'$(WfWasmWindowsBaseSource)' != ''">
-    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/../../scripts/ensure-windowsbase-full.ps1&quot; -IntermediateDir &quot;$(IntermediateOutputPath)&quot; -SourceDll &quot;$(WfWasmWindowsBaseSource)&quot;" />
+    <!-- The trailing dot keeps a final backslash from escaping the closing
+         quote when Windows parses the native PowerShell command line. -->
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/../../scripts/ensure-windowsbase-full.ps1&quot; -IntermediateDir &quot;$(IntermediateOutputPath).&quot; -SourceDll &quot;$(WfWasmWindowsBaseSource)&quot;" />
   </Target>
 
   <Target Name="UseFullWindowsBase" AfterTargets="ResolveAssemblyReferences" Condition="'$(WfWasmWindowsBaseSource)' != ''">

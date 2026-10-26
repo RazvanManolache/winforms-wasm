@@ -103,7 +103,10 @@ public partial class NativeWindow
         }
         catch (Exception e)
         {
-            Console.WriteLine($"[WasmNotifyPaint] {e}");
+            string who;
+            try { who = Control.FromHandle(hWnd)?.GetType().FullName ?? window.GetType().FullName ?? "?"; }
+            catch { who = "?"; }
+            Console.WriteLine($"[WasmNotifyPaint] {who} :: {e}");
         }
     }
 

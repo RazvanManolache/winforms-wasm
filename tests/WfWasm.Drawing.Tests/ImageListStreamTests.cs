@@ -102,6 +102,98 @@ public sealed class ImageListStreamTests
         Assert.Equal(WfColor.Lime.ToArgb(), slot1.GetPixel(1, 1).ToArgb());
     }
 
+    [Fact]
+    public void Synthetic_Six_Slot_Tiled_Decode_Maps_Row_Major_Tiles()
+    {
+        // 6 slots of 2x2 over a comctl32-tiled 8x4 strip (4 per row,
+        // 2 rows): horizontal slicing would read slot 4 at x=8 (past the
+        // strip) and fail. Slot colors: R/Lime/Blue/White/Magenta/Cyan.
+        byte[] palette = [
+            0, 0, 0, 0,
+            0, 0, 255, 0,
+            0, 255, 0, 0,
+            255, 0, 0, 0,
+            255, 255, 255, 0,
+            255, 0, 255, 0,
+            255, 255, 0, 0,
+            0, 0, 0, 0,
+        ];
+        byte[] xor = [ // bottom-up rows (top-down y3,y2,y1,y0)
+            5, 5, 6, 6, 0, 0, 0, 0,
+            5, 5, 6, 6, 0, 0, 0, 0,
+            1, 1, 2, 2, 3, 3, 4, 4,
+            1, 1, 2, 2, 3, 3, 4, 4,
+        ];
+        byte[] colorBmp = BuildBmp(8, 4, 8, palette, xor);
+        // Mask: top-down (2,2) (slot 5 origin) transparent. File row 1,
+        // x=2 -> byte 0 bit 5.
+        byte[] maskBits = [0, 0, 0, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        byte[] maskBmp = BuildBmp(8, 4, 1, [0, 0, 0, 0, 255, 255, 255, 0], maskBits);
+        byte[] il = BuildImageListStream(6, 2, 2, colorBmp, maskBmp);
+        byte[] msft = RleEncode(il);
+
+        Assert.True(WfNrbf.TryDecodeImageListStream(msft, out WfBitmap[]? images, out var slot, out int depth));
+        Assert.NotNull(images);
+        Assert.Equal(6, images.Length);
+        Assert.Equal(new WfDraw::System.Drawing.Size(2, 2), slot);
+        Assert.Equal(8, depth);
+
+        int[] expected = [
+            WfColor.Red.ToArgb(), WfColor.Lime.ToArgb(), WfColor.Blue.ToArgb(),
+            WfColor.White.ToArgb(), WfColor.Magenta.ToArgb(), WfColor.Cyan.ToArgb(),
+        ];
+        for (int s = 0; s < 4; s++)
+        {
+            Assert.Equal(expected[s], images[s].GetPixel(0, 0).ToArgb());
+            Assert.Equal(expected[s], images[s].GetPixel(1, 1).ToArgb());
+        }
+        Assert.Equal(expected[4], images[4].GetPixel(0, 0).ToArgb());
+        Assert.Equal(expected[4], images[4].GetPixel(1, 1).ToArgb());
+        // Mask folds into alpha at the tiled address, not the
+        // horizontal one.
+        Assert.Equal(0, images[5].GetPixel(0, 0).A);
+        Assert.Equal(expected[5], images[5].GetPixel(1, 0).ToArgb());
+        Assert.Equal(expected[5], images[5].GetPixel(1, 1).ToArgb());
+        foreach (var bmp in images)
+            bmp.Dispose();
+    }
+
+    [Fact]
+    public void Synthetic_Six_Slot_Horizontal_Strip_Falls_Back()
+    {
+        // Non-tiled 12x2 strip (6 horizontal slots): the tiled rects
+        // overflow, so the decoder must fall back to horizontal slicing.
+        byte[] palette = [
+            0, 0, 0, 0,
+            0, 0, 255, 0,
+            0, 255, 0, 0,
+            255, 0, 0, 0,
+            255, 255, 255, 0,
+            255, 0, 255, 0,
+            255, 255, 0, 0,
+            0, 0, 0, 0,
+        ];
+        byte[] row = [1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6];
+        byte[] xor = [.. row, .. row]; // bottom-up, both rows identical
+        byte[] colorBmp = BuildBmp(12, 2, 8, palette, xor);
+        byte[] il = BuildImageListStream(6, 2, 2, colorBmp, []);
+        byte[] msft = RleEncode(il);
+
+        Assert.True(WfNrbf.TryDecodeImageListStream(msft, out WfBitmap[]? images, out var slot, out int depth));
+        Assert.NotNull(images);
+        Assert.Equal(6, images.Length);
+        int[] expected = [
+            WfColor.Red.ToArgb(), WfColor.Lime.ToArgb(), WfColor.Blue.ToArgb(),
+            WfColor.White.ToArgb(), WfColor.Magenta.ToArgb(), WfColor.Cyan.ToArgb(),
+        ];
+        for (int s = 0; s < 6; s++)
+        {
+            Assert.Equal(expected[s], images[s].GetPixel(0, 0).ToArgb());
+            Assert.Equal(expected[s], images[s].GetPixel(1, 1).ToArgb());
+            images[s].Dispose();
+        }
+    }
+
     [Theory]
     [InlineData(new byte[] { })]
     [InlineData(new byte[] { (byte)'M', (byte)'S', (byte)'F', (byte)'X' })]

@@ -144,6 +144,16 @@ namespace System.Drawing.Text
         {
         }
 
+        // Process-wide private-font byte registry (browser FontFace bridge):
+        // AddMemoryFont records (family name -> TTF bytes) so BrowserText can
+        // register the exact bytes with the browser when text first uses the
+        // family. Bounded: private icon fonts are few; extras are dropped.
+        internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte[]> s_privateFontBytes =
+            new(System.StringComparer.Ordinal);
+
+        internal static bool TryGetPrivateFontBytes(string family, out byte[]? bytes) =>
+            s_privateFontBytes.TryGetValue(family, out bytes);
+
         public void AddFontFile(string filename)
         {
             ArgumentException.ThrowIfNullOrEmpty(filename);
@@ -177,7 +187,14 @@ namespace System.Drawing.Text
             // than a hang, while a parsed entry terminates the loop.
             string? name = TryReadFamilyName(copy);
             if (name is not null)
+            {
                 _families.Add(new FontFamily(name));
+                if (s_privateFontBytes.Count < 32)
+                    s_privateFontBytes.TryAdd(name, copy);
+                // Eager browser registration: wins the boot race so the first
+                // raster already resolves (backstop in EnsurePrivateFont).
+                try { global::System.Drawing.BrowserText.KickFontRegistration(name, copy); } catch { }
+            }
         }
 
         // Only fonts added to THIS collection (cf. desktop, where installed

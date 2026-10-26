@@ -1138,6 +1138,7 @@ namespace Windows.Win32
                     // ignores the GDI+ world transform.
                     global::System.Drawing.Drawing2D.Matrix savedXf = graphics.Transform;
                     graphics.Transform = new global::System.Drawing.Drawing2D.Matrix();
+                    global::System.Drawing.Drawing2D.GraphicsState? clipScope = null;
                     try
                     {
                     if (options.HasFlag(ETO_OPTIONS.ETO_OPAQUE) && lprect is not null)
@@ -1177,11 +1178,19 @@ namespace Windows.Win32
                         py = y - (font.Height * 0.8f);
                     }
 
+                    if (options.HasFlag(ETO_OPTIONS.ETO_CLIPPED) && lprect is not null)
+                    {
+                        // Desktop clips cell text to lprect; the point layout below is
+                        // unclipped, so without this grid text overruns its column.
+                        global::System.Drawing.Rectangle clipRect = *lprect;
+                        clipScope = graphics.Save();
+                        graphics.IntersectClip(new global::System.Drawing.RectangleF(clipRect.X, clipRect.Y, clipRect.Width, clipRect.Height));
+                    }
                     using var brush = new global::System.Drawing.SolidBrush(FromColorRef(state.TextColor));
                     if (!TryPaintWords(graphics, cleaned, font, brush, px, py, sf))
                         graphics.DrawString(cleaned, font, brush, new global::System.Drawing.PointF(px, py), sf);
                     }
-                    finally { graphics.Transform = savedXf; }
+                    finally { if (clipScope is not null) graphics.Restore(clipScope); graphics.Transform = savedXf; }
                     return true;
                 }
                 catch
@@ -1222,6 +1231,14 @@ namespace Windows.Win32
                 if (format.HasFlag(DRAW_TEXT_FORMAT.DT_END_ELLIPSIS))
                 {
                     sf.Trimming = global::System.Drawing.StringTrimming.EllipsisCharacter;
+                }
+
+                if (format.HasFlag(DRAW_TEXT_FORMAT.DT_NOCLIP))
+                {
+                    // NoClip callers (unbounded point-layout paints) must not
+                    // inherit the layout-rect clip our DrawString applies by
+                    // default; without this the flag was silently dropped.
+                    sf.FormatFlags |= global::System.Drawing.StringFormatFlags.NoClip;
                 }
 
                 return sf;

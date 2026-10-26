@@ -71,12 +71,14 @@ public sealed class CommandListRedirectTests
             var setTarget = BodyOf(ctx, "SetTarget", 1);
             Assert.Contains(setTarget, i => i.OpCode == OpCodes.Isinst
                 && i.Operand is TypeReference tr && tr.Name == "CpuCommandList");
-            Assert.True(Calls(setTarget, "CreateScratchTarget"),
-                "SetTarget must allocate the redirect scratch");
+            Assert.True(Calls(setTarget, "CreateScratchHandle"),
+                "SetTarget must mint the redirect scratch by ID (rev203: raw GCHandle values recycle)");
             Assert.True(Calls(setTarget, "GetTransform"),
-                "SetTarget must copy the live matrix into the scratch");
-            Assert.True(Calls(setTarget, "SetTransform"),
-                "SetTarget must copy the live matrix into the scratch");
+                "SetTarget must read the live matrix for the mint");
+            Assert.False(Calls(setTarget, "SetTransform"),
+                "SetTarget must not SetTransform the scratch ID (rev204: matrix applied at mint; IDs must never reach FromHandle)");
+            Assert.False(Calls(setTarget, "CreateScratchTarget"),
+                "SetTarget must not allocate raw scratch handles (IDs only)");
 
             var getTarget = BodyOf(ctx, "GetTarget", 0);
             Assert.Contains(getTarget, i => i.OpCode == OpCodes.Ldfld

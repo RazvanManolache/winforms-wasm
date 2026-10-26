@@ -8,6 +8,7 @@ using IsoFileStream = IsoStub::System.IO.IsolatedStorage.IsolatedStorageFileStre
 // GetStore(scope, Type, Type) at boot): same-triple handles share one
 // session store, scope and evidence types separate stores, and the full
 // FileMode file flow works over the stored bytes.
+[Collection("IsoStore")]
 public sealed class GetStoreTests
 {
     private sealed class EvidenceA { }

@@ -821,6 +821,25 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 	}
 
+	/// <summary>
+	/// Raises <see cref="Form.Load"/> exactly once per form.
+	/// The fork guards its native OnLoad paths with the private CalledOnLoad
+	/// flag, but the explicit host invoke below used to bypass it: every form
+	/// whose native show path fired Load got a second Load here (duplicate
+	/// DataBindings -&gt; TargetInvocationException, e.g.
+	/// syncfusion-grid-grouping). Skip when native already fired; set the
+	/// guard after a manual fire so a later native path also skips.
+	/// </summary>
+	public static void EnsureOnLoadOnce(System.Windows.Forms.Form form)
+	{
+		System.Type formType = typeof(System.Windows.Forms.Form);
+		System.Reflection.PropertyInfo? guard = formType.GetProperty("CalledOnLoad", BindingFlags.Instance | BindingFlags.NonPublic);
+		if ((bool?)guard?.GetValue(form) == true)
+			return;
+		formType.GetMethod("OnLoad", BindingFlags.Instance | BindingFlags.NonPublic)?.Invoke(form, new object[1] { EventArgs.Empty });
+		guard?.SetValue(form, true);
+	}
+
 	public System.Windows.Forms.Form? GetOrCreateForm(AppScene scene)
 	{
 		if (_forms.TryGetValue(scene, out System.Windows.Forms.Form value))
@@ -933,7 +952,7 @@ public sealed class WinFormsAppHost : IDisposable
 				form.Visible = true;
 				try
 				{
-					typeof(System.Windows.Forms.Form).GetMethod("OnLoad", BindingFlags.Instance | BindingFlags.NonPublic)?.Invoke(form, new object[1] { EventArgs.Empty });
+					EnsureOnLoadOnce(form);
 				}
 				catch (Exception ex)
 				{
@@ -963,7 +982,7 @@ public sealed class WinFormsAppHost : IDisposable
 						PerformLayoutRecursive(control);
 					}
 				}
-				else
+				else if (!ApplyMaximizedPlacement(form))
 				{
 					CenterInViewport(form);
 					_autoCentered.Add(form);
@@ -1480,6 +1499,31 @@ public sealed class WinFormsAppHost : IDisposable
 		catch { return false; }
 	}
 
+	// Maximized-start: a form whose app code requests Maximized (e.g. DockSample
+	// sets it in InitializeComponent) fills the viewport client area instead of
+	// sitting at design size; the fork stores the state but has no window manager
+	// to act on it. Returns true when applied (caller then skips centering).
+	private bool ApplyMaximizedPlacement(System.Windows.Forms.Form form)
+	{
+		try
+		{
+			if (form.IsDisposed) return false;
+			if (form.WindowState != System.Windows.Forms.FormWindowState.Maximized) return false;
+			// Size sets while Maximized are diverted to restore-bounds storage
+			// headless (no window manager ever applies them), so the design size
+			// would stick: drop to Normal, assign, re-assert Maximized.
+			form.WindowState = System.Windows.Forms.FormWindowState.Normal;
+			form.Location = new Point(0, 0);
+			form.Width = ViewWidth;
+			form.Height = Math.Max(100, ViewHeight - ChromeHeight(form));
+			form.WindowState = System.Windows.Forms.FormWindowState.Maximized;
+			form.PerformLayout();
+			Console.WriteLine($"[Host] maximized {form.GetType().Name} to {form.Width}x{form.Height} (view {ViewWidth}x{ViewHeight})");
+			return true;
+		}
+		catch { return false; }
+	}
+
 	private static void CenterInViewport(System.Windows.Forms.Form form)
 	{
 		// Fit every scene (generalizes the Paint-only clamp): shrink
@@ -1528,6 +1572,10 @@ public sealed class WinFormsAppHost : IDisposable
 					control.Size = form2.ClientSize;
 					PerformLayoutRecursive(control);
 				}
+			}
+			else if (!form2.IsDisposed && form2.WindowState == System.Windows.Forms.FormWindowState.Maximized)
+			{
+				ApplyMaximizedPlacement(form2);
 			}
 			else if (_autoCentered.Contains(form2) && !_userPlaced.Contains(form2))
 			{

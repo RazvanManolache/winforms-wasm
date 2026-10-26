@@ -105,26 +105,14 @@ public static class WasmDialogHost
         // of a dialog the user has not seen yet (ShowDialog returns None
         // immediately headless). PDN's own flows were built around that
         // abort, so they keep it. Every other modal follows desktop blocking
-        // semantics instead: it must survive until a real user close.
-        // Assembly-gated, not behavior-gated, so PDN stays exactly as before.
-        if (!IsEffectConfigDialog(form) && IsPdnAbortFlow(form))
+        // semantics (Dispose always tears down synchronously); gating on the dialog kind, not the calling assembly, so plain third-party modals and PDN non-effect dialogs dispose for real.
+        // Effect config dialogs keep the abort-survival PDN needs.
+        if (!IsEffectConfigDialog(form))
             return false;
         mark.Deferred = true;
         return true;
     }
 
-    private static bool IsPdnAbortFlow(Form form)
-    {
-        try
-        {
-            string? name = form.GetType().Assembly.GetName().Name;
-            if (string.IsNullOrEmpty(name))
-                return false;
-            return name.Equals("PaintDotNet", StringComparison.Ordinal)
-                || name.StartsWith("PaintDotNet.", StringComparison.Ordinal);
-        }
-        catch { return false; }
-    }
 
     // Sync abort-Hide: PDN's abort also calls configDialog.Hide() in the
     // presenting turn. Same gate as disposal (mark + same turn + effect

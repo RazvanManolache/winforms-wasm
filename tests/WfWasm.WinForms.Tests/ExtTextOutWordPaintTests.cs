@@ -17,6 +17,10 @@ using WfSolidBrush = WasmDraw::System.Drawing.SolidBrush;
 using WfStringFormat = WasmDraw::System.Drawing.StringFormat;
 using WfBrowserText = WasmDraw::System.Drawing.BrowserText;
 using ForkBridge = Fork::Windows.Win32.PInvoke.WasmTextBridge;
+using ForkFill = Fork::Windows.Win32.PInvoke.WasmFillBridge;
+using ForkGdi = Fork::Windows.Win32.Graphics.Gdi;
+using ForkRect = Fork::Windows.Win32.Foundation.RECT;
+using ForkPInvokeCore = Fork::Windows.Win32.PInvokeCore;
 
 namespace WfWasm.WinForms.Tests;
 
@@ -79,6 +83,62 @@ public sealed class ExtTextOutWordPaintTests
             using var sf = new WfStringFormat();
             Assert.False(ForkBridge.TryPaintWords(g, line, font, brush, 10f, 4f, sf));
             Assert.Empty(calls);
+        }
+        finally
+        {
+            WfBrowserText.RasterOverride = null;
+        }
+    }
+
+    [Fact]
+    public unsafe void TryExtTextOut_Clipped_Stays_Inside_Rect()
+    {
+        // Grid cells paint through ExtTextOut with ETO_CLIPPED; the bridge
+        // used unbounded point layout, so over-wide cell text overran its
+        // column (ERP). The clip scope must contain it to the rect.
+        var calls = new List<string>();
+        WfBrowserText.RasterOverride = (text, _, _, _) => { calls.Add(text); return Tick2x8(); };
+        try
+        {
+            using var bmp = new WfBitmap(120, 24);
+            using var g = WfGraphics.FromImage(bmp);
+            g.Clear(WfColor.White);
+            using var font = new WfFont("Microsoft Sans Serif", 8.25f);
+            var hfont = (ForkGdi.HFONT)font.ToHfont();
+            ForkGdi.HDC hdc = new((nint)0x3A7F2E11);
+            ForkPInvokeCore.SelectObject(hdc, hfont);
+            using var reg = ForkFill.TrackTarget(hdc, g);
+            var rc = new ForkRect(10, 4, 40, 24);
+            Assert.True(ForkBridge.TryExtTextOut(hdc, 10, 4, ForkGdi.ETO_OPTIONS.ETO_CLIPPED, &rc, "The jamped dog"));
+            // DC text color defaults to black (no SetTextColor in this harness).
+            Assert.Equal(WfColor.Black.ToArgb(), bmp.GetPixel(10, 5).ToArgb());
+            Assert.Equal(WfColor.Black.ToArgb(), bmp.GetPixel(32, 5).ToArgb());
+            Assert.Equal(WfColor.White.ToArgb(), bmp.GetPixel(69, 5).ToArgb());
+        }
+        finally
+        {
+            WfBrowserText.RasterOverride = null;
+        }
+    }
+
+    [Fact]
+    public unsafe void TryExtTextOut_Unclipped_Paints_Full_Line()
+    {
+        var calls = new List<string>();
+        WfBrowserText.RasterOverride = (text, _, _, _) => { calls.Add(text); return Tick2x8(); };
+        try
+        {
+            using var bmp = new WfBitmap(120, 24);
+            using var g = WfGraphics.FromImage(bmp);
+            g.Clear(WfColor.White);
+            using var font = new WfFont("Microsoft Sans Serif", 8.25f);
+            var hfont = (ForkGdi.HFONT)font.ToHfont();
+            ForkGdi.HDC hdc = new((nint)0x3A7F2E12);
+            ForkPInvokeCore.SelectObject(hdc, hfont);
+            using var reg = ForkFill.TrackTarget(hdc, g);
+            var rc = new ForkRect(10, 4, 40, 24);
+            Assert.True(ForkBridge.TryExtTextOut(hdc, 10, 4, (ForkGdi.ETO_OPTIONS)0, &rc, "The jamped dog"));
+            Assert.Equal(WfColor.Black.ToArgb(), bmp.GetPixel(69, 5).ToArgb());
         }
         finally
         {

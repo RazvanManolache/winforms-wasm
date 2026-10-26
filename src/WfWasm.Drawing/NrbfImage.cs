@@ -44,16 +44,19 @@ public static class NrbfImage
         }
     }
 
-    // .NET Core+ ResourceWriter stores Bitmap/Icon user-type values
-    // without any BinaryFormatter envelope: 0x02 marker + 7-bit length +
-    // raw image-file bytes (observed live: DRR-stamped Syncfusion
-    // streams carry 02 + len + PNG). Lift the inner file when the length
-    // fits exactly and the magic matches; anything else is a miss (the
-    // caller keeps its placeholder).
+    // ResourceWriter stores Bitmap/Icon user-type values without any
+    // BinaryFormatter envelope: marker + 7-bit length + raw image-file
+    // bytes. Marker 0x02 observed live on .NET Core+ writer output
+    // (DRR-stamped Syncfusion streams carry 02 + len + PNG); marker 0x04
+    // observed live on netfx writer output (Syncfusion.Diagram.Base
+    // Images: 62 Bitmap entries, BMP and PNG, exact-fit, e.g. Bold).
+    // Lift the inner file when the length fits exactly and the magic
+    // matches; anything else is a miss (the caller keeps its
+    // placeholder).
     public static bool TryExtractPrefixedImageBytes(byte[]? payload, out byte[] image)
     {
         image = [];
-        if (payload is null || payload.Length < 5 || payload[0] != 0x02)
+        if (payload is null || payload.Length < 5 || (payload[0] != 0x02 && payload[0] != 0x04))
             return false;
         try
         {
@@ -580,8 +583,17 @@ public static class NrbfImage
         System.Drawing.Bitmap strip;
         try { strip = System.Drawing.BmpCodec.Decode(colorSlice); }
         catch { return false; }
-        if (strip.Width < imageCount * cx || strip.Height < cy)
+        // On-wire strips are comctl32-tiled, TILE_COUNT = 4 slots per row
+        // (a real 3-glyph 16x16 stream ships a 64x16 = 4-wide strip, not
+        // 48x16). Slot s sits at ((s%4)*cx, (s/4)*cy). A horizontal strip
+        // is accepted as a fallback only when the tiled rects overflow.
+        const int tileCols = 4;
+        bool tiledFits = ((imageCount - 1) % tileCols) * cx + cx <= strip.Width
+            && ((imageCount - 1) / tileCols) * cy + cy <= strip.Height;
+        bool horizFits = (long)imageCount * cx <= strip.Width && cy <= strip.Height;
+        if (!tiledFits && !horizFits)
             return false;
+        bool tiled = tiledFits;
         if (ReadI32(il, 28 + 14) < 40)
             return false;
         bitDepth = il[28 + 14 + 14] | (il[28 + 14 + 15] << 8);
@@ -601,16 +613,19 @@ public static class NrbfImage
         int[] src = strip.Pixels;
         for (int s = 0; s < imageCount; s++)
         {
+            int tx = tiled ? (s % tileCols) * cx : s * cx;
+            int ty = tiled ? (s / tileCols) * cy : 0;
             var slotBmp = new System.Drawing.Bitmap(cx, cy);
             int[] dest = slotBmp.Pixels;
             for (int y = 0; y < cy; y++)
             {
                 for (int x = 0; x < cx; x++)
                 {
-                    int gx = s * cx + x;
-                    int argb = src[y * strip.Width + gx];
-                    bool transparent = hasMask && maskBits![y * maskW + gx] == 1;
-                    int alpha = transparent ? 0 : (bitDepth == 32 ? ColorAlphaAt(il, 28, colorDataOff, (int)colorStride, colorTopDown, colorH, gx, y) : 255);
+                    int gx = tx + x;
+                    int gy = ty + y;
+                    int argb = src[gy * strip.Width + gx];
+                    bool transparent = hasMask && maskBits![gy * maskW + gx] == 1;
+                    int alpha = transparent ? 0 : (bitDepth == 32 ? ColorAlphaAt(il, 28, colorDataOff, (int)colorStride, colorTopDown, colorH, gx, gy) : 255);
                     dest[y * cx + x] = (alpha << 24) | (argb & 0xFFFFFF);
                 }
             }

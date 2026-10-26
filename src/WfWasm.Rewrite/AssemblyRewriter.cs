@@ -329,6 +329,14 @@ public static class AssemblyRewriter
             catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
             {
             }
+            // ScaledResource<T> generic-instantiation callvirt trips
+            // Mono class loading headless (ArrowButton glyph fetch
+            // kind-17s its whole paint): serve the trivial getters
+            // through reflection helpers (see method).
+            try { RetargetScaledResourceHeadless(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
         }
         if (assembly.Name.Name == "PaintDotNet.Windows")
         {
@@ -386,6 +394,13 @@ public static class AssemblyRewriter
             if (scaledSrc is not null)
             {
                 scaledSrc.IsPublic = true;
+            }
+            // Same generic-instantiation callvirt trip as the
+            // paintdotnet ArrowButton path (PdnNumericUpDown lives
+            // here): serve the getters through reflection helpers.
+            try { RetargetScaledResourceHeadless(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
             }
         }
         if (assembly.Name.Name == "PaintDotNet.Windows.Framework")
@@ -5333,6 +5348,12 @@ public static class AssemblyRewriter
             // the new types skip the per-type loop. Loud on missing
             // pieces; silent only for non-PDN modules.
             EnsureCpuDrawingContext(module, cpuPaintPath);
+            // Empty-bitmap pool guard (P1 WheelBitmap): Core-only inside,
+            // silent elsewhere.
+            EnsureBitmapBufferEmptyGuard(module);
+            // Empty-source image guard (P1 WheelBitmap): Framework-only
+            // inside, silent elsewhere.
+            EnsureEmptySourceGuard(module);
         }
 
         // Headless animation services (COM UIAnimation has no WASM
@@ -5361,8 +5382,69 @@ public static class AssemblyRewriter
         }
 
         using var ms = new MemoryStream();
+        // Obfuscator junk (observed: Fiddler's <Module> global carries an
+        // unreachable `call` whose member token Cecil leaves null).
+        // Cecil reads it lazily but its writer NREs in HasImplicitThis
+        // when computing the stack delta, so neutralize provably
+        // unreachable null-calls to nop here. A *reachable* null call is
+        // either a rewrite bug or unloadable input: fail loudly with the
+        // method and offset instead of Cecil's bare NRE.
+        NeutralizeUnreachableNullCalls(module);
         assembly.Write(ms);
         return ms.ToArray();
+    }
+
+    private static void NeutralizeUnreachableNullCalls(ModuleDefinition module)
+    {
+        var bad = new List<string>();
+        foreach (var type in module.Types)
+            NeutralizeInType(type, bad);
+        if (bad.Count != 0)
+            throw new InvalidOperationException(
+                "rewrite emitted or kept reachable null method operands: "
+                + string.Join(" | ", bad));
+    }
+
+    private static void NeutralizeInType(TypeDefinition type, List<string> bad)
+    {
+        foreach (var m in type.Methods)
+        {
+            if (m is null || !m.HasBody || m.Body?.Instructions is null)
+                continue;
+            var insns = m.Body.Instructions;
+            for (int k = 0; k < insns.Count; k++)
+            {
+                var ins = insns[k];
+                var oc = ins.OpCode;
+                if (oc != Mono.Cecil.Cil.OpCodes.Call && oc != Mono.Cecil.Cil.OpCodes.Callvirt
+                    && oc != Mono.Cecil.Cil.OpCodes.Newobj && oc != Mono.Cecil.Cil.OpCodes.Ldftn
+                    && oc != Mono.Cecil.Cil.OpCodes.Ldvirtftn && oc != Mono.Cecil.Cil.OpCodes.Jmp
+                    && oc != Mono.Cecil.Cil.OpCodes.Calli)
+                    continue;
+                if (ins.Operand is not null)
+                    continue;
+                bool unreachable = k == 0;
+                if (!unreachable)
+                {
+                    var prev = insns[k - 1].OpCode;
+                    unreachable = prev == Mono.Cecil.Cil.OpCodes.Br || prev == Mono.Cecil.Cil.OpCodes.Br_S
+                        || prev == Mono.Cecil.Cil.OpCodes.Leave || prev == Mono.Cecil.Cil.OpCodes.Leave_S
+                        || prev == Mono.Cecil.Cil.OpCodes.Ret || prev == Mono.Cecil.Cil.OpCodes.Throw
+                        || prev == Mono.Cecil.Cil.OpCodes.Rethrow || prev == Mono.Cecil.Cil.OpCodes.Endfinally;
+                }
+                if (unreachable)
+                {
+                    ins.OpCode = Mono.Cecil.Cil.OpCodes.Nop;
+                    ins.Operand = null;
+                }
+                else
+                {
+                    bad.Add($"{type.FullName}::{m.Name} IL_{ins.Offset:X4} {oc.Name}");
+                }
+            }
+        }
+        foreach (var nested in type.NestedTypes)
+            NeutralizeInType(nested, bad);
     }
 
     public static List<string> ReferenceNames(string assemblyPath)
@@ -6168,7 +6250,7 @@ public static class AssemblyRewriter
     // immediate fills land early and a later opaque DrawImage buries
     // them (observed: PDN Colors palette wells under the checkers
     // layer). Anything else returning a value fails loudly.
-    private static TypeDefinition SynthesizeCpuCommandList(ModuleDefinition module, MethodReference freeScratch)
+    private static TypeDefinition SynthesizeCpuCommandList(ModuleDefinition module, MethodReference freeScratch, MethodReference claimScratch)
     {
         TypeReference iface = LocalOrOwnedCpuRef(module, "PaintDotNet.Direct2D1.ICommandList");
         TypeDefinition ifaceDef = ResolveCpuDef(iface);
@@ -6199,6 +6281,12 @@ public static class AssemblyRewriter
         var savedField = new FieldDefinition("_saved", FieldAttributes.Public, module.TypeSystem.Int64);
         type.Fields.Add(scratchField);
         type.Fields.Add(savedField);
+        // Back-pointer to the dc currently redirected through this list.
+        // A second dc must not re-take a live list: the take would
+        // overwrite _saved (losing the first dc's target) and a later
+        // teardown would free whoever recycled that slot.
+        var redirDcField = new FieldDefinition("_redirDc", FieldAttributes.Public, module.TypeSystem.Object);
+        type.Fields.Add(redirDcField);
         MethodReference objectCtor = module.ImportReference(typeof(object).GetConstructor(Type.EmptyTypes)!);
         var ctor = new MethodDefinition(
             ".ctor",
@@ -6249,23 +6337,28 @@ public static class AssemblyRewriter
         // alive through the effect). DrawImage consumes the scratch on
         // first playback (blit+free+zero, single-playback headless); this
         // finalizer backstops lists that are never drawn.
+        // The finalizer runs on its own thread: the take goes through the
+        // CpuPaint slot lock (ClaimScratch zeroes under the same lock the
+        // SetTarget store uses), so no torn or stale take can free twice
+        // (NRE/InvalidCast in FromHandle, then runtime exit 255).
         var finalizer = new MethodDefinition(
             "Finalize",
             MethodAttributes.Family | MethodAttributes.Virtual | MethodAttributes.HideBySig,
             module.TypeSystem.Void);
         {
+            var finScratch = new VariableDefinition(module.TypeSystem.Int64);
+            finalizer.Body.Variables.Add(finScratch);
+            finalizer.Body.InitLocals = true;
             var fil = finalizer.Body.GetILProcessor();
             var finDone = fil.Create(OpCodes.Nop);
             fil.Emit(OpCodes.Ldarg_0);
-            fil.Emit(OpCodes.Ldfld, scratchField);
+            fil.Emit(OpCodes.Ldflda, scratchField);
+            fil.Emit(OpCodes.Call, claimScratch);
+            fil.Emit(OpCodes.Stloc, finScratch);
+            fil.Emit(OpCodes.Ldloc, finScratch);
             fil.Emit(OpCodes.Brfalse, finDone);
-            fil.Emit(OpCodes.Ldarg_0);
-            fil.Emit(OpCodes.Ldfld, scratchField);
+            fil.Emit(OpCodes.Ldloc, finScratch);
             fil.Emit(OpCodes.Call, freeScratch);
-            fil.Emit(OpCodes.Ldarg_0);
-            fil.Emit(OpCodes.Ldc_I4_0);
-            fil.Emit(OpCodes.Conv_I8);
-            fil.Emit(OpCodes.Stfld, scratchField);
             fil.Append(finDone);
             fil.Emit(OpCodes.Ret);
         }
@@ -9557,6 +9650,124 @@ public static class AssemblyRewriter
     // FormClosed hook (EnsureEffectDialogResume) resumes the product
     // DoEffect then. Inserted after the SetEffect call: stack-neutral,
     // idempotent, safe under any branch shape.
+    // The ScaledResource<T> generic-instantiation callvirt trips Mono
+    // class loading headless: ArrowButton's glyph fetch kind-17s its
+    // whole OnPaint, and the PdnToolBar/numeric self-paints fail the
+    // same way through InvokeWithOneArg. The getters are trivial
+    // backing-field reads, so reroute them through reflection helpers
+    // that carry no generic token at runtime (call + castclass/unbox
+    // of the ORIGINAL return-type token: same stack shape, all tokens
+    // assembly-scoped so the nested module-scope check stays green).
+    private static void RetargetScaledResourceHeadless(ModuleDefinition module, string? cpuPaintPath)
+    {
+        MethodReference getRes = ImportCpuPaintMethod(module, cpuPaintPath, "ScaledResourceGet", 1);
+        MethodReference getFac = ImportCpuPaintMethod(module, cpuPaintPath, "ScaledResourceFactor", 1);
+        int count = 0;
+        foreach (TypeDefinition type in module.Types)
+            count += RetargetScaledResourceIn(type, getRes, getFac);
+        if (count == 0)
+            throw new InvalidOperationException("CpuPaint: no ScaledResource call sites found");
+    }
+
+    private static bool ContainsGenericParameter(TypeReference tr)
+    {
+        if (tr is GenericParameter) return true;
+        if (tr is GenericInstanceType gi)
+        {
+            foreach (TypeReference arg in gi.GenericArguments)
+                if (ContainsGenericParameter(arg)) return true;
+            return false;
+        }
+        if (tr is TypeSpecification spec)
+            return spec.ElementType != null && ContainsGenericParameter(spec.ElementType);
+        return false;
+    }
+
+    private static int RetargetScaledResourceIn(
+        TypeDefinition type, MethodReference getRes, MethodReference getFac)
+    {
+        int count = 0;
+        foreach (MethodDefinition method in type.Methods)
+        {
+            if (!method.HasBody) continue;
+            List<Instruction> hits = new List<Instruction>();
+            foreach (Instruction ins in method.Body.Instructions)
+            {
+                if (ins.OpCode == OpCodes.Callvirt
+                    && ins.Operand is MethodReference mr
+                    && (mr.Name == "get_Resource" || mr.Name == "get_ScaleFactor")
+                    && mr.DeclaringType is GenericInstanceType gi
+                    && gi.ElementType.FullName == "PaintDotNet.Resources.ScaledResource`1"
+                    && gi.GenericArguments.Count == 1
+                    && !ContainsGenericParameter(gi.GenericArguments[0]))
+                    hits.Add(ins);
+            }
+            if (hits.Count == 0) continue;
+            var il = method.Body.GetILProcessor();
+            foreach (Instruction ins in hits)
+            {
+                var mr = (MethodReference)ins.Operand;
+                bool isRes = mr.Name == "get_Resource";
+                // The getter's declared return is the open generic
+                // parameter T (Cecil does not inflate through the
+                // instantiation): emitting it as a castclass/unbox
+                // operand kills the WASM interpreter at transform
+                // time (transform.c assertion, whole-app death).
+                // Inflate manually from the instantiation argument;
+                // the factor getter already returns concrete
+                // UIScaleFactor.
+                TypeReference retTok = mr.ReturnType;
+                if (isRes && mr.DeclaringType is GenericInstanceType giRes
+                    && giRes.GenericArguments.Count == 1)
+                    retTok = giRes.GenericArguments[0];
+                ins.OpCode = OpCodes.Call;
+                ins.Operand = isRes ? getRes : getFac;
+                il.InsertAfter(ins, il.Create(
+                    isRes ? OpCodes.Castclass : OpCodes.Unbox_Any, retTok));
+                count++;
+            }
+        }
+        foreach (TypeDefinition nested in type.NestedTypes)
+            count += RetargetScaledResourceIn(nested, getRes, getFac);
+        return count;
+    }
+
+    // Detach helper for CpuDrawingContext teardown: if a command-list
+    // redirect is active, the scratch belongs to the list (consumed on
+    // DrawImage, else the list finalizer frees it), never to this dc.
+    // Restores this dc's own pre-redirect target (saved on the list by
+    // SetTarget) and clears the redirect; the caller then tears down
+    // normally. Without this, Dispose frees the list's scratch and the
+    // list finalizer later dies in FromHandle on the recycled slot
+    // (InvalidCast -> runtime exit 255, seen on brush strokes).
+    private static void EmitRedirectDetach(
+        ILProcessor il, MethodDefinition owner,
+        FieldDefinition targetField, FieldDefinition redirField, TypeDefinition cpuCmdList)
+    {
+        var redirLoc = new VariableDefinition(cpuCmdList);
+        owner.Body.Variables.Add(redirLoc);
+        FieldDefinition savedF = cpuCmdList.Fields.First(f => f.Name == "_saved");
+        FieldDefinition redirDcF = cpuCmdList.Fields.First(f => f.Name == "_redirDc");
+        var attached = il.Create(OpCodes.Nop);
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Ldfld, redirField);
+        il.Emit(OpCodes.Isinst, cpuCmdList);
+        il.Emit(OpCodes.Stloc, redirLoc);
+        il.Emit(OpCodes.Ldloc, redirLoc);
+        il.Emit(OpCodes.Brfalse, attached);
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Ldloc, redirLoc);
+        il.Emit(OpCodes.Ldfld, savedF);
+        il.Emit(OpCodes.Stfld, targetField);
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Ldnull);
+        il.Emit(OpCodes.Stfld, redirField);
+        il.Emit(OpCodes.Ldloc, redirLoc);
+        il.Emit(OpCodes.Ldnull);
+        il.Emit(OpCodes.Stfld, redirDcF);
+        il.Append(attached);
+    }
+
     private static void EnsureEffectApplyResume(ModuleDefinition module, string? cpuPaintPath)
     {
         TypeDefinition menu = module.GetType("PaintDotNet.Menus.EffectMenuBase")
@@ -11625,6 +11836,111 @@ public static class AssemblyRewriter
         }
         return true;
     }
+    // Empty-bitmap guard for the PDN buffer pool (P1 WheelBitmap): an
+    // unsized (0x0) control bitmap must surface as NotSupported "(empty)"
+    // (a layout cause), not as ArgumentOutOfRange from the pool index
+    // math. BitmapBufferPool.RentImpl computes Log2RoundUp(size) before
+    // its own unpoolable-size fallback, and Log2RoundUp(0) throws; the
+    // sibling NativeAllocPool.RentImpl already answers default for 0, but a
+    // default (null-ptr) buffer dies in BitmapBase..ctor's ptr validation.
+    // So RentImpl(0) allocates a 1-byte floor via the same direct-Allocate
+    // fallback it already uses for sizes with no pool index: pools may
+    // legally over-allocate, and the 0x0 size still rides on the bitmap,
+    // so the "(empty)" report fires downstream. Nonempty sizes run
+    // pristine IL untouched.
+    // Best-effort: modules without the pool keep today's shape.
+    private static void EnsureBitmapBufferEmptyGuard(ModuleDefinition module)
+    {
+        try
+        {
+            TypeDefinition? pool = module.GetType("PaintDotNet.Imaging.BitmapBufferPool");
+            TypeDefinition? buf = module.GetType("PaintDotNet.Imaging.BitmapBuffer");
+            if (pool is null || buf is null)
+                return;
+            MethodDefinition? rentImpl = pool.Methods.FirstOrDefault(
+                m => m.Name == "RentImpl" && m.Parameters.Count == 2 && m.HasBody);
+            MethodDefinition? alloc = buf.Methods.FirstOrDefault(
+                m => m.Name == "Allocate" && m.IsStatic && m.Parameters.Count == 2);
+            if (rentImpl is null || alloc is null)
+                return;
+            MethodReference allocRef = module.ImportReference(alloc);
+            var bil = rentImpl.Body.GetILProcessor();
+            var first = rentImpl.Body.Instructions[0];
+            var nonzero = bil.Create(OpCodes.Nop);
+            bil.InsertBefore(first, bil.Create(OpCodes.Ldarg_1));
+            bil.InsertBefore(first, bil.Create(OpCodes.Brtrue_S, nonzero));
+            bil.InsertBefore(first, bil.Create(OpCodes.Ldc_I4_1));
+            bil.InsertBefore(first, bil.Create(OpCodes.Conv_I));
+            bil.InsertBefore(first, bil.Create(OpCodes.Ldarg_2));
+            bil.InsertBefore(first, bil.Create(OpCodes.Call, allocRef));
+            bil.InsertBefore(first, bil.Create(OpCodes.Ret));
+            bil.InsertBefore(first, nonzero);
+            if (rentImpl.Body.MaxStackSize < 8)
+                rentImpl.Body.MaxStackSize = 8;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException
+            || ex is Mono.Cecil.ResolutionException || ex is ArgumentException) { }
+    }
+
+    // Empty-source guard for image creation (P1 WheelBitmap, second half):
+    // BitmapImage.CreateImpl tiles the source and a 0x0 source yields
+    // zero tiles silently, so the "(empty)" report never fires on the
+    // Bgra32 fast path. The tested contract (CreateImageFromBitmap)
+    // answers NotSupported "(empty)" for an unsized source instead, so a
+    // layout cause (empty ClientRectangle) reads as layout. Nonempty
+    // sources run pristine IL untouched. Best-effort: silent elsewhere.
+    private static void EnsureEmptySourceGuard(ModuleDefinition module)
+    {
+        try
+        {
+            TypeDefinition? ext = module.GetType("PaintDotNet.Direct2D1.DeviceContextExtensions");
+            if (ext is null)
+                return;
+            MethodDefinition? cib = ext.Methods.FirstOrDefault(
+                m => m.Name == "CreateImageFromBitmap" && m.Parameters.Count == 5 && m.HasBody);
+            if (cib is null)
+                return;
+            MethodReference getSize = VirtualCpuCall(module, "PaintDotNet.Imaging.IBitmapSource", "get_Size", 0);
+            MethodReference getW = StructCpuGetter(module, "PaintDotNet.Rendering.SizeInt32", "get_Width");
+            MethodReference getH = StructCpuGetter(module, "PaintDotNet.Rendering.SizeInt32", "get_Height");
+            MethodReference nseCtor = module.ImportReference(typeof(NotSupportedException).GetConstructor([typeof(string)])!);
+            var sizeLoc = new VariableDefinition(LocalOrOwnedCpuRef(module, "PaintDotNet.Rendering.SizeInt32"));
+            var wLoc = new VariableDefinition(module.TypeSystem.Int32);
+            var hLoc = new VariableDefinition(module.TypeSystem.Int32);
+            cib.Body.Variables.Add(sizeLoc);
+            cib.Body.Variables.Add(wLoc);
+            cib.Body.Variables.Add(hLoc);
+            cib.Body.InitLocals = true;
+            var cil = cib.Body.GetILProcessor();
+            var first = cib.Body.Instructions[0];
+            var empty = cil.Create(OpCodes.Nop);
+            cil.InsertBefore(first, cil.Create(OpCodes.Ldarg_1));
+            cil.InsertBefore(first, cil.Create(OpCodes.Callvirt, getSize));
+            cil.InsertBefore(first, cil.Create(OpCodes.Stloc, sizeLoc));
+            cil.InsertBefore(first, cil.Create(OpCodes.Ldloca_S, sizeLoc));
+            cil.InsertBefore(first, cil.Create(OpCodes.Call, getW));
+            cil.InsertBefore(first, cil.Create(OpCodes.Stloc, wLoc));
+            cil.InsertBefore(first, cil.Create(OpCodes.Ldloca_S, sizeLoc));
+            cil.InsertBefore(first, cil.Create(OpCodes.Call, getH));
+            cil.InsertBefore(first, cil.Create(OpCodes.Stloc, hLoc));
+            cil.InsertBefore(first, cil.Create(OpCodes.Ldloc, wLoc));
+            cil.InsertBefore(first, cil.Create(OpCodes.Ldc_I4_1));
+            cil.InsertBefore(first, cil.Create(OpCodes.Blt, empty));
+            cil.InsertBefore(first, cil.Create(OpCodes.Ldloc, hLoc));
+            cil.InsertBefore(first, cil.Create(OpCodes.Ldc_I4_1));
+            cil.InsertBefore(first, cil.Create(OpCodes.Blt, empty));
+            cil.InsertBefore(first, cil.Create(OpCodes.Br, first));
+            cil.InsertBefore(first, empty);
+            cil.InsertBefore(first, cil.Create(OpCodes.Ldstr, "DeviceContextExtensions.CreateImageFromBitmap has no headless backend (empty)"));
+            cil.InsertBefore(first, cil.Create(OpCodes.Newobj, nseCtor));
+            cil.InsertBefore(first, cil.Create(OpCodes.Throw));
+            if (cib.Body.MaxStackSize < 8)
+                cib.Body.MaxStackSize = 8;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException
+            || ex is Mono.Cecil.ResolutionException || ex is ArgumentException) { }
+    }
+
     private static bool EnsureCpuDrawingContext(ModuleDefinition module, string cpuPaintPath)
     {
         TypeDefinition? drawCtx = module.GetType("PaintDotNet.Direct2D1.DrawingContext");
@@ -11666,9 +11982,23 @@ public static class AssemblyRewriter
         MethodReference drawBitmapCpu = Cpu("DrawBitmap", 14);
         MethodReference fillRectCpu = Cpu("FillRect", 10);
         MethodReference fillEllipseCpu = Cpu("FillEllipse", 10);
-        MethodReference createScratchCpu = Cpu("CreateScratchTarget", 2);
+        // Scratch surfaces are named by monotonic IDs (CpuPaint ID table),
+        // never by raw GCHandle values that slots recycle. Live/dc targets
+        // keep raw handles via CreateScratchTarget.
+        MethodReference createScratchCpu = Cpu("CreateScratchHandle", 8);
         MethodReference blitScratchCpu = Cpu("BlitScratchOver", 2);
         MethodReference freeScratchCpu = Cpu("FreeScratchTarget", 1);
+        // Lock-serialized scratch-slot ownership (rev202): every take and
+        // every store of a command-list _scratch funnels through one
+        // CpuPaint lock, so no 64-bit atomic emulation or torn-write
+        // interleaving on the finalizer thread can yield a stale handle.
+        // Takes run on finalize/consume; the single store runs on
+        // SetTarget create. Low frequency (per redirect/draw, never per
+        // pixel), so the lock costs nothing measurable per frame.
+        MethodReference claimScratchCpu = Cpu("ClaimScratch", 1);
+        MethodReference peekScratchCpu = Cpu("PeekScratch", 1);
+        MethodReference blitTargetCpu = Cpu("BlitTarget", 2);
+        MethodReference storeScratchCpu = Cpu("StoreScratch", 2);
         MethodReference getTransformCpu = Cpu("GetTransform", 7);
         MethodReference getTargetSizeRedirectCpu = Cpu("GetTargetSize", 3);
         RewriteIdentityFormatConverter(
@@ -11694,7 +12024,7 @@ public static class AssemblyRewriter
         TypeDefinition cpuBmp = SynthesizeCpuDeviceBitmap(module, createBitmapEmpty, freeBitmap);
         TypeDefinition cpuBrush = SynthesizeCpuDeviceBrush(module);
         TypeDefinition cpuGradient = SynthesizeCpuLinearGradientBrush(module);
-        TypeDefinition cpuCmdList = SynthesizeCpuCommandList(module, freeScratchCpu);
+        TypeDefinition cpuCmdList = SynthesizeCpuCommandList(module, freeScratchCpu, claimScratchCpu);
         MethodDefinition cmdListCtor = cpuCmdList.Methods.First(m => m.Name == ".ctor");
         FieldDefinition bmpHandleField = cpuBmp.Fields.First(f => f.Name == "_handle");
         FieldDefinition bmpWidthField = cpuBmp.Fields.First(f => f.Name == "_width");
@@ -13177,6 +13507,7 @@ public static class AssemblyRewriter
             setTarget.Body.InitLocals = true;
             FieldDefinition scratchF = cpuCmdList.Fields.First(f => f.Name == "_scratch");
             FieldDefinition savedF = cpuCmdList.Fields.First(f => f.Name == "_saved");
+            FieldDefinition redirDcF = cpuCmdList.Fields.First(f => f.Name == "_redirDc");
             var notList = sil.Create(OpCodes.Nop);
             var haveScratch = sil.Create(OpCodes.Nop);
             var doneST = sil.Create(OpCodes.Nop);
@@ -13188,6 +13519,23 @@ public static class AssemblyRewriter
             sil.Emit(OpCodes.Ldarg_0);
             sil.Emit(OpCodes.Ldfld, redirField);
             sil.Emit(OpCodes.Brtrue, doneST);
+            // Nested-take guard: a list already redirected on ANOTHER dc
+            // must not be re-taken here; the take would overwrite _saved
+            // (losing the first dc's target) and a later teardown would
+            // free whoever recycled that slot (Finalize NRE -> exit 255).
+            // The nested fills stay direct on this dc instead.
+            var takeIt = sil.Create(OpCodes.Nop);
+            sil.Emit(OpCodes.Ldloc, listLoc);
+            sil.Emit(OpCodes.Ldfld, redirDcF);
+            sil.Emit(OpCodes.Brfalse, takeIt);
+            sil.Emit(OpCodes.Ldloc, listLoc);
+            sil.Emit(OpCodes.Ldfld, redirDcF);
+            sil.Emit(OpCodes.Ldarg_0);
+            sil.Emit(OpCodes.Beq, takeIt);
+            // Refusals stay silent: the nested fills stay direct on this
+            // dc instead. (Forensics runs never observed one fire.)
+            sil.Emit(OpCodes.Br, doneST);
+            sil.Append(takeIt);
             sil.Emit(OpCodes.Ldloc, listLoc);
             sil.Emit(OpCodes.Ldarg_0);
             sil.Emit(OpCodes.Ldfld, targetField);
@@ -13200,13 +13548,6 @@ public static class AssemblyRewriter
             sil.Emit(OpCodes.Ldloca_S, stwLoc);
             sil.Emit(OpCodes.Ldloca_S, sthLoc);
             sil.Emit(OpCodes.Call, getTargetSizeRedirectCpu);
-            sil.Emit(OpCodes.Ldloc, stwLoc);
-            sil.Emit(OpCodes.Ldloc, sthLoc);
-            sil.Emit(OpCodes.Call, createScratchCpu);
-            sil.Emit(OpCodes.Stloc, stmpLoc);
-            sil.Emit(OpCodes.Ldloc, listLoc);
-            sil.Emit(OpCodes.Ldloc, stmpLoc);
-            sil.Emit(OpCodes.Stfld, scratchF);
             sil.Emit(OpCodes.Ldarg_0);
             sil.Emit(OpCodes.Ldfld, targetField);
             sil.Emit(OpCodes.Ldloca_S, stm11Loc);
@@ -13216,14 +13557,20 @@ public static class AssemblyRewriter
             sil.Emit(OpCodes.Ldloca_S, st31Loc);
             sil.Emit(OpCodes.Ldloca_S, st32Loc);
             sil.Emit(OpCodes.Call, getTransformCpu);
-            sil.Emit(OpCodes.Ldloc, stmpLoc);
+            sil.Emit(OpCodes.Ldloc, stwLoc);
+            sil.Emit(OpCodes.Ldloc, sthLoc);
             sil.Emit(OpCodes.Ldloc, stm11Loc);
             sil.Emit(OpCodes.Ldloc, stm12Loc);
             sil.Emit(OpCodes.Ldloc, stm21Loc);
             sil.Emit(OpCodes.Ldloc, stm22Loc);
             sil.Emit(OpCodes.Ldloc, st31Loc);
             sil.Emit(OpCodes.Ldloc, st32Loc);
-            sil.Emit(OpCodes.Call, setTransformCpu);
+            sil.Emit(OpCodes.Call, createScratchCpu);
+            sil.Emit(OpCodes.Stloc, stmpLoc);
+            sil.Emit(OpCodes.Ldloc, listLoc);
+            sil.Emit(OpCodes.Ldflda, scratchF);
+            sil.Emit(OpCodes.Ldloc, stmpLoc);
+            sil.Emit(OpCodes.Call, storeScratchCpu);
             sil.Append(haveScratch);
             sil.Emit(OpCodes.Ldarg_0);
             sil.Emit(OpCodes.Ldloc, listLoc);
@@ -13232,6 +13579,9 @@ public static class AssemblyRewriter
             sil.Emit(OpCodes.Ldarg_0);
             sil.Emit(OpCodes.Ldloc, listLoc);
             sil.Emit(OpCodes.Stfld, redirField);
+            sil.Emit(OpCodes.Ldloc, listLoc);
+            sil.Emit(OpCodes.Ldarg_0);
+            sil.Emit(OpCodes.Stfld, redirDcF);
             sil.Emit(OpCodes.Br, doneST);
             sil.Append(notList);
             sil.Emit(OpCodes.Ldarg_1);
@@ -13249,6 +13599,9 @@ public static class AssemblyRewriter
             sil.Emit(OpCodes.Ldarg_0);
             sil.Emit(OpCodes.Ldnull);
             sil.Emit(OpCodes.Stfld, redirField);
+            sil.Emit(OpCodes.Ldloc, listLoc);
+            sil.Emit(OpCodes.Ldnull);
+            sil.Emit(OpCodes.Stfld, redirDcF);
             sil.Append(doneST);
             sil.Emit(OpCodes.Ret);
         }
@@ -13418,13 +13771,19 @@ public static class AssemblyRewriter
             il.Emit(OpCodes.Stloc, earlyListLoc);
             il.Emit(OpCodes.Ldloc, earlyListLoc);
             il.Emit(OpCodes.Brfalse, notListEarly);
+            // Lock-serialized take (paired with the finalizer Claim): a racing
+            // finalizer observes zero and never double-frees this scratch.
             il.Emit(OpCodes.Ldloc, earlyListLoc);
-            il.Emit(OpCodes.Ldfld, earlyScratchF);
+            il.Emit(OpCodes.Ldflda, earlyScratchF);
+            il.Emit(OpCodes.Call, claimScratchCpu);
             il.Emit(OpCodes.Stloc, earlyScratchLoc);
             il.Emit(OpCodes.Ldloc, earlyScratchLoc);
             il.Emit(OpCodes.Brfalse, imgDone);
             il.Emit(OpCodes.Ldarg_0);
             il.Emit(OpCodes.Ldfld, targetField);
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldfld, redirField);
+            il.Emit(OpCodes.Call, blitTargetCpu);
             il.Emit(OpCodes.Ldloc, earlyScratchLoc);
             il.Emit(OpCodes.Call, blitScratchCpu);
             // Consume on first playback (single-playback headless): the
@@ -13433,10 +13792,6 @@ public static class AssemblyRewriter
             // paint. Leftovers die in the finalizer.
             il.Emit(OpCodes.Ldloc, earlyScratchLoc);
             il.Emit(OpCodes.Call, freeScratchCpu);
-            il.Emit(OpCodes.Ldloc, earlyListLoc);
-            il.Emit(OpCodes.Ldc_I4_0);
-            il.Emit(OpCodes.Conv_I8);
-            il.Emit(OpCodes.Stfld, earlyScratchF);
             il.Emit(OpCodes.Br, imgDone);
             il.Append(notListEarly);
             if (hasCheckerPath)
@@ -13703,11 +14058,15 @@ public static class AssemblyRewriter
                             il.Emit(OpCodes.Brfalse, doRet);
                             il.Emit(OpCodes.Ldloc, cmeListLoc);
                             il.Emit(OpCodes.Ldfld, earlyScratchF);
+                            il.Emit(OpCodes.Call, peekScratchCpu);
                             il.Emit(OpCodes.Stloc, cmeScrLoc);
                             il.Emit(OpCodes.Ldloc, cmeScrLoc);
                             il.Emit(OpCodes.Brfalse, doRet);
                             il.Emit(OpCodes.Ldarg_0);
                             il.Emit(OpCodes.Ldfld, targetField);
+                            il.Emit(OpCodes.Ldarg_0);
+                            il.Emit(OpCodes.Ldfld, redirField);
+                            il.Emit(OpCodes.Call, blitTargetCpu);
                             il.Emit(OpCodes.Ldloc, cmeScrLoc);
                             il.Emit(OpCodes.Call, blitScratchCpu);
                         }
@@ -13734,11 +14093,15 @@ public static class AssemblyRewriter
                             il.Emit(OpCodes.Brfalse, doRet);
                             il.Emit(OpCodes.Ldloc, cmeListLoc);
                             il.Emit(OpCodes.Ldfld, earlyScratchF);
+                            il.Emit(OpCodes.Call, peekScratchCpu);
                             il.Emit(OpCodes.Stloc, cmeScrLoc);
                             il.Emit(OpCodes.Ldloc, cmeScrLoc);
                             il.Emit(OpCodes.Brfalse, doRet);
                             il.Emit(OpCodes.Ldarg_0);
                             il.Emit(OpCodes.Ldfld, targetField);
+                            il.Emit(OpCodes.Ldarg_0);
+                            il.Emit(OpCodes.Ldfld, redirField);
+                            il.Emit(OpCodes.Call, blitTargetCpu);
                             il.Emit(OpCodes.Ldloc, cmeScrLoc);
                             il.Emit(OpCodes.Call, blitScratchCpu);
                         }
@@ -13862,21 +14225,23 @@ public static class AssemblyRewriter
             // Redirected lists carry their fills in the scratch surface:
             // blit it back in desktop order. Lists without a scratch
             // painted direct (or stayed empty): today's skip.
+            // Lock-serialized take (paired with the finalizer Claim): a racing
+            // finalizer observes zero and never double-frees this scratch.
             il.Emit(OpCodes.Ldloc, listLoc2);
-            il.Emit(OpCodes.Ldfld, scratchF2);
+            il.Emit(OpCodes.Ldflda, scratchF2);
+            il.Emit(OpCodes.Call, claimScratchCpu);
             il.Emit(OpCodes.Stloc, scratchHLoc);
             il.Emit(OpCodes.Ldloc, scratchHLoc);
             il.Emit(OpCodes.Brfalse, imgDone);
             il.Emit(OpCodes.Ldarg_0);
             il.Emit(OpCodes.Ldfld, targetField);
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldfld, redirField);
+            il.Emit(OpCodes.Call, blitTargetCpu);
             il.Emit(OpCodes.Ldloc, scratchHLoc);
             il.Emit(OpCodes.Call, blitScratchCpu);
             il.Emit(OpCodes.Ldloc, scratchHLoc);
             il.Emit(OpCodes.Call, freeScratchCpu);
-            il.Emit(OpCodes.Ldloc, listLoc2);
-            il.Emit(OpCodes.Ldc_I4_0);
-            il.Emit(OpCodes.Conv_I8);
-            il.Emit(OpCodes.Stfld, scratchF2);
             il.Emit(OpCodes.Br, imgDone);
             il.Append(tryProc);
             il.Emit(OpCodes.Ldarg_0);
@@ -14310,6 +14675,14 @@ public static class AssemblyRewriter
             ilDisp.Emit(OpCodes.Ret);
         }
         // -- Dispose(bool): last-ref teardown (write-back, then free).
+        // Detach an active command-list redirect FIRST: the scratch
+        // belongs to the list (consumed on DrawImage, else the list
+        // finalizer frees it), never to this dc. Freeing _target while
+        // redirected steals the list scratch; the list finalizer then
+        // dies in FromHandle on the recycled slot (InvalidCast ->
+        // runtime exit 255 on brush strokes). Restore this dc's own
+        // pre-redirect target (saved on the list by SetTarget) and tear
+        // down normally.
         {
             MethodDefinition baseDisposing = FindBaseVirtual(
                 ResolveCpuDef(refTrackedRef), "Dispose", m => m.Parameters.Count == 1);
@@ -14320,6 +14693,7 @@ public static class AssemblyRewriter
             dispB.Parameters.Add(new ParameterDefinition(module.TypeSystem.Boolean));
             dispB.Overrides.Add(module.ImportReference(baseDisposing));
             var ilDispB = dispB.Body.GetILProcessor();
+            EmitRedirectDetach(ilDispB, dispB, targetField, redirField, cpuCmdList);
             ilDispB.Emit(OpCodes.Ldarg_0);
             ilDispB.Emit(OpCodes.Call, writeback);
             ilDispB.Emit(OpCodes.Ldarg_0);
@@ -14335,10 +14709,24 @@ public static class AssemblyRewriter
         // types answer default; void members are headless no-ops.
         MethodReference notSupportedCtor = module.ImportReference(
             typeof(NotSupportedException).GetConstructor(new[] { typeof(string) })!);
+        // Signature dedupe (rev204): the union walk can carry the same
+        // member from two interfaces (observed: get_MaximumBitmapSize
+        // twice). Object identity lets the second through and Cecil
+        // writes two same-signature methods (invalid IL; dispatch then
+        // picks one arbitrarily). Skip already-emitted signatures.
+        var implementedSig = new HashSet<string>(StringComparer.Ordinal);
+        foreach (MethodDefinition done in implemented)
+            implementedSig.Add(done.Name + "(" + string.Join(",",
+                done.Parameters.Select(p => p.ParameterType.FullName))
+                + ")->" + done.ReturnType.FullName);
         foreach (MethodDefinition contract in contracts)
         {
-            if (!implemented.Add(contract))
+            string sig = contract.Name + "(" + string.Join(",",
+                contract.Parameters.Select(p => p.ParameterType.FullName))
+                + ")->" + contract.ReturnType.FullName;
+            if (!implementedSig.Add(sig))
                 continue;
+            implemented.Add(contract);
             var impl = new MethodDefinition(
                 contract.Name,
                 MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.Final
@@ -14350,6 +14738,7 @@ public static class AssemblyRewriter
             var il = impl.Body.GetILProcessor();
             if (contract.Name == "Dispose" && contract.Parameters.Count == 0)
             {
+                EmitRedirectDetach(il, impl, targetField, redirField, cpuCmdList);
                 il.Emit(OpCodes.Ldarg_0);
                 il.Emit(OpCodes.Ldfld, targetField);
                 il.Emit(OpCodes.Call, freeContext);

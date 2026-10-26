@@ -19,6 +19,16 @@ internal static partial class BrowserText
     [JSImport("globalThis.wfwasmTextMeasure")]
     internal static partial double TextMeasureWidth(string text, string fontCss, int fontPx, int maxW);
 
+    // Private-font bridge (Syncfusion/Telerik icon fonts): AddMemoryFont
+    // bytes are registered with the browser via FontFace so canvas
+    // fillText resolves them. Check is synchronous (document.fonts.check);
+    // registration is fire-and-forget (FontFace.load promise); the tofu
+    // purge below re-rasters once the family confirms loaded.
+    [JSImport("globalThis.wfwasmFontCheck")]
+    internal static partial bool FontCheck(string family);
+    [JSImport("globalThis.wfwasmRegisterFont")]
+    internal static partial void RegisterFont(string family, string base64);
+
     private static int s_caps; // 0 = unprobed, 1 = available, -1 = unavailable
 
     internal static bool IsAvailable
@@ -59,8 +69,64 @@ internal static partial class BrowserText
     // browser canvas measure. Never throws.
     internal static Func<string, Font, float, int, float?>? MeasureWidthOverride;
 
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> s_fontConfirmed =
+        new(System.StringComparer.Ordinal);
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> s_fontKickStarted =
+        new(System.StringComparer.Ordinal);
+
+    // Fire-and-forget browser registration for a private family. Called
+    // eagerly from AddMemoryFont (wins the boot race) and as a backstop
+    // from EnsurePrivateFont. Never throws.
+    internal static void KickFontRegistration(string family, byte[] bytes)
+    {
+        try
+        {
+            if (s_fontKickStarted.TryAdd(family, 1))
+            {
+                try { RegisterFont(family, System.Convert.ToBase64String(bytes)); }
+                catch { }
+            }
+        }
+        catch { }
+    }
+
+    // Ensures a private (AddMemoryFont) family is registered with the
+    // browser before raster/measure. System families miss the registry
+    // (one dictionary lookup). FontCheck scans document.fonts membership
+    // (document.fonts.check reports unknown families as loaded, so
+    // membership is scanned instead). Never throws:
+    // any bridge failure simply retries next paint.
+    internal static void EnsurePrivateFont(Font font)
+    {
+        try
+        {
+            string name = font.Name;
+            if (string.IsNullOrWhiteSpace(name) || s_fontConfirmed.ContainsKey(name))
+                return;
+            if (!System.Drawing.Text.PrivateFontCollection.TryGetPrivateFontBytes(name, out byte[]? bytes) || bytes is null)
+                return;
+            bool loaded;
+            try { loaded = FontCheck(name); }
+            catch { return; }
+            if (loaded)
+            {
+                // Family arrived (eager kick won the race, or a previous
+                // raster kicked it): purge any tofu cached before confirm.
+                if (s_fontConfirmed.TryAdd(name, 1))
+                {
+                    s_cache.Clear();
+                    s_widthCache.Clear();
+                }
+                return;
+            }
+            KickFontRegistration(name, bytes);
+        }
+        catch { }
+    }
+
     internal static Raster? TryMeasure(string text, Font font, float dpi, int maxW)
     {
+        EnsurePrivateFont(font);
         var probe = MeasureOverride;
         if (probe is not null)
         {
@@ -116,6 +182,7 @@ internal static partial class BrowserText
 
     internal static Raster? TryRaster(string text, Font font, float dpi, int maxW)
     {
+        EnsurePrivateFont(font);
         if (TextRasterCounters.PerfEnabled)
             TextRasterCounters.NoteRasterCall();
         var paint = RasterOverride;
@@ -208,6 +275,7 @@ internal static partial class BrowserText
 
     internal static float? TryMeasureWidth(string text, Font font, float dpi, int maxW)
     {
+        EnsurePrivateFont(font);
         if (TextRasterCounters.PerfEnabled)
             TextRasterCounters.NoteMeasureWidthCall();
         var probe = MeasureWidthOverride;

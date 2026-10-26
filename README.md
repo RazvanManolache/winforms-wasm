@@ -20,17 +20,21 @@ The idea is to **use AI to convert the “SAFE” part**: the runtime, drawing l
 
 This is an early experiment. Selected applications render and respond to input today. Compatibility is incomplete, and preserving behavior still requires testing each application's real workflows.
 
-## Latest update — 24 October 2026
+## Latest update — 26 October 2026
 
-Paint.NET's Colors panel now displays the palette strip, color wheel and RGB/HSV/opacity controls together. In a fresh browser check, selecting a palette cell changed the primary swatch, wheel marker and displayed color to **RGB 0, 255, 144 / #00FF90**. The Layers tool window and its thumbnail are visible, but full independent-layer behavior remains unverified.
+This checkpoint improves command-list resource ownership, text clipping and trimming, connected paths, image-list decoding and private-font registration. Forms avoid duplicate Load events and maximized windows receive viewport placement. New tests cover GC pressure, storage, rendering and platform contracts.
 
-![Paint.NET in the browser after selecting a palette color; the primary swatch and RGB/HSV controls update](docs/screenshots/paint-net-palette-selected-2026-10-24.png)
+The portable source build succeeds. The unfiltered native run records **2,091 passes and 23 failures**; browser editing and performance remain incomplete. Paint.NET opens and palette selection works with the optional full-WindowsBase configuration, but the longer brush check stalled. Focus/window-handling edits that introduced additional regressions were held back.
 
-This source update also includes rectangular clipping/fill corrections, retained scroll-shift groundwork, explicit opt-in diagnostics, native/resource compatibility fixes and stronger browser-test acceptance checks. Normal application painting still uses CPU bitmaps; these changes are not a broad GPU-acceleration or performance acceptance claim.
+See [the changes, validation and limits](docs/update-2026-10-26-drawing-and-lifetimes.md) and [the next compatibility/performance tasks](docs/next-agent-2026-10-26.md).
 
-**Still experimental:** the longer Paint.NET brush/layer check exposed a runtime-ending command-list cleanup failure. The source build and focused base gate pass; the broader unfiltered native run has **1,906 passes and 25 failures**, including missing integration inputs and unresolved defects. We are publishing the progress with those limits visible, not claiming that all editing workflows or benchmarks work.
+### Previous visual update — 24 October 2026
 
-See [the new captures, validation and remaining work](docs/update-2026-10-24-colors-and-panels.md), the [previous panel/thumbnail update](docs/update-2026-10-22-panels.md), and [integration architecture](docs/integration-bridges.md). Application files and converted assemblies remain excluded.
+Paint.NET's Colors panel displays the palette strip, color wheel and RGB/HSV/opacity controls together. Selecting a palette cell changed the primary swatch and displayed color to **RGB 0, 255, 144 / #00FF90**. The Layers tool window and its thumbnail are visible, but full independent-layer behavior remains unverified.
+
+![Paint.NET in the browser after selecting a palette color; the primary swatch and RGB/HSV controls update, captured 24 October](docs/screenshots/paint-net-palette-selected-2026-10-24.png)
+
+See [the dated captures and remaining work](docs/update-2026-10-24-colors-and-panels.md), the [previous panel/thumbnail update](docs/update-2026-10-22-panels.md), and [integration architecture](docs/integration-bridges.md). Application files and converted assemblies remain excluded. Normal application painting still uses CPU bitmaps; broad GPU acceleration remains work in progress.
 
 ## Recent progress — October 2026
 
@@ -93,9 +97,9 @@ Open [http://127.0.0.1:5210](http://127.0.0.1:5210). The checkout starts with th
 
 The script builds the fork and rewriter, generates the browser-compatible runtime under the ignored `.artifacts/` directory, and builds the host. See [build instructions](docs/building.md) for individual steps, tests, and locally supplied applications.
 
-![Fresh source-only checkout: the built-in form responds to a button click](docs/screenshots/base-project-2026-10-24.png)
+![Fresh source-only checkout: the built-in form responds to a button click](docs/screenshots/base-project-2026-10-26.png)
 
-*24 October clean-source check: the exported tree builds without application inputs. The built-in button changes its counter to 1; the library contains that form and 27 unprepared optional benchmark entries. No browser console or page errors occurred in this base run.*
+*26 October clean-source check: the exported tree builds without application inputs and passes the focused base gate. The built-in button changes its counter to 1; the library contains that form and 27 unprepared optional benchmark entries. No browser console or page errors occurred in this base run.*
 
 ## Current scope
 

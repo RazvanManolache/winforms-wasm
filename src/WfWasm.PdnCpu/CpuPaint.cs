@@ -49,8 +49,32 @@ public static unsafe class CpuPaint
 
     private static void FreeHandle(long handle)
     {
-        if (handle != 0)
-            GCHandle.FromIntPtr((IntPtr)handle).Free();
+        // Fail closed on scratch IDs (negative): they are owned by the
+        // ID table and freed via Claim; freeing the ID value itself as
+        // a GCHandle would corrupt an unrelated slot.
+        if (handle <= 0)
+            return;
+        GCHandle.FromIntPtr((IntPtr)handle).Free();
+    }
+
+    // rev204: target operands arrive as raw handles or scratch IDs.
+    // Scratch IDs are negative (raw GCHandle values are never negative),
+    // so the two spaces are unmistakable and need no value guessing:
+    // negative resolves through the ID table, the rest pass through.
+    // Unknown/stale IDs answer null and callers skip (fail closed).
+    private static Target? TargetOf(long v)
+    {
+        if (v == 0)
+            return null;
+        if (v < 0)
+        {
+            lock (s_cmdListLock)
+            {
+                return s_scratchMap.TryGetValue(v, out long h)
+                    ? FromHandle<Target>(h) : null;
+            }
+        }
+        return FromHandle<Target>(v);
     }
 
     public static long CreateContext(IntPtr target, int width, int height, int stride)
@@ -76,27 +100,27 @@ public static unsafe class CpuPaint
     // (get_PixelSize/get_Size/get_PixelFormat). Primitives only, like the
     // rest of this surface. Unknown/zero handles answer 0 (callers treat an
     // empty size as nothing-to-draw, matching the native default path).
-    public static int GetTargetWidth(long ctx) => ctx == 0 ? 0 : FromHandle<Target>(ctx).Width;
-    public static int GetTargetHeight(long ctx) => ctx == 0 ? 0 : FromHandle<Target>(ctx).Height;
-    public static int GetTargetStride(long ctx) => ctx == 0 ? 0 : FromHandle<Target>(ctx).Stride;
-    public static int GetTargetBpp(long ctx) => ctx == 0 ? 0 : FromHandle<Target>(ctx).Bpp;
+    public static int GetTargetWidth(long ctx) => TargetOf(ctx)?.Width ?? 0;
+    public static int GetTargetHeight(long ctx) => TargetOf(ctx)?.Height ?? 0;
+    public static int GetTargetStride(long ctx) => TargetOf(ctx)?.Stride ?? 0;
+    public static int GetTargetBpp(long ctx) => TargetOf(ctx)?.Bpp ?? 0;
 
     public static void SetTransform(long ctx, float m11, float m12, float m21, float m22, float m31, float m32)
     {
-        if (ctx == 0)
+        var t = TargetOf(ctx);
+        if (t == null)
             return;
-        var t = FromHandle<Target>(ctx);
         t.M11 = m11; t.M12 = m12; t.M21 = m21; t.M22 = m22; t.M31 = m31; t.M32 = m32;
     }
 
     public static void GetTransform(long ctx, out float m11, out float m12, out float m21, out float m22, out float m31, out float m32)
     {
-        if (ctx == 0)
+        var t = TargetOf(ctx);
+        if (t == null)
         {
             m11 = 1f; m12 = 0f; m21 = 0f; m22 = 1f; m31 = 0f; m32 = 0f;
             return;
         }
-        var t = FromHandle<Target>(ctx);
         m11 = t.M11; m12 = t.M12; m21 = t.M21; m22 = t.M22; m31 = t.M31; m32 = t.M32;
     }
 
@@ -163,6 +187,31 @@ public static unsafe class CpuPaint
     // back, Dispose frees it. Identity matrix on creation; the
     // SetTarget rewrite copies the live matrix in (GetTransform /
     // SetTransform) so redirected fills map exactly like direct ones.
+    // rev195: ScaledResource<T> generic-instantiation callvirt trips
+    // Mono class loading headless (ArrowButton glyph fetch kind-17s its
+    // whole paint; PdnToolBar/numeric self-paints fail the same way via
+    // InvokeWithOneArg). The getters are trivial backing-field reads;
+    // serve them through reflection so no generic token executes.
+    public static object ScaledResourceGet(object scaled)
+    {
+        if (scaled == null) return null;
+        var f = scaled.GetType().GetField("<Resource>k__BackingField",
+            System.Reflection.BindingFlags.Instance
+            | System.Reflection.BindingFlags.NonPublic
+            | System.Reflection.BindingFlags.Public);
+        return f?.GetValue(scaled);
+    }
+
+    public static object ScaledResourceFactor(object scaled)
+    {
+        if (scaled == null) return null;
+        var f = scaled.GetType().GetField("<ScaleFactor>k__BackingField",
+            System.Reflection.BindingFlags.Instance
+            | System.Reflection.BindingFlags.NonPublic
+            | System.Reflection.BindingFlags.Public);
+        return f?.GetValue(scaled);
+    }
+
     public static long CreateScratchTarget(int width, int height)
     {
         if (width <= 0 || height <= 0)
@@ -195,8 +244,10 @@ public static unsafe class CpuPaint
         {
             return;
         }
-        var d = FromHandle<Target>(dst);
-        var s = FromHandle<Target>(src);
+        var d = TargetOf(dst);
+        var s = TargetOf(src);
+        if (d == null || s == null)
+            return;
         if (d.Bpp != 4 || s.Bpp != 4)
         {
             return;
@@ -221,7 +272,9 @@ public static unsafe class CpuPaint
     {
         if (scratch == 0)
             return;
-        var t = FromHandle<Target>(scratch);
+        var t = TargetOf(scratch);
+        if (t == null)
+            return;
         if (t.IsPinned)
         {
             t.Pin.Free();
@@ -229,6 +282,105 @@ public static unsafe class CpuPaint
         }
         FreeHandle(scratch);
     }
+
+    // Lock-serialized scratch-slot access (rev202): every take and every
+    // store of a command-list _scratch goes through this lock, so no
+    // 64-bit atomic emulation or torn-write interleaving on the finalizer
+    // thread can yield a stale handle. Takes run on finalize/consume;
+    // stores run on SetTarget; bodies never call out (no reentrancy).
+    private static readonly object s_cmdListLock = new();
+
+    // Scratch-handle identity table (rev203): command-list _scratch fields
+    // name allocations by monotonic IDs, never by raw GCHandle values.
+    // GCHandle slots recycle numerically, so a stale field value can alias
+    // a live foreign handle and a take would free something live (the
+    // Finalize NRE / exit 255). IDs never repeat: the entry is added at
+    // mint and removed at take under s_cmdListLock, and a take of an
+    // unknown ID fails closed (returns 0, reported) instead of freeing.
+    private static readonly Dictionary<long, long> s_scratchMap = new();
+    // Negative and decreasing: raw GCHandle values are never negative,
+    // so IDs can never alias a live handle no matter how slots recycle.
+    private static long s_nextScratchId;
+
+    // Mint a scratch target and name it with a fresh ID. Only the
+    // command-list redirect path uses IDs; live/dc targets keep raw
+    // GCHandle values via CreateScratchTarget. The caller's matrix is
+    // applied at mint (rev204): the ID must never reach FromHandle, so
+    // SetTarget cannot copy the matrix afterwards via SetTransform.
+    public static long CreateScratchHandle(int width, int height,
+        float m11, float m12, float m21, float m22, float m31, float m32)
+    {
+        long h = CreateScratchTarget(width, height);
+        if (h == 0)
+            return 0;
+        // Fresh raw handle just minted above: cannot be a stale ID.
+        var t = TargetOf(h)!;
+        t.M11 = m11; t.M12 = m12; t.M21 = m21; t.M22 = m22; t.M31 = m31; t.M32 = m32;
+        lock (s_cmdListLock)
+        {
+            long id = --s_nextScratchId;
+            s_scratchMap[id] = h;
+            return id;
+        }
+    }
+
+    public static long ClaimScratch(ref long slot)
+    {
+        lock (s_cmdListLock)
+        {
+            long id = slot;
+            slot = 0;
+            if (id == 0)
+                return 0;
+            if (!s_scratchMap.TryGetValue(id, out long h))
+            {
+                // Fail closed: a stale (already-consumed) ID frees nothing.
+                // Unknown IDs are a bug; the ownership tests pin
+                // exactly-once consume/finalize instead of logging here.
+                return 0;
+            }
+            s_scratchMap.Remove(id);
+            return h;
+        }
+    }
+
+    public static void StoreScratch(ref long slot, long scratch)
+    {
+        lock (s_cmdListLock)
+        {
+            slot = scratch;
+        }
+    }
+
+    // rev204: look up a scratch ID without consuming it (effect-forward
+    // blits read the surface while the list still owns it; the later
+    // DrawImage consume or the finalizer frees it). Unknown IDs (already
+    // consumed) answer 0 and the blit skips.
+    public static long PeekScratch(long id)
+    {
+        if (id == 0)
+            return 0;
+        lock (s_cmdListLock)
+        {
+            return s_scratchMap.TryGetValue(id, out long h) ? h : 0;
+        }
+    }
+
+    // rev204: destination operand for a scratch blit. A redirected drawing
+    // context names its scratch ID in _target; anything else is already a
+    // raw handle. The redirect state (not the value) decides, so raw
+    // handles can never alias IDs. Unknown IDs fail closed to 0 and the
+    // blit skips.
+    public static long BlitTarget(long target, object? redirList)
+    {
+        if (redirList == null)
+            return target;
+        lock (s_cmdListLock)
+        {
+            return s_scratchMap.TryGetValue(target, out long raw) ? raw : 0;
+        }
+    }
+
 
     // Pins the pixel buffer and answers its address so PDN source
     // pixels can be uploaded with IBitmapSource.CopyPixels. Every
@@ -325,9 +477,11 @@ public static unsafe class CpuPaint
         float sx, float sy, float sw, float sh, bool hasSrc,
         float opacity, bool bilinear)
     {
-        if (ctx == 0 || bmp == 0)
+        if (bmp == 0)
             return;
-        var t = FromHandle<Target>(ctx);
+        var t = TargetOf(ctx);
+        if (t == null)
+            return;
         var b = FromHandle<Bitmap>(bmp);
         if (opacity <= 0f || b.Width <= 0 || b.Height <= 0)
             return;
@@ -607,9 +761,9 @@ public static unsafe class CpuPaint
 
     public static void ClearTarget(long ctx, float r, float g, float b, float a, bool hasColor)
     {
-        if (ctx == 0)
+        var t = TargetOf(ctx);
+        if (t == null)
             return;
-        var t = FromHandle<Target>(ctx);
         if (!hasColor)
             r = g = b = a = 0f;
         if (t.Bpp == 4)
@@ -654,7 +808,10 @@ public static unsafe class CpuPaint
     {
         if (ctx == 0 || opacity <= 0f || w <= 0f || h <= 0f)
             return;
-        FillRectT(FromHandle<Target>(ctx), x, y, w, h, opacity, r, g, b, a);
+        var frt = TargetOf(ctx);
+        if (frt == null)
+            return;
+        FillRectT(frt, x, y, w, h, opacity, r, g, b, a);
     }
 
     private static void FillRectT(
@@ -683,7 +840,10 @@ public static unsafe class CpuPaint
     {
         if (ctx == 0 || opacity <= 0f || rx <= 0f || ry <= 0f)
             return;
-        FillEllipseT(FromHandle<Target>(ctx), cx, cy, rx, ry, opacity, r, g, b, a);
+        var fet = TargetOf(ctx);
+        if (fet == null)
+            return;
+        FillEllipseT(fet, cx, cy, rx, ry, opacity, r, g, b, a);
     }
 
     private static void FillEllipseT(
@@ -725,9 +885,11 @@ public static unsafe class CpuPaint
     public static void FillGeometry(
         long ctx, object? geoProvider, float opacity, float r, float g, float b, float a)
     {
-        if (ctx == 0 || geoProvider is null || opacity <= 0f || a <= 0f)
+        if (geoProvider is null || opacity <= 0f || a <= 0f)
             return;
-        var t = FromHandle<Target>(ctx);
+        var t = TargetOf(ctx);
+        if (t == null)
+            return;
         FillGeometryProvider(t, geoProvider, Math.Clamp(a, 0f, 1f) * opacity, r, g, b);
     }
 
@@ -1223,7 +1385,9 @@ public static unsafe class CpuPaint
             size = Convert.ToDouble(getSize.Invoke(layoutProv, null));
         if (size <= 0)
             return;
-        var t = FromHandle<Target>(ctx);
+        var t = TargetOf(ctx);
+        if (t == null)
+            return;
         float alpha = Math.Clamp(a, 0f, 1f) * opacity;
         float scale = (float)(size / 7.0);
         float cx = x;
@@ -1266,10 +1430,12 @@ public static unsafe class CpuPaint
         long ctx, byte[]? rgba, int w, int h, float x, float y,
         float opacity, float r, float g, float b, float a)
     {
-        if (ctx == 0 || rgba is null || rgba.Length < w * h * 4
+        if (rgba is null || rgba.Length < w * h * 4
             || w <= 0 || h <= 0 || opacity <= 0f || a <= 0f)
             return;
-        var t = FromHandle<Target>(ctx);
+        var t = TargetOf(ctx);
+        if (t == null)
+            return;
         float ink = Math.Clamp(a, 0f, 1f) * opacity;
         if (t.M12 != 0f || t.M21 != 0f)
             return;
@@ -2135,9 +2301,11 @@ public static unsafe class CpuPaint
         long ctx, object? geoProvider, float width, float opacity,
         float r, float g, float b, float a)
     {
-        if (ctx == 0 || geoProvider is null || width <= 0f || opacity <= 0f || a <= 0f)
+        if (geoProvider is null || width <= 0f || opacity <= 0f || a <= 0f)
             return;
-        var t = FromHandle<Target>(ctx);
+        var t = TargetOf(ctx);
+        if (t == null)
+            return;
         float alpha = Math.Clamp(a, 0f, 1f) * opacity;
         float radius = width / 2f;
         double step = Math.Max(0.5, width / 2);
@@ -2443,7 +2611,13 @@ public static unsafe class CpuPaint
             height = 0;
             return;
         }
-        Target t = FromHandle<Target>(ctx);
+        Target? t = TargetOf(ctx);
+        if (t == null)
+        {
+            width = 0;
+            height = 0;
+            return;
+        }
         width = t.Width;
         height = t.Height;
     }
@@ -2566,9 +2740,11 @@ public static unsafe class CpuPaint
         long ctx, float x, float y, float w, float h,
         long lut, float x0, float y0, float x1, float y1, int spread)
     {
-        if (ctx == 0 || lut == 0 || w <= 0f || h <= 0f)
+        if (lut == 0 || w <= 0f || h <= 0f)
             return;
-        Target t = FromHandle<Target>(ctx);
+        Target? t = TargetOf(ctx);
+        if (t == null)
+            return;
         float[] table = FromHandle<float[]>(lut);
         float rx0 = x * t.M11 + y * t.M21 + t.M31;
         float ry0 = x * t.M12 + y * t.M22 + t.M32;
@@ -4358,9 +4534,11 @@ public static unsafe class CpuPaint
         long ctx, float x, float y, float w, float h,
         uint c1, uint c2, int tile)
     {
-        if (ctx == 0 || w <= 0f || h <= 0f || tile <= 0)
+        if (w <= 0f || h <= 0f || tile <= 0)
             return;
-        Target t = FromHandle<Target>(ctx);
+        Target? t = TargetOf(ctx);
+        if (t == null)
+            return;
         if (t.Bpp != 4)
             return;
         float x0 = x * t.M11 + y * t.M21 + t.M31;

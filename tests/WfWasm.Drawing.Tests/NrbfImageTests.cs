@@ -92,6 +92,44 @@ public sealed class NrbfImageTests
         Assert.Equal(256, decoded.Height);
     }
 
+    // Real Syncfusion.Diagram.Base Bold payload (netfx writer
+    // envelope: 04 + 7-bit length + raw BMP, 16x16 8bpp). 62 Bitmap
+    // entries in that stream share this exact shape (BMP and PNG).
+    private const string BoldBlobBase64 =
+"BLYKQk02BQAAAAAAADYEAAAoAAAAEAAAABAAAAABAAgAAAAAAAABAAAzCwAAMwsAAAABAAAAAQAAAAAAAO/n5wD37+8A9/f3AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A/wD/AP////////////////////////////////////////////////////////////////////////////////////////8AAAAAAAAAAP///////////wAAAP//AAAA//////////8AAAD//wAAAP//////////AAAA//8AAAD//////////wAAAAAAAAD///////////8AAAD//wAAAP//////////AAAA//8AAAD//////////wAAAP//AAAA/////////wAAAAAAAAAA//////////////////////////////////////////////////////////////////////8=";
+
+    [Fact]
+    public void Prefixed_Netfx04_Marker_Lifts_Bmp()
+    {
+        byte[] payload = System.Convert.FromBase64String(BoldBlobBase64);
+        Assert.True(WfNrbf.TryExtractPrefixedImageBytes(payload, out byte[] image));
+        Assert.Equal(1334, image.Length);
+        Assert.Equal((byte)'B', image[0]);
+        Assert.Equal((byte)'M', image[1]);
+        using var ms = new MemoryStream(image, false);
+        using var decoded = new WfBitmap(ms);
+        Assert.Equal(16, decoded.Width);
+        Assert.Equal(16, decoded.Height);
+    }
+
+    [Fact]
+    public void Prefixed_Core02_Marker_Lifts_Png()
+    {
+        byte[] png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01, 0x02];
+        byte[] payload = [0x02, (byte)png.Length, .. png];
+        Assert.True(WfNrbf.TryExtractPrefixedImageBytes(payload, out byte[] image));
+        Assert.Equal(png, image);
+    }
+
+    [Theory]
+    [InlineData(new byte[] { 0x04, 0x01, 0x00 })]
+    [InlineData(new byte[] { 0x04, 0x02, (byte)'X', (byte)'Y' })]
+    [InlineData(new byte[] { 0x04, 0x05, (byte)'B', (byte)'M' })]
+    public void Prefixed_Malformed_Returns_False(byte[] payload)
+    {
+        Assert.False(WfNrbf.TryExtractPrefixedImageBytes(payload, out _));
+    }
+
     private static byte[]? ReadResourcePayload(string asmPath, string stream, string name, out string? typeName)
     {
         typeName = null;

@@ -297,6 +297,12 @@ namespace System.Drawing.Drawing2D
                 figure.Points.Add(pt1);
                 figure.Types.Add(Start);
             }
+            else if (figure.Points[^1] != pt1)
+            {
+                // GDI+ joins an appended segment to its own start.
+                figure.Points.Add(pt1);
+                figure.Types.Add(Line);
+            }
 
             figure.Points.Add(pt2);
             figure.Types.Add(Line);
