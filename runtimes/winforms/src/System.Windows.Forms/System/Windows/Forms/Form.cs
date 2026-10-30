@@ -4528,11 +4528,14 @@ public partial class Form : ContainerControl
             if (Application.RenderWithVisualStyles)
             {
                 _sizeGripRenderer ??= new VisualStyleRenderer(VisualStyleElement.Status.Gripper.Normal);
-
                 using DeviceContextHdcScope hdc = new(e);
-                _sizeGripRenderer.DrawBackground(
-                    hdc,
-                    new Rectangle(size.Width - SizeGripSize, size.Height - SizeGripSize, SizeGripSize, SizeGripSize));
+                // NOTE: keep this call in its original (HDC, Rectangle, HWND)
+                // shape. The rewriter deliberately skips HWND-tailed
+                // DrawBackground sites: the valuetype-exact spin helper they
+                // would need does not bind headless (interpreter kind-17),
+                // and HDC carries no pixels the helper could paint without
+                // a Graphics. The stubbed P/Invoke is a safe headless no-op.
+                _sizeGripRenderer.DrawBackground(hdc, new Rectangle(size.Width - SizeGripSize, size.Height - SizeGripSize, SizeGripSize, SizeGripSize));
             }
             else
             {
@@ -4554,6 +4557,7 @@ public partial class Form : ContainerControl
 
     /// <summary>
     ///  Raises the Resize event.
+
     /// </summary>
     [EditorBrowsable(EditorBrowsableState.Advanced)]
     protected override void OnResize(EventArgs e)

@@ -57,7 +57,7 @@ public sealed class NrbfImageTests
         // fav_full (16x13 PNG) from the real BookShelf resources: the
         // ground-truth shape the walker must accept. Skips when the
         // demo is absent (same guard as the rewrite fixture tests).
-        string exe = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\ExamplesProjects\BookShelf\bin\BookShelf.exe");
+        const string exe = @"E:\AI\Code\WindowsForms\telerik\Telerik UI for WinForms demos\ExamplesProjects\BookShelf\bin\BookShelf.exe";
         if (!File.Exists(exe)) return;
         byte[]? raw = ReadResourcePayload(exe, "BookShelf.Properties.Resources.resources", "fav_full", out string? typeName);
         Assert.NotNull(raw);
@@ -76,7 +76,7 @@ public sealed class NrbfImageTests
     {
         // WinFormsIcon (32x32) from the real Telerik resources: the
         // two-member Icon shape with the embedded Size class.
-        string dll = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release\Telerik.WinControls.dll");
+        const string dll = @"E:\AI\Code\WindowsForms\telerik\Telerik UI for WinForms demos\Bin\Release\Telerik.WinControls.dll";
         if (!File.Exists(dll)) return;
         byte[]? raw = ReadResourcePayload(dll, "Telerik.WinControls.Properties.Resources.resources", "WinFormsIcon", out string? typeName);
         Assert.NotNull(raw);

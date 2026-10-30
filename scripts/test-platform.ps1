@@ -1,4 +1,4 @@
-param([string]$ResultsDirectory = (Join-Path (Split-Path $PSScriptRoot -Parent) '.artifacts/platform-results'))
+param([string]$ResultsDirectory = 'E:/tmp/wf-platform-results')
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
 Push-Location $projectRoot

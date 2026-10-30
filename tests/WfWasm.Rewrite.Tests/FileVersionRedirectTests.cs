@@ -68,7 +68,7 @@ public sealed class FileVersionRedirectTests
 
     private static bool TryRewriteCyotek(out string tempOut)
     {
-        string input = TestPaths.Repo(@".artifacts\benchmark-apps\benchmark-cyotek\Cyotek.Windows.Forms.ColorPicker.Demo.exe");
+        string input = @"E:\AI\Code\WindowsForms\.artifacts\benchmark-apps\benchmark-cyotek\Cyotek.Windows.Forms.ColorPicker.Demo.exe";
         tempOut = Path.Combine(Path.GetTempPath(), $"CyotekDemo_FileVersion_{Guid.NewGuid()}.dll");
         if (!File.Exists(input)) return false;
         string formsDll = ShimDll("WfWasm.WinForms", "WfWasm.WinForms");

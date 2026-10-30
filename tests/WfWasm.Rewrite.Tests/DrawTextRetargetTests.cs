@@ -14,7 +14,7 @@ namespace WfWasm.Rewrite.Tests;
 // in place (never rewritten on disk).
 public sealed class DrawTextRetargetTests
 {
-    private static readonly string VendorDir = TestPaths.Repo(@"external-apps\syncfusion\syncfusion-treeview");
+    private const string VendorDir = @"E:/tmp/wfwasm-syncfusion-apps/syncfusion-treeview";
 
     private static AssemblyDefinition? LoadVendor(string file)
     {

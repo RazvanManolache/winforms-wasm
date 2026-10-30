@@ -52,6 +52,14 @@ public sealed record BlitBitmapCommand(
 public sealed record PatchBitmapCommand(
     string LayerId, int X, int Y, int Width, int Height, byte[] Rgba) : DrawCommand;
 
+/// <summary>Moves a retained layer's pixels by (DX,DY) on both sides
+/// (managed clone and browser layer) before a strip patch splices the
+/// exposed region. No pixels travel with this marker; the upload loop
+/// applies the shift out-of-band ahead of the patch so ordering
+/// shift-then-patch holds. Pixel p moves to p+(DX,DY).</summary>
+public sealed record ShiftBitmapCommand(
+    string LayerId, int DX, int DY) : DrawCommand;
+
 /// <summary>End-of-frame live set: the compositor drops unlisted layers.</summary>
 public sealed record RetainLayersCommand(
     IReadOnlyList<string> LiveIds) : DrawCommand;
@@ -106,6 +114,9 @@ public sealed class RecordingRenderer : ICanvasRenderer
 
     public void PatchBitmap(string layerId, int x, int y, int width, int height, byte[] rgba) =>
         _commands.Add(new PatchBitmapCommand(layerId, x, y, width, height, rgba));
+
+    public void ShiftBitmap(string layerId, int dx, int dy) =>
+        _commands.Add(new ShiftBitmapCommand(layerId, dx, dy));
 
     public void RetainLayers(IReadOnlyList<string> liveIds) =>
         _commands.Add(new RetainLayersCommand(liveIds));

@@ -20,7 +20,7 @@ public sealed class GenericConstraintScopeTests
         // foreign TypeReference re-scoped IObjectRef to System.Numerics.Vectors
         // at write time (live TypeLoad token 010002E7, paint brush strokes and
         // GPU-effect dialogs dead). The constraint must stay ComponentModel.
-        string corePath = TestPaths.Repo(@"targets\paint.net\PaintDotNet.Windows.Core.dll");
+        string corePath = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.Windows.Core.dll";
         if (!File.Exists(corePath)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
         string tempOut = Path.Combine(Path.GetTempPath(), $"WindowsCore_GCon_{Guid.NewGuid()}.dll");

@@ -162,7 +162,7 @@ public sealed class TextBoxTextLengthRedirectTests
     [Fact]
     public void Real_SfInput_TextLength_Sites_Rewritten_With_Intact_Control_Flow()
     {
-        string src = TestPaths.Repo(@"external-apps\syncfusion\syncfusion-calendar\Syncfusion.SfInput.WinForms.dll");
+        string src = @"E:\tmp\wfwasm-syncfusion-apps\syncfusion-calendar\Syncfusion.SfInput.WinForms.dll";
         Assert.True(File.Exists(src), $"vendor SfInput missing: {src}");
         string tmp = Path.Combine(Path.GetTempPath(), $"SfInputTextLength_{Guid.NewGuid()}.dll");
         string out2 = Path.Combine(Path.GetTempPath(), $"SfInputTextLengthOut_{Guid.NewGuid()}.dll");

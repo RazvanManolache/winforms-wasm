@@ -1,7 +1,7 @@
 param(
-    [string]$SourceRoot = (Join-Path (Split-Path $PSScriptRoot -Parent) 'external-apps/syncfusion-sources'),
-    [string]$OutputRoot = (Join-Path (Split-Path $PSScriptRoot -Parent) 'external-apps/syncfusion'),
-    [string]$EvidenceRoot = (Join-Path (Split-Path $PSScriptRoot -Parent) '.artifacts/syncfusion-evidence')
+    [string]$SourceRoot = 'E:/tmp/wfwasm-inputs/syncfusion-winforms-demos',
+    [string]$OutputRoot = 'E:/tmp/wfwasm-syncfusion-apps',
+    [string]$EvidenceRoot = 'E:/tmp/wfwasm-syncfusion-evidence'
 )
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path $PSScriptRoot -Parent

@@ -21,7 +21,7 @@ public sealed class RegistryRewriteTests
         // Registry/RegistryKey call to the WasmRegistry missing-key stubs.
         // Regression: NRE in GetWindowColorizationInfo <- PdnToolBar paint
         // on every PDN frame.
-        string input = TestPaths.Repo(@"targets\paint.net\PaintDotNet.SystemLayer.dll");
+        string input = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.SystemLayer.dll";
         if (!File.Exists(input)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"PdnSysLayer_Registry_{Guid.NewGuid()}.dll");
         try
@@ -77,7 +77,7 @@ public sealed class RegistryRewriteTests
         // RegistryKey has no such overload).
         // Regression: MME OpenSubKey(3) <- GetLocalTimeZone <-
         // hotelapp boot (no form created).
-        string input = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release\Telerik.WinControls.Scheduler.dll");
+        string input = @"E:\AI\Code\WindowsForms\telerik\Telerik UI for WinForms demos\Bin\Release\Telerik.WinControls.Scheduler.dll";
         if (!File.Exists(input)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"Sched_Reg3_{Guid.NewGuid()}.dll");
         try

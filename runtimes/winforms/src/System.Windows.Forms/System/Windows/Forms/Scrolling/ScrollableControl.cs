@@ -1,4 +1,4 @@
-﻿// Licensed to the .NET Foundation under one or more agreements.
+// Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.ComponentModel;
@@ -779,6 +779,14 @@ public partial class ScrollableControl : Control, IArrangedElement
 
         _displayRect.X = x;
         _displayRect.Y = y;
+
+        // Retained scroll reuse (item 4): record the pixel delta so the
+        // next frame can shift retained content and repaint only the
+        // exposed strip. Same sign as ScrollWindowEx below (pixel p moves
+        // to p+(dx,dy)). Consumed only with a matching whole-dirty and
+        // size; otherwise dropped with no behavior change.
+        if (xDelta != 0 || yDelta != 0)
+            WasmRepaintGate.NoteScroll(this, xDelta, yDelta);
 
         if (IsHandleCreated && (xDelta != 0 || yDelta != 0))
         {

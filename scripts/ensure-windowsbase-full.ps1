@@ -15,14 +15,14 @@
 # files are all produced by the pipeline itself, never hand-edited.
 #
 # Usage: ensure-windowsbase-full.ps1 [-IntermediateDir <obj/Debug/net9.0>]
-param([string]$IntermediateDir = "obj/Debug/net9.0", [Parameter(Mandatory=$true)][string]$SourceDll)
+param([string]$IntermediateDir = "obj/Debug/net9.0")
 $ErrorActionPreference = 'Stop'
 $ws = Split-Path $PSScriptRoot -Parent
 $IntermediateDir = $IntermediateDir.TrimEnd('\', '/', '"')
 if (![IO.Path]::IsPathRooted($IntermediateDir)) { $IntermediateDir = Join-Path (Get-Location) $IntermediateDir }
 
-$pristine = [IO.Path]::GetFullPath($SourceDll)
-$pristineDir = Split-Path $pristine -Parent
+$pristineDir = Join-Path $ws 'targets/paint.net'
+$pristine = Join-Path $pristineDir 'WindowsBase.dll'
 if (!(Test-Path $pristine)) { throw "pristine WindowsBase not found: $pristine" }
 $outDir = Join-Path $IntermediateDir 'full-windowsbase'
 $outDll = Join-Path $outDir 'WindowsBase.dll'
@@ -48,7 +48,7 @@ $tool = Join-Path $ws 'src/WfWasm.Rewrite.Tool/bin/Debug/net9.0/WfWasm.Rewrite.T
 # AppTransform.StubbedCopy: the stub resolver searches the file's own
 # directory, and the file itself is a byte copy (never a link — the passes
 # overwrite it in place, which through a link would corrupt pristine).
-$tmpDir = Join-Path (Join-Path $ws '.artifacts/tmp') ('stub-build-' + [Guid]::NewGuid().ToString('N'))
+$tmpDir = Join-Path 'E:/tmp/wasm-cache/tmp' ('stub-build-' + [Guid]::NewGuid().ToString('N'))
 try {
     New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
     foreach ($sib in Get-ChildItem (Join-Path $pristineDir '*.dll')) {
@@ -70,9 +70,5 @@ try {
     Write-Host "WindowsBase full copy staged: $outDll ($len bytes)"
 }
 finally {
-    $cleanupRoot = [IO.Path]::GetFullPath((Join-Path $ws '.artifacts/tmp')) + [IO.Path]::DirectorySeparatorChar
-    $cleanupTarget = [IO.Path]::GetFullPath($tmpDir)
-    if ($cleanupTarget.StartsWith($cleanupRoot, [StringComparison]::OrdinalIgnoreCase)) {
-        try { Remove-Item -LiteralPath $cleanupTarget -Recurse -Force } catch { }
-    }
+    try { Remove-Item $tmpDir -Recurse -Force } catch { }
 }

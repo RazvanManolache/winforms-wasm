@@ -14,7 +14,7 @@ public sealed class CommandListRedirectTests
 {
     private static string PaintDir()
     {
-        string dir = TestPaths.Repo(@"targets\paint.net");
+        string dir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         Assert.True(Directory.Exists(dir), "pristine PDN inputs missing: " + dir);
         return dir;
     }

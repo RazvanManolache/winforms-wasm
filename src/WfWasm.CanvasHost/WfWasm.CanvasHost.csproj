@@ -11,8 +11,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly" Version="9.0.21" />
-    <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.DevServer" Version="9.0.21" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly" Version="9.0.20" />
+    <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.DevServer" Version="9.0.20" PrivateAssets="all" />
     <PackageReference Include="System.Resources.Extensions" Version="9.0.0" />
     <!-- Full System.Configuration impl (app settings + AppSettings):
          the fork's own package reference does not flow through the
@@ -64,8 +64,9 @@
        resolve, then swap it in so the pipeline's own WebCIL conversion,
        fingerprinting and boot.json integrity cover the real bytes. -->
   <Target Name="PrepareFullWindowsBase" BeforeTargets="ResolveAssemblyReferences" Condition="'$(WfWasmWindowsBaseSource)' != ''">
-    <!-- The trailing dot keeps a final backslash from escaping the closing
-         quote when Windows parses the native PowerShell command line. -->
+    <!-- Opt-in only: without an explicit source DLL the source-only build
+         stays clean. The trailing dot keeps a final backslash from escaping
+         the closing quote when Windows parses the native command line. -->
     <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/../../scripts/ensure-windowsbase-full.ps1&quot; -IntermediateDir &quot;$(IntermediateOutputPath).&quot; -SourceDll &quot;$(WfWasmWindowsBaseSource)&quot;" />
   </Target>
 

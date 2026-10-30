@@ -11,13 +11,13 @@ public class ControlInstantiationTests
         {
             var an = new AssemblyName(args.Name);
             if (an.Name == "System.Windows.Forms" || an.Name == "System.Windows.Forms.Primitives" || an.Name == "WfWasm.WinForms")
-                return Assembly.LoadFrom(TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll"));
+                return Assembly.LoadFrom(@"E:\tmp\rewritten-small\WfWasm.WinForms.dll");
             if (an.Name == "System.ComponentModel.Primitives")
                 return typeof(System.ComponentModel.Component).Assembly;
             if (an.Name == "System.Drawing.Common")
                 return typeof(System.Drawing.Font).Assembly;
             if (an.Name == "WfWasm.Drawing")
-                return Assembly.LoadFrom(TestPaths.Repo(@"src\WfWasm.Drawing\bin\Debug\net9.0\WfWasm.Drawing.dll"));
+                return Assembly.LoadFrom(@"E:\AI\Code\WindowsForms\src\WfWasm.Drawing\bin\Debug\net9.0\WfWasm.Drawing.dll");
             return AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(a => a.GetName().Name == an.Name);
         };
         var listeners = new System.Diagnostics.TraceListener[System.Diagnostics.Trace.Listeners.Count];
@@ -59,7 +59,7 @@ public class ControlInstantiationTests
     {
         WithAssemblyResolver(() =>
         {
-            var asm = Assembly.LoadFrom(TestPaths.Repo(@".artifacts\runtime\Calculator.dll"));
+            var asm = Assembly.LoadFrom(@"E:\tmp\rewritten-small\Calculator.dll");
             var formType = asm.GetType("Calculator.Form1")!;
             using var form = (Form)Activator.CreateInstance(formType)!;
             form.Visible = true;
@@ -86,7 +86,7 @@ public class ControlInstantiationTests
     {
         WithAssemblyResolver(() =>
         {
-            var asm = Assembly.LoadFrom(TestPaths.Repo(@".artifacts\runtime\TicTacToe.dll"));
+            var asm = Assembly.LoadFrom(@"E:\tmp\rewritten-small\TicTacToe.dll");
             var formType = asm.GetType("Tic_Tac_Toe.Form1")!;
             using var form = (Form)Activator.CreateInstance(formType)!;
             form.Visible = true;
@@ -108,7 +108,7 @@ public class ControlInstantiationTests
     {
         WithAssemblyResolver(() =>
         {
-            var asm = Assembly.LoadFrom(TestPaths.Repo(@".artifacts\runtime\SimpleDailyToDoList.dll"));
+            var asm = Assembly.LoadFrom(@"E:\tmp\rewritten-small\SimpleDailyToDoList.dll");
             var formType = asm.GetType("SimpleDailyToDoList.ToDoListDashBoard_FR")!;
             using var form = (Form)Activator.CreateInstance(formType)!;
             form.Visible = true;
@@ -132,7 +132,7 @@ public class ControlInstantiationTests
     {
         WithAssemblyResolver(() =>
         {
-            var asm = Assembly.LoadFrom(TestPaths.Repo(@".artifacts\runtime\Calendar.dll"));
+            var asm = Assembly.LoadFrom(@"E:\tmp\rewritten-small\Calendar.dll");
             var formType = asm.GetType("grp2Calendar.Form1")!;
             using var form = (Form)Activator.CreateInstance(formType)!;
             form.Visible = true;

@@ -28,11 +28,16 @@ public sealed class PaintStrokeCommitTests
     }
 
     [Fact]
-    public async Task BrushDrag_Commits_Ink_To_Active_Layer()
+    public void BrushDrag_Commits_Ink_To_Active_Layer()
     {
         var host = _host;
         // Fixture pre-waits for tool readiness; re-check briefly (paint
         // settles tool init) in case collection ordering ever shifts.
+        // Synchronous sleep, never await: PDN tool activation is
+        // thread-affine (VerifyAccess, desktop single-UI-thread parity),
+        // and awaiting hops the continuation to another pool thread, after
+        // which every SetToolFromType throws (swallowed by CycleNextTool)
+        // and the tool never advances past RectangleSelect.
         host.Paint(new RecordingRenderer());
         string tool = "";
         for (int i = 0; i < 20; i++)
@@ -42,7 +47,7 @@ public sealed class PaintStrokeCommitTests
                 break;
             InvokePrivate<object?>(host, "CycleNextTool");
             host.Paint(new RecordingRenderer());
-            await Task.Delay(25);
+            Thread.Sleep(25);
         }
 
         Assert.StartsWith("PaintBrushTool", tool);

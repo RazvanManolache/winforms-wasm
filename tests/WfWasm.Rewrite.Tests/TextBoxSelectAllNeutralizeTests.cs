@@ -156,7 +156,7 @@ public sealed class TextBoxSelectAllNeutralizeTests
     [Fact]
     public void Real_SfInput_SelectAll_Sites_Neutralized_With_Intact_Control_Flow()
     {
-        string src = TestPaths.Repo(@"external-apps\syncfusion\syncfusion-calendar\Syncfusion.SfInput.WinForms.dll");
+        string src = @"E:\tmp\wfwasm-syncfusion-apps\syncfusion-calendar\Syncfusion.SfInput.WinForms.dll";
         Assert.True(File.Exists(src), $"vendor SfInput missing: {src}");
         string tmp = Path.Combine(Path.GetTempPath(), $"SfInputSelectAll_{Guid.NewGuid()}.dll");
         string out2 = Path.Combine(Path.GetTempPath(), $"SfInputSelectAllOut_{Guid.NewGuid()}.dll");

@@ -1,4 +1,4 @@
-using System.Reflection;
+﻿using System.Reflection;
 using WfWasm.Rewrite;
 
 public sealed class RewriteTests
@@ -784,7 +784,7 @@ public sealed class RewriteTests
         // DeviceBitmap upload assumes Bgra32 strides; Half sources
         // (checkbox bitmaps) widen through CreateBitmapFromHalfSource
         // instead of faulting RegionPtr stride validation.
-        string corePath = TestPaths.Repo(@"targets\paint.net\PaintDotNet.Windows.Core.dll");
+        string corePath = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.Windows.Core.dll";
         if (!File.Exists(corePath)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
         string tempOut = Path.Combine(Path.GetTempPath(), $"WindowsCore_HalfUp_{Guid.NewGuid()}.dll");
@@ -819,7 +819,7 @@ public sealed class RewriteTests
         // Brush stamps render through DrawingContext.Draw(RegionPtr):
         // the rewrite must bind a CPU subclass to the mask bytes and
         // route every brush virtual to WfWasm.PdnCpu.
-        string corePath = TestPaths.Repo(@"targets\paint.net\PaintDotNet.Windows.Core.dll");
+        string corePath = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.Windows.Core.dll";
         if (!File.Exists(corePath)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
         string tempOut = Path.Combine(Path.GetTempPath(), $"WindowsCore_Test_{Guid.NewGuid()}.dll");
@@ -1098,7 +1098,7 @@ public sealed class RewriteTests
         // CPU context must answer GetCachedOrCreateResource with real
         // CPU objects instead of the headless-backend throw (the stroke
         // died here once the float-download fix unblocked sprites).
-        string corePath = TestPaths.Repo(@"targets\paint.net\PaintDotNet.Windows.Core.dll");
+        string corePath = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.Windows.Core.dll";
         if (!File.Exists(corePath)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
         string tempOut = Path.Combine(Path.GetTempPath(), $"WindowsCore_ResCache_{Guid.NewGuid()}.dll");
@@ -1253,7 +1253,7 @@ public sealed class RewriteTests
         // died in NotNull at boot; the UIA factories now answer CPU
         // no-ops whose Try* methods return E_NOTIMPL through the
         // callers' own error channels, while anything else stays loud.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -1325,7 +1325,7 @@ public sealed class RewriteTests
         // floating-tool-window Shows and deferred UI refreshes queue
         // forever. Post/PostUserApc now invoke inline (the caller is
         // already on the only thread).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Base.dll");
         if (!File.Exists(input)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"Base_InlinePost_{Guid.NewGuid()}.dll");
@@ -1370,7 +1370,7 @@ public sealed class RewriteTests
         // Wheel/effect resource creation needs a context object but
         // never draws: get_DeviceContext answers a CPU context over
         // the shared scratch target instead of null.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Framework.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -1498,7 +1498,7 @@ public sealed class RewriteTests
         // Properties bag is live and radio/color renders stop NREing.
         // Property writes stay inert (device bag), and DrawImage
         // evaluates crop(checker) and bare checker procedurally.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
         var empty = new Dictionary<string, string>(StringComparer.Ordinal);
         var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
@@ -1678,7 +1678,7 @@ public sealed class RewriteTests
         // cache: providers exposing a SystemColor getter decompose
         // through it to a CPU solid brush (duck-typed: no provider
         // type-name comparison is involved).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -1716,7 +1716,7 @@ public sealed class RewriteTests
         // on the CPU context (Windows.Core); the circle hard shape
         // bypasses its factory-bound geometry path (paintdotnet); the
         // COM-bound IsDrawing check reports false (Windows.dll).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
         var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
         var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
@@ -1831,7 +1831,7 @@ public sealed class RewriteTests
         // although nothing was ever disposed: the list was the only CPU
         // stand-in without the IObjectRef answers. Load the transformed
         // core for real and demand the ref to itself.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -1898,7 +1898,7 @@ public sealed class RewriteTests
         // sprite body must call CpuPaint.CreateSprite/16 and wrap the
         // handle in the sibling core's CpuDeviceBitmap, with all geometry
         // (diameters, Lerp, measured size) from PDN's own math.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string coreInput = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
         if (!File.Exists(coreInput) || !File.Exists(pdnInput)) return;
@@ -1952,7 +1952,7 @@ public sealed class RewriteTests
         // D2D: the extension fills must call CpuPaint (FillGeometry/
         // FillRect/FillEllipse), resolve every callee (including the
         // synthesized GetCpuTargetHandle), and drop the device calls.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string coreInput = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(coreInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -2105,7 +2105,7 @@ public sealed class RewriteTests
         // runs the worker inline; the tile pool Enqueue runs each tile
         // synchronously and its Joins pop; RunEffectImpl notes the menu
         // for the dialog so FormClosed can resume the product DoEffect.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
         if (!File.Exists(pdnInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -2245,7 +2245,7 @@ public sealed class RewriteTests
         // dup + CpuPaint.DefuseWaitHandle, so an undisposed handle
         // leaks benignly instead of killing the tab. Order matters:
         // the dup must sit directly after the newobj (stack-neutral).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
         if (!File.Exists(pdnInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -2312,7 +2312,7 @@ public sealed class RewriteTests
         // never completes without a thread pump, so every undo dies at
         // get_Object (IOE "current state"). The rewrite flips that one
         // bool to synchronous; the save then runs inline in the ctor.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
         if (!File.Exists(pdnInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -2363,7 +2363,7 @@ public sealed class RewriteTests
         // get_Object once the target promotes past gen 0. The rewrite
         // pins the target in a private strong field: the ctor stores
         // it, get_Target and both TryGetTarget overloads answer it.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string runtimeInput = Path.Combine(paintDir, "PaintDotNet.Runtime.dll");
         if (!File.Exists(runtimeInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -2433,7 +2433,7 @@ public sealed class RewriteTests
         // image at the getter so every row (Paintbrush, New Image,
         // ...) is text-only. All get_Image callers pass the value
         // into another memento ctor or branch on null.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
         if (!File.Exists(pdnInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -2473,7 +2473,7 @@ public sealed class RewriteTests
         // (get_Data IOEs immediately, "born-threw", and at undo).
         // The rewrite reduces Flush to ret; the pinned target then
         // lives as long as its memento on the stack.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
         if (!File.Exists(pdnInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -2508,10 +2508,12 @@ public sealed class RewriteTests
         // them on a dedicated render thread, but Thread.Start is
         // neutered browser-wide, so RenderThreadLoop never runs and
         // OnThumbnailReady never fires (no error: nothing throws). The
-        // rewrite drains the loop inline at the end of
-        // QueueThumbnailUpdate: while the queue is non-empty, run one
-        // RenderThreadLoop pass; stop when it reports false.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        // rewrite renders AND drains inline at the end of
+        // QueueThumbnailUpdate via CpuPaint.RenderAndDrainInline: while
+        // the queue is non-empty, run one render+drain pass (re-entrancy
+        // guarded, so nested tail calls return and the outer pass picks
+        // re-queued items up). Null-bitmap items are skipped at dispatch.
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
         if (!File.Exists(pdnInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -2533,8 +2535,8 @@ public sealed class RewriteTests
             int loopCalls = ins.Count(i =>
                 i.OpCode == Mono.Cecil.Cil.OpCodes.Call
                 && i.Operand is Mono.Cecil.MethodReference mr
-                && mr.Name == "RenderThreadLoop"
-                && mr.DeclaringType.FullName == "PaintDotNet.Rendering.ThumbnailManager");
+                && mr.Name == "RenderAndDrainInline"
+                && mr.DeclaringType.FullName == "WfWasm.PdnCpu.CpuPaint");
             Assert.Equal(1, loopCalls);
             Assert.Contains(ins, i =>
                 i.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt
@@ -2570,7 +2572,7 @@ public sealed class RewriteTests
         // 0.5 s fade-in that never advances headless (observed live:
         // op=0 with the image set, so DrawItemImage skips on opacity
         // product 0). The rewrite starts at the end state (1).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
         if (!File.Exists(pdnInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -2620,7 +2622,7 @@ public sealed class RewriteTests
         // the managed Half bridge: RenderThreadLoop calls
         // CpuPaint.RenderLayerThumbnail and no longer touches
         // CreateThumbnailBitmapScRgb.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
         if (!File.Exists(pdnInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -2669,7 +2671,7 @@ public sealed class RewriteTests
         // family as the ToScRgb render death). Headless, 64-bit
         // sources instead recurse into CreateImpl with a managed
         // Bgra32 conversion (CpuPaint.ConvertHalfSourceToBgra).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string fwInput = Path.Combine(paintDir, "PaintDotNet.Windows.Framework.dll");
         if (!File.Exists(fwInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -2708,7 +2710,7 @@ public sealed class RewriteTests
         // empty and the strip chain unwraps to nothing (blank layer
         // previews). Headless, Set also notes (bag, index) -> image into
         // CpuPaint.NoteEffectInput, which the draw-time walk reads first.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string coreInput = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(coreInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -2761,7 +2763,7 @@ public sealed class RewriteTests
         // history). Headless the faulting batch is dropped: the
         // first-chance inventory keeps the signal, the app survives,
         // and the next invalidation re-queues.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
         if (!File.Exists(pdnInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -2803,7 +2805,7 @@ public sealed class RewriteTests
         // (Thread.Sleep): draining inline on the UI thread must not
         // stall per thumbnail, so it reduces to ret. Only
         // ThumbnailManager itself may call it.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
         if (!File.Exists(pdnInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -2838,7 +2840,7 @@ public sealed class RewriteTests
         // here means the emitted shape is wrong, not just unusual).
         // The pinned target round-trips through the ctor and
         // get_Target, and survives a full collection.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string runtimeInput = Path.Combine(paintDir, "PaintDotNet.Runtime.dll");
         if (!File.Exists(runtimeInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -2899,7 +2901,7 @@ public sealed class RewriteTests
         // (immediate None headless): the rewritten body subscribes a
         // synthesized adapter that routes the noted dialog through
         // CpuPaint.ResumeEffectApply, then shows as before.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string coreInput = Path.Combine(paintDir, "PaintDotNet.Effects.Core.dll");
         if (!File.Exists(coreInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -2976,7 +2978,7 @@ public sealed class RewriteTests
         // the device span: [ldarg.1, brfalse SKIP] before the span, SKIP
         // right after the buffered-context store. Order matters (a call
         // on an empty stack is InvalidProgram: the rev103 lesson).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string fwInput = Path.Combine(paintDir, "PaintDotNet.Framework.dll");
         if (!File.Exists(fwInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -3029,7 +3031,7 @@ public sealed class RewriteTests
         // gets first refusal (boxed value-type args), product path on
         // false. The dispatch must LEAD (order pin) and must box (a raw
         // value type on an object parameter is unverifiable IL).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string coreInput = Path.Combine(paintDir, "PaintDotNet.Effects.Core.dll");
         if (!File.Exists(coreInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -3078,7 +3080,7 @@ public sealed class RewriteTests
         // Update checks cannot install anything in a browser, and the
         // boot flow abandons state-machine events that finalize-crash
         // the browser PAL at the first gen-2 GC (stroke trips it).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
         if (!File.Exists(pdnInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -3115,7 +3117,7 @@ public sealed class RewriteTests
         // Settings persistence has no disk in the browser (and
         // BinaryFormatter is gone in net9): the flush must reduce to
         // Ret instead of throwing per boot.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
         if (!File.Exists(pdnInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -3145,7 +3147,7 @@ public sealed class RewriteTests
         // Font-size fitting measures through the D2D layout; the
         // measure step must construct TextMetrics on the CPU while
         // the shrink loop stays pristine.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string uiInput = Path.Combine(paintDir, "PaintDotNet.UI.dll");
         if (!File.Exists(uiInput)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -3659,9 +3661,9 @@ public sealed class RewriteTests
         // End-to-end of facade coherence: the pool's netstandard-era
         // contracts vs shared fx formed a forwarder cycle that killed
         // the server with StackOverflowException at write time.
-        string input = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release\Microsoft.AnalysisServices.AdomdClient.dll");
+        string input = @"E:\AI\Code\WindowsForms\telerik\Telerik UI for WinForms demos\Bin\Release\Microsoft.AnalysisServices.AdomdClient.dll";
         if (!File.Exists(input)) return;
-        string forms = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
+        string forms = @"E:\tmp\rewritten-small\WfWasm.WinForms.dll";
         Assert.True(File.Exists(forms), "regenerate via E:/tmp/rewrite-small.ps1");
         string drawing = ShimDll("WfWasm.Drawing", "WfWasm.Drawing");
         var assemblyMap = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -3687,10 +3689,10 @@ public sealed class RewriteTests
         // in the shared pool. Lookup searches the app closure but the
         // transform used to resolve from the input dir alone, so Cecil
         // threw AssemblyResolutionException (telerik-diagram 500).
-        string input = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\ExamplesProjects\Diagram\DiagramFirstLook\bin\Telerik.WinControls.RadDiagram.dll");
-        string pool = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release");
+        string input = @"E:\AI\Code\WindowsForms\telerik\Telerik UI for WinForms demos\ExamplesProjects\Diagram\DiagramFirstLook\bin\Telerik.WinControls.RadDiagram.dll";
+        string pool = @"E:\AI\Code\WindowsForms\telerik\Telerik UI for WinForms demos\Bin\Release";
         if (!File.Exists(input) || !Directory.Exists(pool)) return;
-        string forms = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
+        string forms = @"E:\tmp\rewritten-small\WfWasm.WinForms.dll";
         Assert.True(File.Exists(forms), "regenerate via E:/tmp/rewrite-small.ps1");
         string drawing = ShimDll("WfWasm.Drawing", "WfWasm.Drawing");
         var assemblyMap = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -3765,7 +3767,7 @@ public sealed class RewriteTests
         // neutralized too. Otherwise the native WM_CREATE notification
         // throws inside GdiControl.OnHandleCreated and the control's
         // input relay never initializes (Paint.NET canvas goes dead).
-        string frameworkPath = TestPaths.Repo(@"targets\paint.net\PaintDotNet.Framework.dll");
+        string frameworkPath = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.Framework.dll";
         if (!File.Exists(frameworkPath)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
         string tempOut = Path.Combine(Path.GetTempPath(), $"Framework_D2D_{Guid.NewGuid()}.dll");
@@ -3799,7 +3801,7 @@ public sealed class RewriteTests
         // ContainsComplexScript NREs dereferencing it for every
         // non-empty string, killing RichTextEditor form creation. The
         // rewrite answers false (simple text) instead.
-        string input = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release\Telerik.WinControls.RichTextEditor.dll");
+        string input = @"E:\AI\Code\WindowsForms\telerik\Telerik UI for WinForms demos\Bin\Release\Telerik.WinControls.RichTextEditor.dll";
         if (!File.Exists(input)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"RteUniscribe_{Guid.NewGuid()}.dll");
         try
@@ -5128,7 +5130,7 @@ public sealed class RewriteTests
     [Fact]
     public void StubPInvokes_Implements_Real_Memory_Allocation()
     {
-        string input = TestPaths.Repo(@"targets\paint.net\TerraFX.Interop.Windows.dll");
+        string input = @"E:\AI\Code\WindowsForms\targets\paint.net\TerraFX.Interop.Windows.dll";
         if (!File.Exists(input)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"TerraFX_Test_{Guid.NewGuid()}.dll");
         try
@@ -5161,7 +5163,7 @@ public sealed class RewriteTests
     [Fact]
     public void Direct2DControl_Constructors_Are_Stubbed()
     {
-        string fwPath = TestPaths.Repo(@"targets\paint.net\PaintDotNet.Framework.dll");
+        string fwPath = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.Framework.dll";
         if (!File.Exists(fwPath)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"Framework_Test_{Guid.NewGuid()}.dll");
         try
@@ -5200,7 +5202,7 @@ public sealed class RewriteTests
     [Fact]
     public void Direct2DControl_Factory_Getters_Are_Stubbed()
     {
-        string fwPath = TestPaths.Repo(@"targets\paint.net\PaintDotNet.Framework.dll");
+        string fwPath = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.Framework.dll";
         if (!File.Exists(fwPath)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"Framework_FactoryTest_{Guid.NewGuid()}.dll");
         try
@@ -5229,7 +5231,7 @@ public sealed class RewriteTests
             var ctrlField = compositor.Fields.First(f => f.Name == "compositorController");
             Assert.Equal("System.Object", ctrlField.FieldType.FullName);
 
-            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
+            string pdnDir = @"E:\tmp\rewritten-paint";
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.Framework.dll"), overwrite: true);
@@ -5244,7 +5246,7 @@ public sealed class RewriteTests
     [Fact]
     public void CanvasRenderingSettings_GetAutoMode_Returns_Software()
     {
-        string pdnPath = TestPaths.Repo(@"targets\paint.net\paintdotnet.dll");
+        string pdnPath = @"E:\AI\Code\WindowsForms\targets\paint.net\paintdotnet.dll";
         if (!File.Exists(pdnPath)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"paintdotnet_Test_{Guid.NewGuid()}.dll");
         try
@@ -5271,7 +5273,7 @@ public sealed class RewriteTests
             Assert.Contains(preRenderPump.Body.Instructions, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Ret);
             Assert.DoesNotContain(preRenderPump.Body.Instructions, i => i.Operand?.ToString()?.Contains("BeginModalUIFrame") == true);
 
-            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
+            string pdnDir = @"E:\tmp\rewritten-paint";
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "paintdotnet.dll"), overwrite: true);
@@ -5286,7 +5288,7 @@ public sealed class RewriteTests
     [Fact]
     public void DXGI_And_DxgiFactory7_Are_Stubbed()
     {
-        string winPath = TestPaths.Repo(@"targets\paint.net\PaintDotNet.Windows.dll");
+        string winPath = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.Windows.dll";
         if (!File.Exists(winPath)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"PaintDotNet_Windows_Test_{Guid.NewGuid()}.dll");
         try
@@ -5308,7 +5310,7 @@ public sealed class RewriteTests
             var createF7 = dxgi.Methods.First(m => m.Name == "CreateFactory7" && m.ReturnType.FullName == "PaintDotNet.Dxgi.IDxgiFactory7");
             Assert.Contains(createF7.Body.Instructions, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Ldnull);
 
-            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
+            string pdnDir = @"E:\tmp\rewritten-paint";
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.Windows.dll"), overwrite: true);
@@ -5323,7 +5325,7 @@ public sealed class RewriteTests
     [Fact]
     public void EffectCategories_Cctor_Bakes_Category_Strings()
     {
-        string fwPath = TestPaths.Repo(@"targets\paint.net\PaintDotNet.Windows.Framework.dll");
+        string fwPath = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.Windows.Framework.dll";
         if (!File.Exists(fwPath)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"WindowsFw_EffectCat_{Guid.NewGuid()}.dll");
         try
@@ -5360,7 +5362,7 @@ public sealed class RewriteTests
                 ["Analysis", "Color", "Composite", "Filter", "Photo", "Source", "Stylize", "Transform", "Transparency"],
                 literals);
 
-            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
+            string pdnDir = @"E:\tmp\rewritten-paint";
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.Windows.Framework.dll"), overwrite: true);
@@ -5375,7 +5377,7 @@ public sealed class RewriteTests
     [Fact]
     public void AnimatedValue_AnimateRawValue_Emits_Correct_Generic_MethodReference()
     {
-        string corePdn = TestPaths.Repo(@"targets\paint.net\PaintDotNet.Core.dll");
+        string corePdn = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.Core.dll";
         if (!File.Exists(corePdn)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"PaintDotNet_Core_Test_{Guid.NewGuid()}.dll");
         try
@@ -5400,7 +5402,7 @@ public sealed class RewriteTests
             var mr = (Mono.Cecil.MethodReference)gvodCall.Operand;
             Assert.True(mr.ReturnType.IsGenericParameter, "ReturnType must be generic parameter !0");
 
-            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
+            string pdnDir = @"E:\tmp\rewritten-paint";
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.Core.dll"), overwrite: true);
@@ -5454,7 +5456,7 @@ public sealed class RewriteTests
                 Assert.DoesNotContain(helper.Body.Instructions, i => i.Operand?.ToString()?.Contains("LoadCursor") == true);
             }
 
-            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
+            string pdnDir = @"E:\tmp\rewritten-paint";
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PresentationCore.dll"), overwrite: true);
@@ -5504,7 +5506,7 @@ public sealed class RewriteTests
                 Assert.DoesNotContain(getNcm.Body.Instructions, i => i.Operand?.ToString()?.Contains("SystemParametersInfo") == true);
             }
 
-            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
+            string pdnDir = @"E:\tmp\rewritten-paint";
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PresentationFramework.dll"), overwrite: true);
@@ -5519,7 +5521,7 @@ public sealed class RewriteTests
     [Fact]
     public void FastMath_CombinePolyLists_And_GpcWrapper_Are_Stubbed()
     {
-        string sysLayerPath = TestPaths.Repo(@"targets\paint.net\PaintDotNet.SystemLayer.dll");
+        string sysLayerPath = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.SystemLayer.dll";
         if (!File.Exists(sysLayerPath)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"PaintDotNet_SystemLayer_Test_{Guid.NewGuid()}.dll");
         try
@@ -5547,7 +5549,7 @@ public sealed class RewriteTests
             var beginModalCore = uiHelpers.Methods.First(m => m.Name == "BeginModalUIFrameCore");
             Assert.Contains(beginModalCore.Body.Instructions, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Ret);
 
-            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
+            string pdnDir = @"E:\tmp\rewritten-paint";
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.SystemLayer.dll"), overwrite: true);
@@ -5562,7 +5564,7 @@ public sealed class RewriteTests
     [Fact]
     public void WIC_Is_Stubbed_Without_Native_Codecs()
     {
-        string winPath = TestPaths.Repo(@"targets\paint.net\PaintDotNet.Windows.dll");
+        string winPath = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.Windows.dll";
         if (!File.Exists(winPath)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"PaintDotNet_Windows_WicTest_{Guid.NewGuid()}.dll");
         try
@@ -5584,7 +5586,7 @@ public sealed class RewriteTests
             var cctor = wic.Methods.First(m => m.Name == ".cctor");
             Assert.DoesNotContain(cctor.Body.Instructions, i => i.Operand?.ToString()?.Contains("windowscodecs") == true);
 
-            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
+            string pdnDir = @"E:\tmp\rewritten-paint";
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.Windows.dll"), overwrite: true);
@@ -5599,7 +5601,7 @@ public sealed class RewriteTests
     [Fact]
     public void ColorProfiles_And_ColorProfile_Are_Stubbed()
     {
-        string corePath = TestPaths.Repo(@"targets\paint.net\PaintDotNet.Windows.Core.dll");
+        string corePath = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.Windows.Core.dll";
         if (!File.Exists(corePath)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"PaintDotNet_Core_CpTest_{Guid.NewGuid()}.dll");
         try
@@ -5642,7 +5644,7 @@ public sealed class RewriteTests
             Assert.Single(trpcCctor.Body.Instructions);
             Assert.Equal(Mono.Cecil.Cil.OpCodes.Ret, trpcCctor.Body.Instructions[0].OpCode);
 
-            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
+            string pdnDir = @"E:\tmp\rewritten-paint";
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.Windows.Core.dll"), overwrite: true);
@@ -5657,7 +5659,7 @@ public sealed class RewriteTests
     [Fact]
     public void GeometryResourceCacheHost_Is_Stubbed()
     {
-        string uiPath = TestPaths.Repo(@"targets\paint.net\PaintDotNet.UI.dll");
+        string uiPath = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.UI.dll";
         if (!File.Exists(uiPath)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"UI_Test_{Guid.NewGuid()}.dll");
         try
@@ -5683,12 +5685,12 @@ public sealed class RewriteTests
             var getBounds = geom.Methods.First(m => m.Name == "get_Bounds");
             Assert.Contains(getBounds.Body.Instructions, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Ret);
 
-            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
+            string pdnDir = @"E:\tmp\rewritten-paint";
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.UI.dll"), overwrite: true);
 
-                string objModelSrc = TestPaths.Repo(@"targets\paint.net\PaintDotNet.ObjectModel.dll");
+                string objModelSrc = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.ObjectModel.dll";
                 if (File.Exists(objModelSrc))
                 {
                     string objOut = Path.Combine(Path.GetTempPath(), $"ObjModel_{Guid.NewGuid()}.dll");
@@ -5701,7 +5703,7 @@ public sealed class RewriteTests
                     finally { if (File.Exists(objOut)) File.Delete(objOut); }
                 }
 
-                string fundSrc = TestPaths.Repo(@"targets\paint.net\PaintDotNet.Fundamentals.dll");
+                string fundSrc = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.Fundamentals.dll";
                 if (File.Exists(fundSrc))
                 {
                     string fundOut = Path.Combine(Path.GetTempPath(), $"Fund_{Guid.NewGuid()}.dll");
@@ -5724,7 +5726,7 @@ public sealed class RewriteTests
     [Fact]
     public void SystemParameters_Is_Stubbed()
     {
-        string wfPath = TestPaths.Repo(@"targets\paint.net\PaintDotNet.Windows.Framework.dll");
+        string wfPath = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.Windows.Framework.dll";
         if (!File.Exists(wfPath)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"WF_Test_{Guid.NewGuid()}.dll");
         try
@@ -5746,7 +5748,7 @@ public sealed class RewriteTests
             var getScale = sp.Methods.First(m => m.Name == "GetCursorScale");
             Assert.Contains(getScale.Body.Instructions, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Ldc_R8);
 
-            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
+            string pdnDir = @"E:\tmp\rewritten-paint";
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.Windows.Framework.dll"), overwrite: true);
@@ -5761,7 +5763,7 @@ public sealed class RewriteTests
     [Fact]
     public void CachedGeometry_Bounds_And_BrushToolBase_Are_Stubbed()
     {
-        string pdnPath = TestPaths.Repo(@"targets\paint.net\paintdotnet.dll");
+        string pdnPath = @"E:\AI\Code\WindowsForms\targets\paint.net\paintdotnet.dll";
         if (!File.Exists(pdnPath)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"PDN_Test_{Guid.NewGuid()}.dll");
         try
@@ -5795,7 +5797,7 @@ public sealed class RewriteTests
             var msi = bsbr.Methods.First(m => m.Name == "MeasureSpriteImage");
             Assert.DoesNotContain(msi.Body.Instructions, i => i.Operand?.ToString()?.Contains("DrawNull") == true);
 
-            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
+            string pdnDir = @"E:\tmp\rewritten-paint";
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "paintdotnet.dll"), overwrite: true);
@@ -5810,7 +5812,7 @@ public sealed class RewriteTests
     [Fact]
     public void CleanupThread_Is_Stubbed()
     {
-        string rtPath = TestPaths.Repo(@"targets\paint.net\PaintDotNet.Runtime.dll");
+        string rtPath = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.Runtime.dll";
         if (!File.Exists(rtPath)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"RT_Test_{Guid.NewGuid()}.dll");
         try
@@ -5839,7 +5841,7 @@ public sealed class RewriteTests
             var ensureEnqueued = ct.Methods.First(m => m.Name == "EnsureEnqueued");
             Assert.Contains(ensureEnqueued.Body.Instructions, i => i.OpCode == Mono.Cecil.Cil.OpCodes.Ldc_I4_0);
 
-            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
+            string pdnDir = @"E:\tmp\rewritten-paint";
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.Runtime.dll"), overwrite: true);
@@ -5854,7 +5856,7 @@ public sealed class RewriteTests
     [Fact]
     public void PaintDotNet_Base_SerializationFallbackBinder_Stubbed()
     {
-        string basePath = TestPaths.Repo(@"targets\paint.net\PaintDotNet.Base.dll");
+        string basePath = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.Base.dll";
         if (!File.Exists(basePath)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"Base_Test_{Guid.NewGuid()}.dll");
         try
@@ -5882,7 +5884,7 @@ public sealed class RewriteTests
             Assert.Contains(cloneCore.Body.Instructions, i => i.Operand?.ToString()?.Contains("MemberwiseClone") == true);
             Assert.DoesNotContain(cloneCore.Body.Instructions, i => i.Operand?.ToString()?.Contains("BinaryFormatter") == true);
 
-            string pdnDir = TestPaths.Repo(@"external-apps\paintnet-support");
+            string pdnDir = @"E:\tmp\rewritten-paint";
             if (Directory.Exists(pdnDir))
             {
                 File.Copy(tempOut, Path.Combine(pdnDir, "PaintDotNet.Base.dll"), overwrite: true);
@@ -5901,7 +5903,7 @@ public sealed class RewriteTests
         // Refresh recomputes effect props from the live Properties bag
         // (writes stay inert via the stubbed SetValue), so it runs for
         // real headless instead of a bare ret.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -5934,7 +5936,7 @@ public sealed class RewriteTests
         // default color context: every CreateColorContext overload
         // answers a synthesized CPU device color context instead of
         // throwing.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -5979,7 +5981,7 @@ public sealed class RewriteTests
         // History/Layers icons select the sRGB variant through
         // AutoColorSpaceImageProvider: the CPU cache answers the inner
         // sRGB provider's resource (color management is identity).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -6035,7 +6037,7 @@ public sealed class RewriteTests
     {
         // The CPU cache unwraps AutoColorSpace through the inner sRGB
         // field from another class: the Framework pass ships it public.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Framework.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -6069,7 +6071,7 @@ public sealed class RewriteTests
         // probe straight to tryText, leaving SystemBrush without a
         // backend; duck misses in turn skipped the Auto gate. Every
         // provider family must be reachable in order.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -6138,7 +6140,7 @@ public sealed class RewriteTests
     [Fact]
     public void Rewrite_SystemColor_Is_Public_For_Cpu_Unbox()
     {
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Framework.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -6168,7 +6170,7 @@ public sealed class RewriteTests
         // Document strips verify every cached bitmap before drawing:
         // IsDisposed must answer handle==0 (Dispose zeroes it) instead
         // of throwing NotSupported.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -6202,7 +6204,7 @@ public sealed class RewriteTests
         // Document color contexts are null headless, which blocks every
         // effect dialog at ManagedColor.Create: the factory stands in a
         // CPU sRGB context (Exif sRGB truth, no profile bytes).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -6273,7 +6275,7 @@ public sealed class RewriteTests
         // rewriter must leave it and get_ControlsAssembly untouched.
         // Without the call ControlsAssembly stays null and every effect
         // config UI dies in PropertyControlInfo..cctor (NotNull).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -6319,10 +6321,10 @@ public sealed class RewriteTests
         // assembly the bundle otherwise deploys. Paint.NET ships
         // on demand, so the server manifest (not the client csproj)
         // must carry it, and the client must not bundle paint at all.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string pdn = Path.Combine(paintDir, "paintdotnet.dll");
-        string csproj = TestPaths.Repo(@"src\WfWasm.CanvasHost\WfWasm.CanvasHost.csproj");
-        string server = TestPaths.Repo(@"src\WfWasm.Host.Server\AppTransform.cs");
+        string csproj = @"E:\AI\Code\WindowsForms\src\WfWasm.CanvasHost\WfWasm.CanvasHost.csproj";
+        string server = @"E:\AI\Code\WindowsForms\src\WfWasm.Host.Server\AppTransform.cs";
         if (!File.Exists(pdn) || !File.Exists(csproj) || !File.Exists(server)) return;
         var resolver = new Mono.Cecil.DefaultAssemblyResolver();
         resolver.AddSearchDirectory(paintDir);
@@ -6342,7 +6344,7 @@ public sealed class RewriteTests
         // WIC factory): EffectServiceProvider..ctor validates non-null
         // and every effect dies. Same CPU sRGB stand-in as the
         // ManagedColor factory default, synthesized into Effects.Core.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Effects.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -6403,7 +6405,7 @@ public sealed class RewriteTests
         // GPU effect dies. The synthesized setting answers the software
         // choice (Type==3), routing effects down the CPU branch — the
         // same path a device-less desktop takes.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Effects.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -6476,7 +6478,7 @@ public sealed class RewriteTests
     {
         // The on-demand transform cache serves bytes by input hash:
         // the rewriter must be deterministic for the cache to be sound.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -6502,7 +6504,7 @@ public sealed class RewriteTests
         // WIC has no headless factory: terminal clippers and color
         // transforms answer their source bitmap (refcounted custody
         // keeps it alive; color work is identity without a device).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -6560,7 +6562,7 @@ public sealed class RewriteTests
         // The CPU context is software by definition; image measurements
         // answer local bounds for both rects (no measure effect). Tokens
         // harvest from the original bodies.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -6600,7 +6602,7 @@ public sealed class RewriteTests
         // BitmapImage tiles with Min(requested, MaximumBitmapSize):
         // the zero-init default divides by zero, so the CPU context
         // reports the desktop D2D cap (16384, never allocated).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -6639,7 +6641,7 @@ public sealed class RewriteTests
         // BitmapSourceExtensions.CreateColorTransformer (the blind
         // identity returned the untyped source, whose wrapper cast to
         // IBitmapSource<Half> faulted every render).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -6681,7 +6683,7 @@ public sealed class RewriteTests
         // DirectoryNotFound for the virtual app folder out of
         // MainForm..ctor. The set is dropped at rewrite time.
         // Regression: DirectoryNotFoundException | Interop.CheckIo.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "paintdotnet.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -6718,11 +6720,11 @@ public sealed class RewriteTests
         // whole chain is replayed here on desktop: the bitmap must
         // allocate, wrap in a ref, reinterpret, and report its size.
         // Regression: NRE | BitmapExtensions.LockFast.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
-        string forkDll = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
+        string forkDll = @"E:\tmp\rewritten-small\WfWasm.WinForms.dll";
         string drawingDll = ShimBinDll("WfWasm.Drawing");
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
-        string handmap = TestPaths.Repo(@"src\WfWasm.Rewrite.Tool\handmap.paint.net.txt");
+        string handmap = @"E:\AI\Code\WindowsForms\src\WfWasm.Rewrite.Tool\handmap.paint.net.txt";
         string[] closure = new[] { "PaintDotNet.Primitives.dll", "PaintDotNet.ComponentModel.dll", "PaintDotNet.Windows.Core.dll", "PaintDotNet.Windows.dll", "PaintDotNet.Windows.Framework.dll" };
         foreach (string f in closure.Concat(new[] { forkDll, drawingDll, cpuDll, handmap }))
             if (!File.Exists(f.StartsWith("PaintDotNet") ? Path.Combine(paintDir, f) : f)) return;
@@ -6945,11 +6947,11 @@ public sealed class RewriteTests
         // color context; an NSE here blanks the wheel with no paint
         // ever reaching the DrawImage core. Regression anchor for
         // NotSupported | GetCachedOrCreateResource (blank Colors wheel).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
-        string forkDll = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
+        string forkDll = @"E:\tmp\rewritten-small\WfWasm.WinForms.dll";
         string drawingDll = ShimBinDll("WfWasm.Drawing");
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
-        string handmap = TestPaths.Repo(@"src\WfWasm.Rewrite.Tool\handmap.paint.net.txt");
+        string handmap = @"E:\AI\Code\WindowsForms\src\WfWasm.Rewrite.Tool\handmap.paint.net.txt";
         string[] closure = new[] { "PaintDotNet.Primitives.dll", "PaintDotNet.ComponentModel.dll", "PaintDotNet.Windows.Core.dll", "PaintDotNet.Windows.dll", "PaintDotNet.Windows.Framework.dll" };
         foreach (string f in closure.Concat(new[] { forkDll, drawingDll, cpuDll, handmap }))
             if (!File.Exists(f.StartsWith("PaintDotNet") ? Path.Combine(paintDir, f) : f)) return;
@@ -7057,11 +7059,11 @@ public sealed class RewriteTests
         // device pixels back, and requires them to survive. Regression
         // anchor for the live blank wheel (render ran, ~200/88804 bytes
         // nonzero: image blit empty, only the selector nub painted).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
-        string forkDll = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
+        string forkDll = @"E:\tmp\rewritten-small\WfWasm.WinForms.dll";
         string drawingDll = ShimBinDll("WfWasm.Drawing");
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
-        string handmap = TestPaths.Repo(@"src\WfWasm.Rewrite.Tool\handmap.paint.net.txt");
+        string handmap = @"E:\AI\Code\WindowsForms\src\WfWasm.Rewrite.Tool\handmap.paint.net.txt";
         string[] closure = new[] { "PaintDotNet.Primitives.dll", "PaintDotNet.ComponentModel.dll", "PaintDotNet.Windows.Core.dll", "PaintDotNet.Windows.dll", "PaintDotNet.Windows.Framework.dll" };
         foreach (string f in closure.Concat(new[] { forkDll, drawingDll, cpuDll, handmap }))
             if (!File.Exists(f.StartsWith("PaintDotNet") ? Path.Combine(paintDir, f) : f)) return;
@@ -7302,11 +7304,11 @@ public sealed class RewriteTests
         // ClientRectangle; when that is empty, tiling uploads a 0-size
         // lock and the upload reports it. Regression anchor for
         // NotSupported | CreateSharedBitmap | ... (empty).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string forkDll = ShimBinDll("WfWasm.WinForms");
         string drawingDll = ShimBinDll("WfWasm.Drawing");
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
-        string handmap = TestPaths.Repo(@"src\WfWasm.Rewrite.Tool\handmap.paint.net.txt");
+        string handmap = @"E:\AI\Code\WindowsForms\src\WfWasm.Rewrite.Tool\handmap.paint.net.txt";
         string[] closure = new[] { "PaintDotNet.Primitives.dll", "PaintDotNet.ComponentModel.dll", "PaintDotNet.Windows.Core.dll", "PaintDotNet.Windows.dll", "PaintDotNet.Windows.Framework.dll" };
         foreach (string f in closure.Concat(new[] { forkDll, drawingDll, cpuDll, handmap }))
             if (!File.Exists(f.StartsWith("PaintDotNet") ? Path.Combine(paintDir, f) : f)) return;
@@ -7415,7 +7417,7 @@ public sealed class RewriteTests
         // from counted clips (CreateRef), so the owned wrapper is real.
         // Regression: source-kill in CreateImageFromBitmap; NRE |
         // BitmapExtensions.LockFast via ReinterpretedBitmapSource.Size.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Framework.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -7454,7 +7456,7 @@ public sealed class RewriteTests
         // Precision/premultiply are device concerns; the image is
         // answered as-is. Regression: NotSupported | CreateEffect via
         // PostProcessImage <- ProcessImage <- CreateImpl.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Framework.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -7493,7 +7495,7 @@ public sealed class RewriteTests
         // QueryInterface, so lifetime plumbing works and native use fails
         // loudly. Regression: ObjectDisposed | CreateRefError from
         // BitmapImage..ctor <- CreateImpl <- CreateImageFromBitmap.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -7539,7 +7541,7 @@ public sealed class RewriteTests
         // packed; 64-bit Half locks convert (see Uploads_Half_Lock);
         // anything else keeps the loud NotSupported.
         // Regression: NotSupported | CpuDrawingContext.CreateSharedBitmap.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -7581,7 +7583,7 @@ public sealed class RewriteTests
         // other widths keep the loud pixel-format NotSupported.
         // Regression: NotSupported | DeviceContextExtensions.CreateSharedBitmap
         // from ImageStrip.DrawImageItemImage <- ImageItem.GetDeviceImage.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -7629,7 +7631,7 @@ public sealed class RewriteTests
         // skipping every non-CpuDeviceBitmap source.
         // Regression: blank layer rows + missing history icons with
         // zero errors (the Isinst miss fell through to ret).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -7671,7 +7673,7 @@ public sealed class RewriteTests
         // letting the procedural fallback swallow the thumbnail.
         // Regression: blank layer rows + missing history icons with
         // zero errors (checker filled the panel, thumb never drew).
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -7707,7 +7709,7 @@ public sealed class RewriteTests
     {
         // The on-demand server serves RAM-only bytes: the twin must
         // emit exactly what the file-based Rewrite writes.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -7741,7 +7743,7 @@ public sealed class RewriteTests
         // wrapper lambdas with the same return type (they delegate to
         // the helper); only the direct factories are asserted
         // structurally, while behavior covers every overload.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "paintdotnet.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -7823,7 +7825,7 @@ public sealed class RewriteTests
         // ColorRectangleControl.OnRenderImpl,
         // ColorGradientControl.OnRenderAdvanced,
         // ColorPaletteControl.OnRenderAdvanced.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -7866,7 +7868,7 @@ public sealed class RewriteTests
         // per pixel. Regression: NotSupported |
         // GetCachedOrCreateResource for LinearGradientBrush from
         // ColorGradientControl.OnRenderAdvanced via FillRectangle.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -7939,7 +7941,7 @@ public sealed class RewriteTests
         // skipped when unclaimable), so no generic token is built or
         // resolved here. Regression: class.c:2324 abort in
         // ColorPaletteControl.OnDeviceContextCreated <- Set.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -8043,7 +8045,7 @@ public sealed class RewriteTests
         // Regression: NullReferenceException | TaskbarList.CreateInstance
         // and NullReferenceException | TaskProgressDialog.OnShown from
         // Levels via EffectMenuBase.RunEffectImpl.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Windows.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -8097,7 +8099,7 @@ public sealed class RewriteTests
         // Regression: NullReferenceException |
         // PixelFormatInfo.TryGetRef from Levels via
         // GpuEffect.InitializeRenderInfo.
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         string input = Path.Combine(paintDir, "PaintDotNet.Effects.Core.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -8158,7 +8160,7 @@ public sealed class RewriteTests
         // Regression: TypeInitializationException |
         // ThemeResolutionService..cctor (inner DllNotFoundException:
         // gdi32.dll) on the first Telerik demo form-create.
-        string telerikDir = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release");
+        string telerikDir = @"E:\AI\Code\WindowsForms\telerik\Telerik UI for WinForms demos\Bin\Release";
         string input = Path.Combine(telerikDir, "Telerik.WinControls.dll");
         if (!File.Exists(input)) return;
         string cpuDll = ShimBinDll("WfWasm.PdnCpu");
@@ -8268,7 +8270,7 @@ public sealed class RewriteTests
         // answers false (same query rule as the file pass).
         // Regression: DllNotFoundException: user32.dll |
         // ThemedFormBehavior.get_IsMaximized on telerik-photo.
-        string telerikDir = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release");
+        string telerikDir = @"E:\AI\Code\WindowsForms\telerik\Telerik UI for WinForms demos\Bin\Release";
         string input = Path.Combine(telerikDir, "TelerikCommon.dll");
         if (!File.Exists(input)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"TelerikCommon_IsZoomed_{Guid.NewGuid()}.dll");
@@ -8384,4 +8386,90 @@ public sealed class RewriteTests
                 && mr.DeclaringType.FullName == "System.Environment");
     }
 
+
+    [Fact]
+    public void ShadowCache_TryGetValue_Bypasses_Interpreter_Find_Headless()
+    {
+        // DocumentStrip sgen hunt: the shadow-cache
+        // Dictionary<SizeInt32,DeviceBitmap>.TryGetValue mis-evaluates
+        // under the Mono WASM interpreter (sibling of the Add-tears-table
+        // precedent that OOB-trapped the session). The crash render dies
+        // right after the 9x7 shadow resource upload with no composite
+        // ever reached; shadows-off lives; RenderInside no-op does not
+        // save it. Retarget the shadow-cache Get sites (same narrow
+        // allowlist as Add/Clear) to scan-backed DictTryGetValue, which
+        // consults the side table first and never touches the hash Find.
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
+        string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
+        if (!File.Exists(pdnInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"pdn_ShadowGet_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(pdnInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var strip = asm.MainModule.GetType("PaintDotNet.Controls.ImageStrip");
+            Assert.NotNull(strip);
+            var m = Assert.Single(strip.Methods, x => x.Name == "DrawImageItemImageShadow" && x.HasBody);
+            var ins = m.Body.Instructions.ToList();
+            Assert.Contains(ins, i =>
+                i.OpCode == Mono.Cecil.Cil.OpCodes.Call
+                && i.Operand is Mono.Cecil.MethodReference mr
+                && mr.Name == "DictTryGetValue"
+                && mr.DeclaringType.FullName == "WfWasm.PdnCpu.CpuPaint");
+            Assert.DoesNotContain(ins, i =>
+                (i.OpCode == Mono.Cecil.Cil.OpCodes.Call || i.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt)
+                && i.Operand is Mono.Cecil.MethodReference mr2
+                && mr2.Name == "TryGetValue"
+                && mr2.DeclaringType is Mono.Cecil.GenericInstanceType gi
+                && gi.ElementType.FullName == "System.Collections.Generic.Dictionary`2");
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
+
+    // No injected entry-touch logging in served methods (BISECT-5 hunt
+    // reverted): the transform must not plant Console.WriteLine tags
+    // ([SHADOW-ENTRY]/[LAYOUT-ENTRY]) into application code. Guards the
+    // revert; legitimate application strings never carry these tags.
+    [Fact]
+    public void NoInjectedEntryTouch_In_Served_ImageStrip()
+    {
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
+        string pdnInput = Path.Combine(paintDir, "paintdotnet.dll");
+        if (!File.Exists(pdnInput)) return;
+        string cpuDll = ShimBinDll("WfWasm.PdnCpu");
+        var emptyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var emptyTypes = new Dictionary<string, (string Assembly, string Type)>(StringComparer.Ordinal);
+        string tempOut = Path.Combine(Path.GetTempPath(), $"pdn_NoTouch_{Guid.NewGuid()}.dll");
+        try
+        {
+            AssemblyRewriter.Rewrite(pdnInput, tempOut, emptyMap, emptyTypes, cpuDll);
+            var resolver = new Mono.Cecil.DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(paintDir);
+            using var asm = Mono.Cecil.AssemblyDefinition.ReadAssembly(tempOut,
+                new Mono.Cecil.ReaderParameters { AssemblyResolver = resolver });
+            var strip = asm.MainModule.GetType("PaintDotNet.Controls.ImageStrip");
+            Assert.NotNull(strip);
+            foreach (var m in strip.Methods)
+            {
+                if (!m.HasBody || m.Body.Instructions is null) continue;
+                Assert.DoesNotContain(m.Body.Instructions, i =>
+                    i.OpCode == Mono.Cecil.Cil.OpCodes.Ldstr
+                    && i.Operand is string s
+                    && (s.Contains("[SHADOW-ENTRY]") || s.Contains("[LAYOUT-ENTRY]")));
+            }
+        }
+        finally
+        {
+            if (File.Exists(tempOut)) File.Delete(tempOut);
+        }
+    }
 }

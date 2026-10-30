@@ -21,5 +21,8 @@ public interface ICanvasRenderer : ICanvas
     void PatchBitmap(string layerId, int x, int y, int width, int height, byte[] rgba) =>
         throw new NotSupportedException("Bitmap layers unsupported.");
 
+    void ShiftBitmap(string layerId, int dx, int dy) =>
+        throw new NotSupportedException("Bitmap layers unsupported.");
+
     void RetainLayers(IReadOnlyList<string> liveIds) { }
 }

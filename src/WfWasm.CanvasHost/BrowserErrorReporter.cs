@@ -1,4 +1,3 @@
-using System.Net.Http.Json;
 using System.Text;
 using Microsoft.JSInterop;
 
@@ -90,6 +89,22 @@ public static class BrowserErrorReporter
     private static readonly Dictionary<string, int> s_sentCounts = new(StringComparer.Ordinal);
     private const int MaxPostsPerSignature = 5;
 
+    // WF-R-NRE-0730: JS-first transport seam. A void [JSImport] dispatch
+    // creates no managed Task, so the report can never fault inside
+    // JavaScriptExports.CompleteTask (previously: synchronous NRE there
+    // took the runtime down, exit 1). Tests set this to observe/short-
+    // circuit dispatch; production uses the canvas-bridge fetch hook.
+    public static Func<string, string, bool>? JsTransportOverride;
+
+    private static readonly System.Text.Json.JsonSerializerOptions s_payloadJson = new(System.Text.Json.JsonSerializerDefaults.Web);
+
+    // In-flight report tasks must stay rooted until the fetch settles:
+    // a fire-and-forget POST whose Task is collected before the browser
+    // completes it surfaces as a frameless NullReferenceException out of
+    // JavaScriptExports.CompleteTask and kills the runtime (exit 1).
+    private static readonly HashSet<Task> s_inflight = new();
+    private static readonly object s_inflightGate = new();
+
     public static void Report(string source, Exception ex, string? topFrame = null)
     {
         // The report POST itself throws HttpRequestException/JSException/
@@ -153,6 +168,15 @@ public static class BrowserErrorReporter
             // Trace collection must never break reporting.
         }
         var http = s_http;
+        string url = http?.BaseAddress is null
+            ? "/api/client-errors"
+            : new Uri(http.BaseAddress, "api/client-errors").ToString();
+        string json = BuildReportJson(signature, ex.Message, chain, source, DateTimeOffset.UtcNow,
+            inputContext, reportApp, reportLabel, reportSession);
+        // JS-first: the bridge fetch returns nothing to managed code, so no
+        // Task ever crosses the interop boundary here (see the seam note).
+        if (TryDispatchJs(url, json))
+            return;
         if (http == null)
         {
             Console.WriteLine($"[report:{source}] no-backend {signature}");
@@ -162,33 +186,93 @@ public static class BrowserErrorReporter
         // has no pool to run the queued work while the app is busy, so the
         // fetch never left the browser. The direct async call executes
         // synchronously up to the first await, which dispatches the fetch
-        // immediately; completion needs no pump (fire-and-forget).
-        _ = SendAsync();
-        async Task SendAsync()
+        // immediately; completion needs no pump (fire-and-forget, but
+        // rooted in s_inflight until it settles — see the field note).
+        Task send;
+        try
+        {
+            send = SendAsync(http, url, json);
+        }
+        catch
+        {
+            return;
+        }
+        lock (s_inflightGate) s_inflight.Add(send);
+        try
+        {
+            send.ContinueWith(
+                t =>
+                {
+                    lock (s_inflightGate) s_inflight.Remove(t);
+                    try { _ = t.Exception; } catch { }
+                },
+                TaskScheduler.Default);
+        }
+        catch
+        {
+            // No pool to schedule the cleanup (single-threaded WASM):
+            // the entry stays rooted for the session; the rate gate
+            // bounds how many can accumulate per signature.
+        }
+        async Task SendAsync(HttpClient client, string postUrl, string payload)
         {
             try
             {
-                await http.PostAsJsonAsync("/api/client-errors", new[]
-                {
-                    new
-                    {
-                        signature,
-                        message = ex.Message,
-                        stack = chain,
-                        source,
-                        time = DateTimeOffset.UtcNow,
-                        context = inputContext,
-                        app = reportApp,
-                        appLabel = reportLabel,
-                        sessionId = reportSession,
-                    },
-                });
+                using var content = new StringContent(payload, System.Text.Encoding.UTF8, "application/json");
+                await client.PostAsync(postUrl, content);
             }
             catch
             {
                 // Backend absent (dev-server) or unreachable: console line above is the record.
             }
         }
+    }
+
+    // Single-batch report payload, shared by the JS and HTTP transports so
+    // both post byte-identical bodies (same field order, Web JSON defaults).
+    public static string BuildReportJson(string signature, string? message, string stack, string source,
+        DateTimeOffset time, string? context, string? app, string? appLabel, string? sessionId)
+    {
+        return System.Text.Json.JsonSerializer.Serialize(new[]
+        {
+            new
+            {
+                signature,
+                message,
+                stack,
+                source,
+                time,
+                context,
+                app,
+                appLabel,
+                sessionId,
+            },
+        }, s_payloadJson);
+    }
+
+    private static bool TryDispatchJs(string url, string json)
+    {
+        // WF-R-FF2-0900 triage marker: console-only, identifies which
+        // transport a report took (temporary; remove after the faulting
+        // Task is identified).
+        try
+        {
+            if (JsTransportOverride is not null)
+                return JsTransportOverride(url, json);
+            if (OperatingSystem.IsBrowser())
+            {
+                CanvasBridge.WfwasmReportError(url, json);
+                Console.WriteLine("[report:transport js]");
+                return true;
+            }
+        }
+        catch (Exception dispatchEx)
+        {
+            // Hook absent (stale shell) or unreachable: HTTP fallback below.
+            try { Console.WriteLine($"[report:transport http-fallback {dispatchEx.GetType().Name}]"); } catch { }
+        }
+        try { Console.WriteLine("[report:transport http]"); } catch { }
+        return false;
     }
 
     private static string? Capture(Func<string?>? provider)

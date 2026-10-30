@@ -35,9 +35,11 @@ public sealed unsafe class CpuParityTests
             1f, false);
     }
 
-    // Raster footprint mirror: inclusive floor..ceil bounds.
+    // Raster footprint mirror: floor(d)..ceil(d+size)-1 (ruled 2026-10-28:
+    // integral far edges are exclusive; the old ceil-inclusive bound
+    // smeared a 5th pixel per dab).
     private static bool Covers(float d, int p) =>
-        p >= Math.Floor(d) && p <= Math.Ceiling(d + 4);
+        p >= Math.Floor(d) && p <= Math.Ceiling(d + 4) - 1;
 
     // Exact mirror of the backend's mask blend (truncating +0.5, not
     // banker's rounding): the oracle must reproduce the bytes.
@@ -66,8 +68,8 @@ public sealed unsafe class CpuParityTests
                 Stamp(ctx, bmp, 8f, 8f, 4f);
 
                 // Coverage per pixel mirrors the backend rasterizer: the
-                // loop runs floor(d)..ceil(d+size) inclusive and edge
-                // texels clamp, so each dab covers a 5x5 square here.
+                // loop runs floor(d)..ceil(d+size)-1, so each dab covers
+                // a 4x4 square here (integral edges exclusive).
                 for (int y = 0; y < 16; y++)
                 {
                     for (int x = 0; x < 16; x++)

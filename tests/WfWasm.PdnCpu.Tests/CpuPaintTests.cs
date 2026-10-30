@@ -155,6 +155,10 @@ public sealed unsafe class CpuPaintTests
                 Assert.Equal(128, target[2 * 6 + 2]);
                 Assert.Equal(0, target[0]);
                 Assert.Equal(0, target[5 * 6 + 5]);
+                // Integral far edge (3.0) must not paint a 3rd row/column.
+                Assert.Equal(0, target[1 * 6 + 3]);
+                Assert.Equal(0, target[3 * 6 + 1]);
+                Assert.Equal(0, target[3 * 6 + 3]);
                 // Second coat composites, not overwrites
                 // (0.5 over 128/255 -> 192).
                 CpuPaint.FillRect(ctx, 1f, 1f, 2f, 2f, 0.5f, 1f, 1f, 1f, 1f);
@@ -1338,6 +1342,132 @@ public sealed unsafe class CpuPaintTests
         Assert.Equal("FINAL", CpuPaint.GetProxySourceImage(outer));
     }
 
+    [Fact]
+    public void GetProxySourceImage_Prefers_Bitmap_Input_In_Composite()
+    {
+        // Layer thumbnails composite (checkerboard, bitmap): the old
+        // input-0 resolution dropped the bitmap for the procedural
+        // tile. The bitmap input must win.
+        var checker = new FakeCheckerboardEffect(
+            new FakeFloatColor(1f, 1f, 1f, 1f),
+            new FakeFloatColor(0f, 0f, 0f, 1f), 8);
+        var bitmap = new FakeUploadedBitmap();
+        var composite = new FakeCompositeEffectForTest(checker, bitmap);
+        Assert.Same(bitmap, CpuPaint.GetProxySourceImage(composite));
+    }
+
+    [Fact]
+    public void GetProxySourceImage_Composite_AllProcedural_Falls_Through()
+    {
+        // No bitmap-like input: today's input-0 behavior is preserved
+        // (the procedural input resolves to itself, as before).
+        var checker = new FakeCheckerboardEffect(
+            new FakeFloatColor(1f, 1f, 1f, 1f),
+            new FakeFloatColor(0f, 0f, 0f, 1f), 8);
+        var composite = new FakeCompositeEffectForTest(checker, null);
+        Assert.Same(checker, CpuPaint.GetProxySourceImage(composite));
+    }
+
+    public sealed class FakeUploadedBitmap
+    {
+    }
+
+    public sealed class FakeCompositeEffectForTest
+    {
+        private readonly object?[] _inputs;
+        public FakeCompositeEffectForTest(params object?[] inputs) { _inputs = inputs; }
+        public object? GetInput(int index) => _inputs[index];
+    }
+
+    [Fact]
+    public void GetProxySourceImage_Prefers_Bitmap_In_Sources_List()
+    {
+        // Real CompositeEffects expose destination/source through
+        // Properties.Sources, not GetInput: the bitmap (index 1)
+        // must win over the procedural destination (index 0).
+        var checker = new FakeCheckerboardEffect(
+            new FakeFloatColor(1f, 1f, 1f, 1f),
+            new FakeFloatColor(0f, 0f, 0f, 1f), 8);
+        var bitmap = new FakeUploadedBitmap();
+        var composite = new FakeSourcesCompositeEffect(checker, bitmap);
+        Assert.Same(bitmap, CpuPaint.GetProxySourceImage(composite));
+    }
+
+    public sealed class FakeSourcesCompositeEffect
+    {
+        private readonly object?[] _inputs;
+        public FakeSourcesCompositeEffect(params object?[] inputs) { _inputs = inputs; }
+        public FakeSourcesProps Properties => new(_inputs);
+    }
+
+    public sealed class FakeSourcesProps
+    {
+        private readonly object?[] _inputs;
+        public FakeSourcesProps(object?[] inputs) { _inputs = inputs; }
+        public System.Collections.Generic.List<object?> Sources =>
+            new(_inputs);
+    }
+
+    [Fact]
+    public void GetProxySourceImage_Prefers_Bitmap_In_Duck_Sources()
+    {
+        // The real Sources accessor is duck-enumerable (custom
+        // GetEnumerator, no IEnumerable): same preference must apply.
+        var checker = new FakeCheckerboardEffect(
+            new FakeFloatColor(1f, 1f, 1f, 1f),
+            new FakeFloatColor(0f, 0f, 0f, 1f), 8);
+        var bitmap = new FakeUploadedBitmap();
+        var composite = new FakeDuckSourcesCompositeEffect(checker, bitmap);
+        Assert.Same(bitmap, CpuPaint.GetProxySourceImage(composite));
+    }
+
+    public sealed class FakeDuckSourcesCompositeEffect
+    {
+        private readonly object?[] _inputs;
+        public FakeDuckSourcesCompositeEffect(params object?[] inputs) { _inputs = inputs; }
+        public FakeDuckSourcesProps Properties => new(_inputs);
+    }
+
+    public sealed class FakeDuckSourcesProps
+    {
+        private readonly object?[] _inputs;
+        public FakeDuckSourcesProps(object?[] inputs) { _inputs = inputs; }
+        public FakeDuckEnumerator Sources => new(_inputs);
+    }
+
+    public sealed class FakeDuckEnumerator
+    {
+        private readonly object?[] _inputs;
+        private int _at = -1;
+        public FakeDuckEnumerator(object?[] inputs) { _inputs = inputs; }
+        public FakeDuckEnumerator GetEnumerator() => this;
+        public bool MoveNext() => ++_at < _inputs.Length;
+        public object? Current => _inputs[_at];
+    }
+
+    [Fact]
+    public void TryUploadUiDeviceBitmap_Uploads_Half_Source()
+    {
+        // Layer-strip checkbox glyphs arrive as UI.DeviceBitmaps
+        // wrapping a 13x13 Half source; the helper must answer a
+        // nonzero handle with matching dims.
+        var src = new FakeHalfBitmapSource(13, 13);
+        var image = new PaintDotNet.UI.Media.DeviceBitmap(src);
+        bool ok = CpuPaint.TryUploadUiDeviceBitmap(image, out long handle, out int w, out int h);
+        Assert.True(ok);
+        Assert.NotEqual(0, handle);
+        Assert.Equal(13, w);
+        Assert.Equal(13, h);
+        CpuPaint.FreeBitmap(handle);
+    }
+
+    [Fact]
+    public void TryUploadUiDeviceBitmap_Rejects_Foreign_Types()
+    {
+        Assert.False(CpuPaint.TryUploadUiDeviceBitmap(new object(), out _, out _, out _));
+        Assert.False(CpuPaint.TryUploadUiDeviceBitmap(null, out _, out _, out _));
+    }
+
     public interface IDeviceEffectProxy<T> { FakePropBag Properties { get; } }
     public sealed class FakePropBag
     {
@@ -2266,4 +2396,31 @@ public sealed unsafe class CpuPaintTests
         CpuPaint.NoteEffectInput(bag, 65, new object());
         Assert.Empty(CallEffectInputs(new NotedEffectStub(bag)));
     }
+}
+
+public sealed class FakeHalfBitmapSource
+{
+    private readonly int _w;
+    private readonly int _h;
+    public FakeHalfBitmapSource(int w, int h) { _w = w; _h = h; }
+    public FakeIntSize Size => new(_w, _h);
+    public FakePixelFormat PixelFormat => new();
+    public void CopyPixels(IntPtr dst, int stride, int len, object? rect)
+    {
+        for (int i = 0; i < _w * _h; i++)
+            for (int c = 0; c < 4; c++)
+                Marshal.WriteInt16(dst, (i * 4 + c) * 2, 0x3C00);
+    }
+}
+
+public sealed class FakeIntSize
+{
+    public FakeIntSize(int w, int h) { Width = w; Height = h; }
+    public int Width { get; }
+    public int Height { get; }
+}
+
+public sealed class FakePixelFormat
+{
+    public int GetBitsPerPixel() => 64;
 }

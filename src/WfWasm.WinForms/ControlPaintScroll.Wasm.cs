@@ -12,7 +12,7 @@ using System.Drawing;
 
 namespace System.Windows.Forms;
 
-internal static class ControlPaintScrollPainter
+public static class ControlPaintScrollPainter
 {
     public static void DrawScrollButton(Graphics? g, Rectangle rect, ScrollButton button, ButtonState state)
     {

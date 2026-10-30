@@ -20,6 +20,8 @@ namespace WfWasm.CanvasHost;
 /// 10 = retainLayers [[liveIds]] (compositor drops unlisted layers).
 /// 11 = patchBitmap [layerId,x,y,w,h] (pixels out-of-band, spliced into
 /// the retained layer; hand-built streams without a prior upload no-op).
+/// 12 = shiftBitmap [layerId,dx,dy] (marker only: the upload loop applies
+/// the shift out-of-band ahead of the patch; hand-built streams no-op).
 /// Frame/end markers carry no pixels.
 /// </summary>
 public static partial class CanvasBridge
@@ -29,6 +31,17 @@ public static partial class CanvasBridge
 
     [JSImport("globalThis.wfwasmTexPatch")]
     internal static partial string TexPatch(string layerId, byte[] rgba, int x, int y, int width, int height);
+
+    [JSImport("globalThis.wfwasmTexShift")]
+    internal static partial string TexShift(string layerId, int dx, int dy);
+
+    // WF-R-NRE-0730: sync error-report dispatch (canvas-bridge.js
+    // wfwasmReportError). Void return = fire-and-forget at the JS
+    // boundary: no managed Task is created, so a report can never fault
+    // inside JavaScriptExports.CompleteTask (previously: NRE there took
+    // the runtime down, exit 1).
+    [JSImport("globalThis.wfwasmReportError")]
+    internal static partial void WfwasmReportError(string url, string json);
 
     // Perf item 4 bridge anchors (B-1). PerfNowMs places managed events
     // on the JS axis (ordering only). PerfMoveSlot reads the latest raw
@@ -40,7 +53,7 @@ public static partial class CanvasBridge
     [JSImport("globalThis.wfwasmPerfLastMove")]
     internal static partial double[]? PerfMoveSlot();
 
-    public sealed record BitmapUpload(string LayerId, byte[] Rgba, int Width, int Height, int X = 0, int Y = 0, bool IsPatch = false);
+    public sealed record BitmapUpload(string LayerId, byte[] Rgba, int Width, int Height, int X = 0, int Y = 0, bool IsPatch = false, bool IsShift = false);
 
     public static string SerializeCommands(IReadOnlyList<DrawCommand> commands)
     {
@@ -86,6 +99,9 @@ public static partial class CanvasBridge
                 case PatchBitmapCommand p:
                     ops.Add([11, p.LayerId, p.X, p.Y, p.Width, p.Height]);
                     break;
+                case ShiftBitmapCommand s:
+                    ops.Add([12, s.LayerId, s.DX, s.DY]);
+                    break;
             }
         }
 
@@ -107,6 +123,8 @@ public static partial class CanvasBridge
                 uploads.Add(new BitmapUpload(d.LayerId, d.Rgba, d.Width, d.Height));
             else if (command is PatchBitmapCommand p)
                 uploads.Add(new BitmapUpload(p.LayerId, p.Rgba, p.Width, p.Height, p.X, p.Y, true));
+            else if (command is ShiftBitmapCommand s)
+                uploads.Add(new BitmapUpload(s.LayerId, [], s.DX, s.DY, IsShift: true));
             else
                 json.Add(command);
         }
@@ -123,7 +141,9 @@ public static partial class CanvasBridge
         var (json, uploads) = SplitUploads(commands);
         foreach (BitmapUpload u in uploads)
         {
-            if (u.IsPatch)
+            if (u.IsShift)
+                TexShift(u.LayerId, u.Width, u.Height);
+            else if (u.IsPatch)
                 TexPatch(u.LayerId, u.Rgba, u.X, u.Y, u.Width, u.Height);
             else
                 TexDef(u.LayerId, u.Rgba, u.Width, u.Height);
@@ -144,7 +164,9 @@ public static partial class CanvasBridge
         long t0 = PerfTimeline.Enabled ? PerfTimeline.Stamp() : 0;
         foreach (BitmapUpload u in uploads)
         {
-            if (u.IsPatch)
+            if (u.IsShift)
+                TexShift(u.LayerId, u.Width, u.Height);
+            else if (u.IsPatch)
                 TexPatch(u.LayerId, u.Rgba, u.X, u.Y, u.Width, u.Height);
             else
                 TexDef(u.LayerId, u.Rgba, u.Width, u.Height);

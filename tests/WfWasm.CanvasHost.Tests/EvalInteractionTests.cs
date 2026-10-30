@@ -15,7 +15,7 @@ using FormsTextBox = System.Windows.Forms.TextBox;
 /// </summary>
 public sealed class EvalInteractionTests
 {
-    private static readonly string SmallDir = TestPaths.Repo(@".artifacts\runtime");
+    private const string SmallDir = @"E:\tmp\rewritten-small";
 
     private static Assembly LoadSmallApp(string file, string expectName)
     {

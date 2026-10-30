@@ -220,7 +220,8 @@ namespace Windows.Win32
         public static uint GetDpiForSystem() => 96;
         public static unsafe HRESULT GetErrorInfo(uint dwReserved, IErrorInfo** pperrinfo) => HRESULT.S_FALSE;
         public static unsafe BOOL GetExitCodeThread(HANDLE hThread, uint* lpExitCode) => (BOOL)true;
-        public static HWND GetFocus() => default;
+        private static HWND s_focusedWindow;
+        public static HWND GetFocus() => s_focusedWindow;
         public static unsafe HRESULT GetHGlobalFromILockBytes(void* plkbyt, HGLOBAL* phglobal) => HRESULT.S_OK;
         public static unsafe int GetKeyboardLayoutList(int nBuff, HKL* lpList) => 0;
         public static unsafe BOOL GetKeyboardState(byte* lpKeyState) => (BOOL)true;
@@ -255,7 +256,17 @@ namespace Windows.Win32
                 return DrawTextEx(hdc, (PWSTR)lpchText, cchText, pRect, format, null);
             }
         }
-        public static HWND SetFocus(HWND hWnd = default) => default;
+        public static HWND SetFocus(HWND hWnd = default)
+        {
+            // Desktop fails the call on NULL (focus unchanged); a real
+            // window takes focus. Drives Control.Focused/ContainsFocus,
+            // which Win32 menus/combo popups gate on (silent no-open).
+            if (!hWnd.IsNull)
+            {
+                s_focusedWindow = hWnd;
+            }
+            return s_focusedWindow;
+        }
         public static void GetStartupInfo(out STARTUPINFOW lpStartupInfo) => lpStartupInfo = default;
         public static int GetSystemMetricsForDpi(SYSTEM_METRICS_INDEX nIndex, uint dpi) => PInvokeCore.GetSystemMetrics(nIndex);
         public static unsafe uint GetSystemPaletteEntries(HDC hdc, uint iStart, uint cEntries, PALETTEENTRY* pEntries) => 0;
@@ -998,7 +1009,7 @@ namespace Windows.Win32
                 return previous;
             }
 
-
+            
             // Bounded GDI-paint census (tile-text diagnosis): which DrawText
             // paints arrive, with what rect, and whether a world transform
             // was active when they arrived. Rewriter-note: keep this block

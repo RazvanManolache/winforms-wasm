@@ -72,3 +72,4 @@ public sealed class PaintHostFixture : IDisposable
 
 [CollectionDefinition("Paint")]
 public sealed class PaintCollection : ICollectionFixture<PaintHostFixture>;
+

@@ -31,7 +31,7 @@
         _lines.Clear();
         try
         {
-            RunBattery();
+            await RunBattery();
         }
         catch (Exception ex)
         {
@@ -79,7 +79,10 @@
         return worst;
     }
 
-    private void RunBattery()
+    // WF-R-FF2-0900: awaited (was fire-and-forget). A dropped raw JSImport
+    // Task that gets collected before the browser settles it surfaces as
+    // an NRE out of CompleteTask and takes the runtime down (exit 1).
+    private async Task RunBattery()
     {
         Say("caps=" + WebGlFx.CapsText);
         if (!WebGlFx.IsAvailable)
@@ -160,7 +163,7 @@
         Say(un is null ? "unmapped=null PASS" : "FAIL unmapped!=null");
 
         rec.EndFrame();
-        _ = CanvasBridge.PaintAsync(JS, "fxcanvas", rec.Commands);
+        await CanvasBridge.PaintAsync(JS, "fxcanvas", rec.Commands);
         Say("tiles=" + tile);
     }
 }

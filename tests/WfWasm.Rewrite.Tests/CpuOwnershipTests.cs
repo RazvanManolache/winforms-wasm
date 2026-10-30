@@ -16,7 +16,7 @@ public sealed class CpuOwnershipTests
 {
     private static string PaintDir()
     {
-        string dir = TestPaths.Repo(@"targets\paint.net");
+        string dir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         Assert.True(Directory.Exists(dir), "pristine PDN inputs missing: " + dir);
         return dir;
     }
@@ -107,7 +107,7 @@ public sealed class CpuOwnershipTests
     {
         string paintDir = PaintDir();
         string cpuDll = BinDll("WfWasm.PdnCpu", "net9.0", "WfWasm.PdnCpu");
-        string forkDll = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
+        string forkDll = @"E:\tmp\rewritten-small\WfWasm.WinForms.dll";
         string drawingDll = BinDll("WfWasm.Drawing", "net9.0", "WfWasm.Drawing");
         string corePath = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         Assert.True(File.Exists(corePath), "pristine PDN core missing: " + corePath);
@@ -152,7 +152,7 @@ public sealed class CpuOwnershipTests
     {
         string paintDir = PaintDir();
         string cpuDll = BinDll("WfWasm.PdnCpu", "net9.0", "WfWasm.PdnCpu");
-        string forkDll = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
+        string forkDll = @"E:\tmp\rewritten-small\WfWasm.WinForms.dll";
         string drawingDll = BinDll("WfWasm.Drawing", "net9.0", "WfWasm.Drawing");
         string corePath = Path.Combine(paintDir, "PaintDotNet.Windows.Core.dll");
         Assert.True(File.Exists(corePath), "pristine PDN core missing: " + corePath);

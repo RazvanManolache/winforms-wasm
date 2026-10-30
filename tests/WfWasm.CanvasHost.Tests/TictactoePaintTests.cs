@@ -48,7 +48,7 @@ public sealed class TictactoePaintTests
         // non-layered DrawImageCommand shape predates retained layers).
         // Same regenerable-data coupling as the fork file reference in this
         // test project: the rewritten app must exist in E:\tmp.
-        string app = TestPaths.Repo(@".artifacts\runtime\TicTacToe.dll");
+        string app = @"E:\tmp\rewritten-small\TicTacToe.dll";
         Assert.True(File.Exists(app), $"regenerate via E:/tmp/rewrite-small.ps1: {app}");
         var ttt = Assembly.LoadFrom(app);
         // The file is TicTacToe.dll but the assembly name kept its spaces

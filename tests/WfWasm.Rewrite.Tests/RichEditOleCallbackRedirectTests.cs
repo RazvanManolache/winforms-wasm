@@ -137,7 +137,7 @@ public sealed class RichEditOleCallbackRedirectTests
         // metadata, which self-locks a same-path write.
         byte[] bytes = File.ReadAllBytes(src);
         string? dir = Path.GetDirectoryName(src);
-        using var resolver = new FrameworkResolver(dir, [TestPaths.Repo(@".artifacts\runtime"), TestPaths.Repo(@"external-apps\paintnet-support")]);
+        using var resolver = new FrameworkResolver(dir, [@"E:\tmp\rewritten-small", @"E:\tmp\rewritten-paint"]);
         var readerParams = new ReaderParameters { AssemblyResolver = resolver };
         using (var ms = new MemoryStream(bytes))
         using (var read = AssemblyDefinition.ReadAssembly(ms, readerParams))
@@ -233,7 +233,7 @@ public sealed class RichEditOleCallbackRedirectTests
     [Fact]
     public void Redirect_Real_Fork_OleCallback_Keeps_Only_DragAccept_Tail()
     {
-        string src = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
+        string src = @"E:\tmp\rewritten-small\WfWasm.WinForms.dll";
         string? tmp = null;
         try
         {

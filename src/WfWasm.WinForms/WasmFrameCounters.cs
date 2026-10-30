@@ -76,6 +76,9 @@ public static class WasmFrameCounters
     public static long NRasterRegion;
     public static long NBlitClean;
     public static long NScrollShift;
+    // Self-painted control invocations in the open frame (nested-
+    // paint audit: distinguishes one big raster from many small ones).
+    public static long NSelfPaint;
     public static long RasterPx;
     public static long BytesExtracted;
     public static long BytesHashed;
@@ -152,6 +155,7 @@ public static class WasmFrameCounters
     // surface in place and repainted only the narrowed union instead
     // of a full raster.
     public static void CountScrollShift() => Interlocked.Increment(ref NScrollShift);
+    public static void CountSelfPaint() => Interlocked.Increment(ref NSelfPaint);
 
     // Mark-source attribution (who keeps a frame dirty). Counts every
     // mark call; the first marked control + rect per frame is kept
@@ -238,6 +242,7 @@ public static class WasmFrameCounters
         NRasterRegion = 0;
         NBlitClean = 0;
         NScrollShift = 0;
+        NSelfPaint = 0;
         RasterPx = 0;
         BytesExtracted = 0;
         BytesHashed = 0;

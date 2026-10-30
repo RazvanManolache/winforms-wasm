@@ -1,4 +1,4 @@
-@page "/"
+﻿@page "/"
 @page "/app/{SceneSlug}"
 @using Microsoft.AspNetCore.Components.Web
 @using Microsoft.AspNetCore.Components.Routing
@@ -263,6 +263,25 @@
     [JSInvokable]
     public bool PerfGetEnabled() => PerfTimeline.Enabled;
 
+    // Scroll-strip A/B gate: with off, scroll frames keep strip raster
+    // but upload full bitmaps (WfWasm.DisableScrollShift). Probe-only.
+    [JSInvokable]
+    public Task PerfSetScrollShift(bool on)
+    {
+        System.AppContext.SetSwitch("WfWasm.DisableScrollShift", !on);
+        return Task.CompletedTask;
+    }
+
+    // WF-R-NRE-0730 resnap gate: reference-path acceptance runs with the
+    // WF-P-FIX (2b) post-shift skip disabled (zero-byte saver, not under
+    // test). Probe-only; the unset-switch default keeps the skip enabled.
+    [JSInvokable]
+    public Task PerfSetPostShiftSkip(bool on)
+    {
+        System.AppContext.SetSwitch("WfWasm.DisablePostShiftSkip", !on);
+        return Task.CompletedTask;
+    }
+
     private static void SetDiagnosticsEnabled(bool on)
     {
         PerfTimeline.Enabled = on;
@@ -276,6 +295,23 @@
 
     [JSInvokable]
     public string PerfDumpJson() => PerfTimeline.DumpJson();
+
+    private static string AnimVal(object target, string prop, System.Reflection.BindingFlags flags)
+    {
+        try
+        {
+            var a = target.GetType().GetProperty(prop, flags)?.GetValue(target);
+            if (a == null) return "null";
+            return Convert.ToString(a.GetType().GetProperty("Value", flags)?.GetValue(a),
+                System.Globalization.CultureInfo.InvariantCulture) ?? "?";
+        }
+        catch { return "err"; }
+    }
+
+    // Read-only input-trace bridge for probe attribution (which managed
+    // control got the click/key, focus state). No behavior change.
+    [JSInvokable]
+    public string InputTraceDump() => _winFormsHost.RecentInputContext();
 
     [JSInvokable]
     public Task<string> GpuProbeScenario(string canvasId, string scenario)
@@ -435,6 +471,7 @@
             NRasterRegion = System.Windows.Forms.WasmFrameCounters.NRasterRegion,
             NBlit = System.Windows.Forms.WasmFrameCounters.NBlitClean,
             NScrollShift = System.Windows.Forms.WasmFrameCounters.NScrollShift,
+            NSelfPaint = System.Windows.Forms.WasmFrameCounters.NSelfPaint,
             RasterPx = System.Windows.Forms.WasmFrameCounters.RasterPx,
             UploadBytes = upBytes,
             JsonChars = jsonChars,
@@ -548,7 +585,6 @@
         System.Windows.Forms.WasmRepaintGate.RepaintRequested -= RequestPaint;
         System.Windows.Forms.WasmRepaintGate.RepaintRequested += RequestPaint;
     }
-
 
     private void RequestPaint()
     {

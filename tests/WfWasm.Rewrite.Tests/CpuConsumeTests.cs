@@ -28,13 +28,13 @@ public sealed class CpuConsumeTests
     // rooting ctx/list under Debug lifetime) are already dead.
     private static void WithRewrittenCore(Func<Assembly, Assembly, WeakReference[]> scenario)
     {
-        string paintDir = TestPaths.Repo(@"targets\paint.net");
+        string paintDir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         Assert.True(Directory.Exists(paintDir), "pristine PDN inputs missing: " + paintDir);
         string cpuDll = Path.GetFullPath(Path.Combine(
             AppContext.BaseDirectory, "..", "..", "..", "..", "..",
             "src", "WfWasm.PdnCpu", "bin", "Debug", "net9.0", "WfWasm.PdnCpu.dll"));
         Assert.True(File.Exists(cpuDll), "dependency not built: " + cpuDll);
-        string forkDll = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
+        string forkDll = @"E:\tmp\rewritten-small\WfWasm.WinForms.dll";
         string drawingDll = Path.GetFullPath(Path.Combine(
             AppContext.BaseDirectory, "..", "..", "..", "..", "..",
             "src", "WfWasm.Drawing", "bin", "Debug", "net9.0", "WfWasm.Drawing.dll"));

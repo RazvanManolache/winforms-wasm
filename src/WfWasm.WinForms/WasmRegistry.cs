@@ -18,10 +18,41 @@ public static class WasmRegistry
     public static RegistryKey? OpenSubKey(RegistryKey? key, string name, bool writable) => null;
     public static RegistryKey? OpenSubKey(RegistryKey? key, string name, RegistryKeyPermissionCheck permissionCheck) => null;
     public static RegistryKey? OpenSubKey(RegistryKey? key, string name, RegistryKeyPermissionCheck permissionCheck, System.Security.AccessControl.RegistryRights rights) => null;
-    public static object? GetValue(RegistryKey? key, string? name) => null;
-    public static object? GetValue(RegistryKey? key, string? name, object? defaultValue) => defaultValue;
-    public static object? GetValue(RegistryKey? key, string? name, object? defaultValue, RegistryValueOptions options) => defaultValue;
-    public static object? GetValue(string keyName, string? valueName, object? defaultValue) => defaultValue;
+    public static object? GetValue(RegistryKey? key, string? name)
+    {
+        NoteMiss(name);
+        return null;
+    }
+    public static object? GetValue(RegistryKey? key, string? name, object? defaultValue)
+    {
+        NoteMiss(name);
+        return defaultValue;
+    }
+    public static object? GetValue(RegistryKey? key, string? name, object? defaultValue, RegistryValueOptions options)
+    {
+        NoteMiss(name);
+        return defaultValue;
+    }
+    public static object? GetValue(string keyName, string? valueName, object? defaultValue)
+    {
+        NoteMiss(keyName + "/" + valueName);
+        return defaultValue;
+    }
+
+    private static int s_missCount;
+
+    // Section-5 failure attribution (bounded, no stack materialization):
+    // name the missing value on the first 3 misses + every 256th; counter
+    // only otherwise. Browser-safe: key/value names are plain strings, never
+    // resolved frames. Follows the DrawString census precedent.
+    public static string DumpRegistryMissCensus() => "registry-miss=" + s_missCount;
+
+    private static void NoteMiss(string? valueName)
+    {
+        int n = System.Threading.Interlocked.Increment(ref s_missCount);
+        if (n <= 3 || n % 256 == 0)
+            System.Console.WriteLine($"[REGMISS] value='{valueName}' n={n}");
+    }
     public static void SetValue(RegistryKey? key, string? name, object value) { }
     public static void SetValue(RegistryKey? key, string? name, object value, RegistryValueKind kind) { }
     public static void SetValue(string keyName, string? valueName, object value) { }

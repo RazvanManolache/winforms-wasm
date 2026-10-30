@@ -121,10 +121,28 @@ public sealed class ResourceStringStreamRewriteTests
     [Fact]
     public void Rewrite_ResourceManager_GetResourceSet_Redirects_To_Fork_Shim()
     {
-        string input = BuildResourceSetCaller();
+        string input = BuildResourceSetCaller(3);
         var target = RewriteAndFindCall(input, "SafeGetResourceSet");
         Assert.Equal("System.Windows.Forms.WasmResourceShim", target.DeclaringType.FullName);
         Assert.Equal(4, target.Parameters.Count);
+    }
+
+    [Fact]
+    public void Rewrite_ResourceManager_GetResourceSet_1Arg_Redirects_To_Fork_Shim()
+    {
+        string input = BuildResourceSetCaller(1);
+        var target = RewriteAndFindCall(input, "SafeGetResourceSet");
+        Assert.Equal("System.Windows.Forms.WasmResourceShim", target.DeclaringType.FullName);
+        Assert.Equal(2, target.Parameters.Count);
+    }
+
+    [Fact]
+    public void Rewrite_ResourceManager_GetResourceSet_2Arg_Redirects_To_Fork_Shim()
+    {
+        string input = BuildResourceSetCaller(2);
+        var target = RewriteAndFindCall(input, "SafeGetResourceSet");
+        Assert.Equal("System.Windows.Forms.WasmResourceShim", target.DeclaringType.FullName);
+        Assert.Equal(3, target.Parameters.Count);
     }
 
     [Fact]
@@ -220,7 +238,7 @@ public sealed class ResourceStringStreamRewriteTests
                     if (already is not null)
                         return already;
                     foreach (string dir in new[]
-                        { AppContext.BaseDirectory, TestPaths.Repo(@".artifacts\runtime") })
+                        { AppContext.BaseDirectory, @"E:\tmp\rewritten-small" })
                     {
                         string cand = Path.Combine(dir, want + ".dll");
                         if (File.Exists(cand))
@@ -324,7 +342,7 @@ public sealed class ResourceStringStreamRewriteTests
         return input;
     }
 
-    private static string BuildResourceSetCaller()
+    private static string BuildResourceSetCaller(int explicitArgs = 3)
     {
         string fixture = Path.GetFullPath(Path.Combine(
             AppContext.BaseDirectory, "..", "..", "..", "..",
@@ -352,8 +370,10 @@ public sealed class ResourceStringStreamRewriteTests
                 HasThis = true,
             };
             target.Parameters.Add(new Mono.Cecil.ParameterDefinition(cultureRef));
-            target.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Boolean));
-            target.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Boolean));
+            if (explicitArgs >= 2)
+                target.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Boolean));
+            if (explicitArgs >= 3)
+                target.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Boolean));
             var caller = new Mono.Cecil.MethodDefinition(
                 "GetIt",
                 Mono.Cecil.MethodAttributes.Public | Mono.Cecil.MethodAttributes.Static,
@@ -362,8 +382,10 @@ public sealed class ResourceStringStreamRewriteTests
             var il = caller.Body.GetILProcessor();
             il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
             il.Emit(Mono.Cecil.Cil.OpCodes.Ldnull);
-            il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
-            il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
+            if (explicitArgs >= 2)
+                il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
+            if (explicitArgs >= 3)
+                il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
             il.Emit(Mono.Cecil.Cil.OpCodes.Callvirt, target);
             il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
             calls.Methods.Add(caller);

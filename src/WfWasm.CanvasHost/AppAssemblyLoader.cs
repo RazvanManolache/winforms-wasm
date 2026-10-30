@@ -32,11 +32,21 @@ public static partial class AppAssemblyLoader
     private static readonly Dictionary<string, HashSet<string>> UsedByApp = new(StringComparer.OrdinalIgnoreCase);
     private static readonly HashSet<string> Resolving = new(StringComparer.OrdinalIgnoreCase);
     private static readonly HashSet<string> Missing = new(StringComparer.OrdinalIgnoreCase);
+    // The background warmup Task.Run is fire-and-forget: keep it rooted
+    // for the session. An unrooted fetch chain whose Task is collected
+    // before the browser completes it dies framelessly in
+    // JavaScriptExports.CompleteTask and takes the runtime down (exit 1).
+    private static Task? s_warmup;
 
     [JSImport("globalThis.wfwasmFetchAssembly")]
     private static partial byte[] FetchRequestedAssembly(string app, string name);
 
-    private static string Key(string name)
+private static int WarmPriority(string stem) =>
+stem.Equals("Mono.Cecil", StringComparison.OrdinalIgnoreCase) ? 0
+: stem.StartsWith("PaintDotNet.Effects", StringComparison.OrdinalIgnoreCase) ? 1
+: 2;
+
+private static string Key(string name)
     {
         string leaf = Path.GetFileName(name.Replace('\\', '/'));
         return leaf.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) || leaf.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
@@ -130,6 +140,15 @@ public static partial class AppAssemblyLoader
                 Console.WriteLine($"[AppAssemblyLoader] Load of {app}/{name} threw {ex.GetType().Name}, treating as missing.");
                 return null;
             }
+        }
+        catch
+        {
+            // Fail closed for the whole handler, not just the load: the
+            // synchronous demand fetch above runs outside the inner try,
+            // and anything it throws would otherwise escape the handler
+            // and kill the runtime (exit 1). The request site sees a miss.
+            try { Console.WriteLine("[AppAssemblyLoader] Resolve failed, treating as missing."); } catch { }
+            return null;
         }
         finally { lock (Gate) Resolving.Remove(name); }
     }
@@ -227,7 +246,30 @@ public static partial class AppAssemblyLoader
         catch { Fetches.TryRemove(new KeyValuePair<string, Lazy<Task<byte[]>>>(file.sha256, fetch)); throw; }
         lock (Gate) Bytes[Key(file.name)] = entryBytes;
         NoteUsed(app, Key(file.name));
-        await ReportAsync(js, entryBytes.Length, !ReferenceEquals(fetch, lazy));
+await ReportAsync(js, entryBytes.Length, !ReferenceEquals(fetch, lazy));
+// Awaited killer-set prefetch: these assemblies are demanded late by
+// PDN boot (effect discovery + Cecil scanning) through the synchronous
+// demand hook, whose sync-XHR return correlates with the post-load
+// session death. Awaiting them here (HttpClient path, ~1.5MB
+// transformed) guarantees warmed Bytes before first paint, so the
+// hook finds them cached and never calls sync XHR for them. Failures
+// fall through to the fire-and-forget warmup + demand hook below.
+try
+{
+if (manifest.prefetch is { Count: > 0 })
+{
+string[] killers = ["Mono.Cecil", "PaintDotNet.Effects", "PaintDotNet.Effects.Legacy", "PaintDotNet.Effects.Core", "PaintDotNet.Effects.Gpu"];
+var killTasks = new System.Collections.Generic.List<Task>();
+foreach (string k in killers)
+{
+var kf = manifest.prefetch.FirstOrDefault(x => Key(x.name).Equals(k, StringComparison.OrdinalIgnoreCase));
+if (kf is null) continue;
+killTasks.Add(PrefetchOneAsync(http, kf));
+}
+await Task.WhenAll(killTasks);
+}
+}
+catch { }
         // Warm the manifest closure in parallel without delaying first
         // paint: demand faults that arrive before warmup completes use the
         // sync hook as before. Fire-and-forget (all failures swallowed —
@@ -235,10 +277,16 @@ public static partial class AppAssemblyLoader
         // header, never from a blind store.
         if (manifest.prefetch is { Count: > 0 })
         {
-            var warm = manifest.prefetch
-                .Where(f => !Key(f.name).Equals(manifest.entry, StringComparison.OrdinalIgnoreCase))
-                .ToList();
-            _ = Task.Run(async () =>
+// Priority warmup: historically late, death-adjacent
+// on-demand assemblies (effect discovery + Cecil scanning)
+// arrive first, so the boot phase that demands them finds
+// warmed bytes instead of falling back to the synchronous
+// demand hook. Stable order otherwise preserved.
+var warm = manifest.prefetch
+.Where(f => !Key(f.name).Equals(manifest.entry, StringComparison.OrdinalIgnoreCase))
+.OrderBy(f => WarmPriority(Key(f.name)))
+.ToList();
+            s_warmup = Task.Run(async () =>
             {
                 using var gate = new SemaphoreSlim(6);
                 long warmed = 0;

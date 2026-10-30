@@ -625,4 +625,33 @@ public sealed class ResourceHelperTests
             ("plain.String", null, null, "hello"),
             ("icon.Svg", null, new byte[] { 60, 115, 118, 103 }, null));
     }
+
+    // Manifest probing yields real-but-wrong streams (no BEEFCACE
+    // header); opening the legacy reader on those threw a first-chance
+    // NSE per candidate per key (per-boot PNSE storm on Syncfusion
+    // button images, caught and recovered via the raw walk). The
+    // magic gate must answer null without executing the doomed ctor.
+    // Regression: NotSupportedException | ctor-1ST on every
+    // resource.Image key in syncfusion-buttons.
+    [Fact]
+    public void OpenResourceReader_Skips_NonResource_Stream_ThrowFree()
+    {
+        int readerFirstChance = 0;
+        EventHandler<FirstChanceExceptionEventArgs> hook = (_, e) =>
+        {
+            if (e.Exception is ArgumentException || e.Exception is NotSupportedException)
+                readerFirstChance++;
+        };
+        System.AppDomain.CurrentDomain.FirstChanceException += hook;
+        try
+        {
+            using var garbage = new MemoryStream(new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 });
+            Assert.Null(WfResourceHelper.OpenResourceReader(garbage));
+        }
+        finally
+        {
+            System.AppDomain.CurrentDomain.FirstChanceException -= hook;
+        }
+        Assert.Equal(0, readerFirstChance);
+    }
 }

@@ -364,6 +364,9 @@ namespace System.Drawing
         private int[] _pixels;
         private int _width;
         private int _height;
+        private IntPtr _wrapPtr = IntPtr.Zero;
+        private int _wrapStride;
+        private int _wrapBpp;
         private float _dpiX = 96f;
         private float _dpiY = 96f;
         private readonly Dictionary<Imaging.BitmapData, LockState> _locks = new();
@@ -402,6 +405,9 @@ namespace System.Drawing
             int bytesPerPixel = bpp / 8;
             var bytes = new byte[stride * height];
             System.Runtime.InteropServices.Marshal.Copy(scan0, bytes, 0, bytes.Length);
+            _wrapPtr = scan0;
+            _wrapStride = stride;
+            _wrapBpp = bpp;
             for (int y = 0; y < height; y++)
             {
                 for (int x = 0; x < width; x++)
@@ -853,7 +859,32 @@ namespace System.Drawing
 
         protected override void Dispose(bool disposing)
         {
-            // Theme loaders (Telerik ImageFromString) LockBits and never
+            // Scan-pointer wrappers (stride, scan0) draw through on desktop:
+            // copy owned pixels back to the caller buffer so
+            // using-patterns (paint, dispose, read buffer) observe paints.
+            // Finalizer path never touches the pointer.
+            if (disposing && _wrapPtr != IntPtr.Zero)
+            {
+                IntPtr ptr = _wrapPtr;
+                _wrapPtr = IntPtr.Zero;
+                int bytesPerPixel = _wrapBpp / 8;
+                var bytes = new byte[_wrapStride * _height];
+                for (int y = 0; y < _height; y++)
+                {
+                    for (int x = 0; x < _width; x++)
+                    {
+                        int px = _pixels[y * _width + x];
+                        int o = y * _wrapStride + x * bytesPerPixel;
+                        bytes[o] = (byte)px;
+                        bytes[o + 1] = (byte)(px >> 8);
+                        bytes[o + 2] = (byte)(px >> 16);
+                        if (bytesPerPixel == 4)
+                            bytes[o + 3] = (byte)(px >> 24);
+                    }
+                }
+                System.Runtime.InteropServices.Marshal.Copy(bytes, 0, ptr, bytes.Length);
+            }
+// Theme loaders (Telerik ImageFromString) LockBits and never
             // Unlock; free any abandoned pins so repeated loads do not pin
             // garbage forever. Entries stay valid: a later UnlockBits
             // still runs and removes its entry.

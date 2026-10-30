@@ -5,7 +5,6 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
-using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -14,6 +13,7 @@ using System.Resources;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Loader;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -34,137 +34,68 @@ public sealed class WinFormsAppHost : IDisposable
 		Released
 	}
 
+	private sealed class ListViewScroll
+	{
+		public int Top;
+
+		public int Anchor = -2;
+	}
+
+	private sealed class ClickToken : IEquatable<ClickToken>
+	{
+		public string Kind { get; }
+
+		public object? Target { get; }
+
+		public ClickToken(string kind, object? target)
+		{
+			Kind = kind;
+			Target = target;
+		}
+
+		public bool Equals(ClickToken? other)
+		{
+			return other != null && Kind == other.Kind && Target == other.Target;
+		}
+
+		public override bool Equals(object? obj)
+		{
+			return Equals(obj as ClickToken);
+		}
+
+		public override int GetHashCode()
+		{
+			return HashCode.Combine(Kind, RuntimeHelpers.GetHashCode(Target));
+		}
+	}
+
 	private static readonly MethodInfo? s_onPaintMethod = typeof(System.Windows.Forms.Control).GetMethod("OnPaint", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
 	private static readonly MethodInfo? s_onPaintBackgroundMethod = typeof(System.Windows.Forms.Control).GetMethod("OnPaintBackground", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
 	private static readonly ConcurrentDictionary<Type, bool> s_selfPaints = new ConcurrentDictionary<Type, bool>();
 
-	// Paint-routing rule (SfButton style images, 2026-10-23): a control
-	// whose type overrides OnPaint/OnPaintBackground owns its pixels
-	// (vendor theme states, style images); the flat fast-paths are only
-	// for exact framework types and non-overriding subclasses. Shared
-	// with RenderControls so dispatch and self-paint probing agree.
-	internal static bool TypeSelfPaints(Type type)
-	{
-		return s_selfPaints.GetOrAdd(type, delegate(Type type2)
-		{
-			MethodInfo method = type2.GetMethod("OnPaint", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-			if ((object)method != null && method.DeclaringType != typeof(System.Windows.Forms.Control))
-			{
-				return true;
-			}
-			MethodInfo method2 = type2.GetMethod("OnPaintBackground", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-			return (object)method2 != null && method2.DeclaringType != typeof(System.Windows.Forms.Control);
-		});
-	}
+	private static readonly ConcurrentDictionary<Type, byte> s_selfPaintPoisoned = new ConcurrentDictionary<Type, byte>();
 
-	// Narrower routing rule for the flat Button fast-path: Button
-	// itself overrides OnPaint upstream, so the generic self-paint
-	// predicate cannot tell plain Button apart from a self-painted
-	// subclass. Managed paint wins only when the most-derived paint
-	// method is declared STRICTLY below Button (e.g. SfButton, which
-	// carries its images in the vendor style, not ButtonBase.Image).
-	internal static bool ButtonPaintsItself(Type type)
-	{
-		Type btn = typeof(System.Windows.Forms.Button);
-		if (type == null || type == btn || !btn.IsAssignableFrom(type))
-			return false;
-		MethodInfo onPaint = type.GetMethod("OnPaint", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-		if (onPaint != null && onPaint.DeclaringType != null && onPaint.DeclaringType != btn && btn.IsAssignableFrom(onPaint.DeclaringType))
-			return true;
-		MethodInfo onPaintBackground = type.GetMethod("OnPaintBackground", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-		return onPaintBackground != null && onPaintBackground.DeclaringType != null && onPaintBackground.DeclaringType != btn && btn.IsAssignableFrom(onPaintBackground.DeclaringType);
-	}
 	private static readonly ConcurrentDictionary<Type, bool> s_nonFlatPaints = new ConcurrentDictionary<Type, bool>();
 
 	private static readonly ConcurrentDictionary<string, byte> s_selfPaintLogged = new ConcurrentDictionary<string, byte>();
+
 	private static readonly ConcurrentDictionary<string, byte> s_firstPaintLogged = new ConcurrentDictionary<string, byte>();
 
-	// Durable paint signal (replaces per-paint [TEMP] spam, ~1.4k lines/run):
-	// first completed paint per control type, plus Self-paint failures.
-	private static void LogFirstPaint(System.Windows.Forms.Control c)
-	{
-		try
-		{
-			string text = c.GetType().FullName ?? c.GetType().Name;
-			if (s_firstPaintLogged.TryAdd(text, 1))
-			{
-				System.Console.WriteLine("[paint] first-painted " + text);
-				// Tile content lives in TPF elements (not Controls): dump
-				// the tile tree once its panorama first paints (post-layout).
-				if (text.Contains("Panorama", System.StringComparison.Ordinal))
-					DumpTileVisualState(c);
-				// Positive-control ink census for vendor text paths: grids
-				// and diagrams render dense text; their sessions tell
-				// whether managed ink APIs run at all (BookShelf reads zero
-				// everywhere). Bounded one-liners, first paint only.
-				if (text.Contains("RadGridView", System.StringComparison.Ordinal)
-					|| text.Contains("RadDiagram", System.StringComparison.Ordinal))
-					DumpInkCensus();
-			}
-			// One-shot late tile dump (ungated): panorama groups arrive
-			// async (book load via ThreadPool), so the first-paint tree
-			// predates the tiles. Re-dumps on the first panorama paint
-			// whose groups are non-empty (covers loading repaints as each
-			// arrives). Cheap presence probe per panorama paint.
-			if (!s_tileLateDumpDone
-				&& text.Contains("Panorama", System.StringComparison.Ordinal)
-				&& PanoramaHasGroups(c))
-			{
-				s_tileLateDumpDone = true;
-				DumpTileVisualState(c);
-				MaybeEnsureTileRepaint(c);
-				SubscribeTilePaintFire(c);
-				ArmTileRedumpOnResize(c);
-			}
-		}
-		catch { }
-	}
-	// Perf item 4: first-chance exception census (caught per-span
-	// throws are invisible otherwise). Hooked only when the
-	// timeline is enabled; Take drains per frame in Home.
 	private static long s_firstChanceCount;
+
 	private static long s_slowTicks;
+
 	private static string? s_slowType;
+
 	private static long s_slowDraws;
+
 	private static long s_slowPx;
-	internal static void TakeSlow(out long ticks, out string? type, out long draws, out long px)
-	{
-		ticks = System.Threading.Interlocked.Exchange(ref s_slowTicks, 0);
-		type = System.Threading.Interlocked.Exchange(ref s_slowType, null);
-		draws = System.Threading.Interlocked.Exchange(ref s_slowDraws, 0);
-		px = System.Threading.Interlocked.Exchange(ref s_slowPx, 0);
-	}
+
 	private static int s_firstChanceHooked;
-	private static System.EventHandler<System.Runtime.ExceptionServices.FirstChanceExceptionEventArgs>? s_firstChanceHandler;
 
-	internal static void HookFirstChance()
-	{
-		if (System.Threading.Interlocked.Exchange(ref s_firstChanceHooked, 1) != 0)
-		    return;
-		var handler = new System.EventHandler<System.Runtime.ExceptionServices.FirstChanceExceptionEventArgs>((_, _) =>
-		    System.Threading.Interlocked.Increment(ref s_firstChanceCount));
-	s_firstChanceHandler = handler;
-		System.AppDomain.CurrentDomain.FirstChanceException += handler;
-	}
-
-	// Diagnostics off-switch: removes the FirstChance tap so the default-off
-	// state pays nothing per throw (not even the gated increment).
-	internal static void UnhookFirstChance()
-	{
-		if (System.Threading.Interlocked.Exchange(ref s_firstChanceHooked, 0) == 0)
-		    return;
-		try
-		{
-		    var handler = System.Threading.Volatile.Read(ref s_firstChanceHandler);
-		    if (handler is not null)
-		        System.AppDomain.CurrentDomain.FirstChanceException -= handler;
-	} catch { }
-	}
-
-	internal static long TakeFirstChance() =>
-		System.Threading.Interlocked.Exchange(ref s_firstChanceCount, 0);
+	private static EventHandler<FirstChanceExceptionEventArgs>? s_firstChanceHandler;
 
 	private static readonly ConcurrentDictionary<Type, ElementLayoutMembers?> s_layoutMembers = new ConcurrentDictionary<Type, ElementLayoutMembers>();
 
@@ -179,14 +110,23 @@ public sealed class WinFormsAppHost : IDisposable
 	private static readonly MethodInfo? s_onMouseEnterMethod = typeof(System.Windows.Forms.Control).GetMethod("OnMouseEnter", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
 	private static readonly MethodInfo? s_onMouseLeaveMethod = typeof(System.Windows.Forms.Control).GetMethod("OnMouseLeave", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
 	private static readonly MethodInfo? s_onMouseClickMethod = typeof(System.Windows.Forms.Control).GetMethod("OnMouseClick", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
 	private static readonly MethodInfo? s_onMouseDoubleClickMethod = typeof(System.Windows.Forms.Control).GetMethod("OnMouseDoubleClick", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
 	private static readonly MethodInfo? s_onDoubleClickMethod = typeof(System.Windows.Forms.Control).GetMethod("OnDoubleClick", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
 	private static readonly MethodInfo? s_onMouseHoverMethod = typeof(System.Windows.Forms.Control).GetMethod("OnMouseHover", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
 	private static readonly MethodInfo? s_onMouseWheelMethod = typeof(System.Windows.Forms.Control).GetMethod("OnMouseWheel", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
 	private static readonly MethodInfo? s_onKeyDownMethod = typeof(System.Windows.Forms.Control).GetMethod("OnKeyDown", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
 	private static readonly MethodInfo? s_processDialogKeyMethod = typeof(System.Windows.Forms.Control).GetMethod("ProcessDialogKey", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
 	private static readonly MethodInfo? s_onKeyPressMethod = typeof(System.Windows.Forms.Control).GetMethod("OnKeyPress", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
 	private static readonly MethodInfo? s_onKeyUpMethod = typeof(System.Windows.Forms.Control).GetMethod("OnKeyUp", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
 	private static readonly MethodInfo? s_itemMouseEnterMethod = typeof(System.Windows.Forms.ToolStripItem).GetMethod("OnMouseEnter", BindingFlags.Instance | BindingFlags.NonPublic);
@@ -206,6 +146,7 @@ public sealed class WinFormsAppHost : IDisposable
 	private System.Windows.Forms.Form? _activeForm;
 
 	private System.Windows.Forms.TextBox? _focusedTextBox;
+
 	private System.Windows.Forms.Control? _focusedControl;
 
 	private System.Windows.Forms.Control? _pressedButton;
@@ -213,85 +154,48 @@ public sealed class WinFormsAppHost : IDisposable
 	private System.Windows.Forms.Control? _mouseTarget;
 
 	private System.Windows.Forms.MouseButtons _mouseButtons = System.Windows.Forms.MouseButtons.None;
-	// Press/release click pairing (desktop: Click fires on release over the
-	// pressed control, DoubleClick replaces the second Click inside the
-	// SystemInformation window/rect). Tokens compare by reference, never by
-	// virtual Equals (app controls may override it).
+
 	private ClickToken? _downToken;
+	private System.Windows.Forms.Control? _pressTarget;
+	private bool _pairedPress;
+
 	private int _downX;
+
 	private int _downY;
+
 	private long _downMs;
+
 	private System.Windows.Forms.MouseButtons _downButton;
+
 	private ClickToken? _lastClickToken;
+
 	private int _lastClickX;
+
 	private int _lastClickY;
+
 	private long _lastClickMs;
+
 	private System.Windows.Forms.MouseButtons _lastClickButton;
-	// Hover stillness: last move position/time; the timer fires OnMouseHover
-	// once the pointer rests inside MouseHoverSize past MouseHoverTime.
+
 	private int _hoverX = int.MinValue;
+
 	private int _hoverY = int.MinValue;
+
 	private long _hoverMs;
+
 	private bool _hoverFired;
+
 	private System.Threading.Timer? _hoverTimer;
-	// Wheel fractional-notch accumulator (trackpads send sub-notch deltas).
+
 	private double _wheelRemainder;
-	// ListView virtual scroll (desktop parity). The host paints ListView rows
-	// itself, so it also owns the scroll offset the native control would keep:
-	// one top index per ListView. Paint is windowed from it, scrollbar on overflow,
-	// wheel + scrollbar-track clicks move it. Entries die with the control.
-	private sealed class ListViewScroll { public int Top; public int Anchor = -2; }
-	private readonly global::System.Runtime.CompilerServices.ConditionalWeakTable<System.Windows.Forms.Control, ListViewScroll> _listViewScroll = new();
+
+	private readonly ConditionalWeakTable<System.Windows.Forms.Control, ListViewScroll> _listViewScroll = new ConditionalWeakTable<System.Windows.Forms.Control, ListViewScroll>();
+
 	internal const int ListViewHeaderH = 24;
+
 	internal const int ListViewRowH = 22;
+
 	internal const int ListViewScrollW = 14;
-	internal static int ListViewCapacity(int height) => Math.Max(1, (height - ListViewHeaderH - 2) / ListViewRowH);
-	internal static int ListViewClampTop(int top, int count, int capacity) => Math.Clamp(top, 0, Math.Max(0, count - capacity));
-	internal int ResolveListViewTop(System.Windows.Forms.ListView lv)
-	{
-		int cap = ListViewCapacity(lv.Height);
-		int count;
-		try { count = lv.Items.Count; }
-		catch { count = 0; }
-		ListViewScroll box = _listViewScroll.GetOrCreateValue(lv);
-		int top = ListViewClampTop(box.Top, count, cap);
-		// Follow the anchor selection into view (native EnsureVisible for
-		// keyboard/click selection changes), but only when the anchor MOVED:
-		// wheel scrolling must persist instead of snapping back.
-		int anchor = -1;
-		try
-		{
-			foreach (int i in lv.SelectedIndices) { anchor = i; break; }
-			if (anchor < 0 && lv.FocusedItem != null) anchor = lv.FocusedItem.Index;
-		}
-		catch { anchor = -1; }
-		if (anchor >= 0 && anchor != box.Anchor)
-		{
-			if (anchor < top) top = anchor;
-			if (anchor >= top + cap) top = anchor - cap + 1;
-			box.Anchor = anchor;
-		}
-		box.Top = top;
-		return top;
-	}
-	internal bool ScrollListView(System.Windows.Forms.ListView lv, int lines)
-	{
-		int cap = ListViewCapacity(lv.Height);
-		int count;
-		try { count = lv.Items.Count; }
-		catch { return false; }
-		if (count <= cap || lines == 0)
-			return false;
-		ListViewScroll box = _listViewScroll.GetOrCreateValue(lv);
-		int top = ListViewClampTop(box.Top + lines, count, cap);
-		if (top == box.Top)
-			return false;
-		box.Top = top;
-		return true;
-	}
-	// Test seam: double-click/hover windows read through here so tests
-	// drive timing without sleeping.
-	internal Func<long> TickNow { get; set; } = static () => Environment.TickCount64;
 
 	private bool _isDraggingTitle;
 
@@ -308,16 +212,13 @@ public sealed class WinFormsAppHost : IDisposable
 	internal Rectangle _documentPageBounds;
 
 	private ZoomedBlit? _docZoomBlit;
-	// Layers tool window captured per frame for thumb re-invalidation
-	// on changed doc composites.
+
 	private System.Windows.Forms.Control? _thumbRefreshTarget;
 
 	private Size _documentOriginalSize;
 
 	private bool _isDrawingOnDocument;
 
-	// Bounded per-session diagnostic for the composited document read
-	// (live tool overlays): first 3 attempts log the reflection chain.
 	private static int _compositedDiagCount;
 
 	private System.Windows.Forms.Control? _hoverControl;
@@ -350,25 +251,20 @@ public sealed class WinFormsAppHost : IDisposable
 
 	private static readonly Dictionary<string, ulong> s_layerHash = new Dictionary<string, ulong>();
 
-	// Per-frame dirty state (drained from WasmRepaintGate by Paint, valid
-	// only for the walk; clean bitmap layers re-blit, dirty ones re-raster).
-	private static Dictionary<System.Windows.Forms.Control, System.Drawing.Rectangle?>? s_frameDirty;
-	private static bool s_frameGlobal;
-	private static int s_paintLogCount; // routine [Paint] lines are throttled (first 3 + every 64th).
-	private static int s_layoutLogCount; // same throttling for [LayoutQueue] lines.
-	private static long s_layoutFaultedSeen; // last queue fault total already logged.
-	private static long s_layoutLogTick; // TickCount64 of the last [LayoutQueue] line.
+	private static Dictionary<System.Windows.Forms.Control, Rectangle?>? s_frameDirty;
 
-	// Opt-in per-frame diagnostics (AppContext switch, read live so
-	// runtime toggling works): routine frames must not pay the
-	// reflection walks or console I/O of Dump*/[Paint]/[CHROME].
-	internal static bool PaintDiagnosticsEnabled =>
-		AppContext.TryGetSwitch("WfWasm.PaintDiagnostics", out bool paintDiagEnabled) && paintDiagEnabled;
-	private static readonly Dictionary<string, (int w, int h)> s_layerSize = new Dictionary<string, (int w, int h)>();
-	// Retained self-paint surfaces by layer id: region repaints run the
-	// clipped OnPaint over these, then patch-upload the dirty rect.
-	// Any full RecordBitmap clears the entry (a Def replaces the base
-	// the next patch would splice into); EmitRetain prunes dead ones.
+	private static bool s_frameGlobal;
+
+	private static int s_paintLogCount;
+
+	private static int s_layoutLogCount;
+
+	private static long s_layoutFaultedSeen;
+
+	private static long s_layoutLogTick;
+
+	private static readonly Dictionary<string, (int w, int h)> s_layerSize = new Dictionary<string, (int, int)>();
+
 	private static readonly Dictionary<string, Bitmap> s_retainedPaint = new Dictionary<string, Bitmap>();
 
 	private static readonly object s_docLayerKey = new object();
@@ -413,7 +309,6 @@ public sealed class WinFormsAppHost : IDisposable
 
 	private static readonly MethodInfo? s_itemMouseUpMethod = typeof(System.Windows.Forms.ToolStripItem).GetMethod("OnMouseUp", BindingFlags.Instance | BindingFlags.NonPublic);
 
-
 	private static bool s_pointerReflectionInitialized;
 
 	private static Type? s_point2DoubleType;
@@ -440,14 +335,294 @@ public sealed class WinFormsAppHost : IDisposable
 
 	private static MethodInfo? s_onDocPointerReleasedMethod;
 
-	// Viewport dimensions (single-canvas app): instance properties backed
-	// by statics so static diagnostic/fit paths (deferred BookShelf fit)
-	// read the same settled values the instance paths write.
 	private static int s_viewWidth = 1200;
-	private static int s_viewHeight = 950;
-	public int ViewWidth { get => s_viewWidth; set => s_viewWidth = value; }
 
-	public int ViewHeight { get => s_viewHeight; set => s_viewHeight = value; }
+	private static int s_viewHeight = 950;
+
+	private static Exception? s_lastFirstChance;
+
+	private static bool s_globalFirstChanceHooked;
+
+	private static bool s_erpSeeded;
+
+	private static bool s_bookShelfFitDone;
+
+	private static bool s_threadExHooked;
+
+	private static int s_tileLines;
+
+	private static bool s_tileLateDumpDone;
+
+	private static bool s_tileResizeArmed;
+
+	private static long s_tileRearmTicks;
+
+	private static int s_gridTreeBudget;
+
+	private static int s_gateBudget;
+
+	private static readonly List<object> s_paintHooks = new List<object>();
+
+	private int _lastPopupCount;
+
+	private static readonly HashSet<string> s_vendorDumpDone = new HashSet<string>();
+
+	private const int WM_KEYDOWN = 256;
+
+	private const int WM_KEYUP = 257;
+
+	private const int WM_CHAR = 258;
+
+	private const int WM_SYSKEYDOWN = 260;
+
+	private const int WM_SYSKEYUP = 261;
+
+	private const int WM_SYSCHAR = 262;
+
+	private static readonly Dictionary<string, MethodInfo?> s_mnemonicMethods = new Dictionary<string, MethodInfo>();
+
+	private static readonly Dictionary<string, MethodInfo?> s_commandKeyMethods = new Dictionary<string, MethodInfo>();
+
+	private static readonly ConcurrentDictionary<string, int> s_paintFire = new ConcurrentDictionary<string, int>();
+
+	private static int s_paintSubs;
+
+	private static int s_panoPaintTrace;
+
+	internal Func<long> TickNow { get; set; } = () => Environment.TickCount64;
+
+	internal static bool PaintDiagnosticsEnabled
+	{
+		get
+		{
+			bool isEnabled;
+			return AppContext.TryGetSwitch("WfWasm.PaintDiagnostics", out isEnabled) & isEnabled;
+		}
+	}
+
+	public int ViewWidth
+	{
+		get
+		{
+			return s_viewWidth;
+		}
+		set
+		{
+			s_viewWidth = value;
+		}
+	}
+
+	public int ViewHeight
+	{
+		get
+		{
+			return s_viewHeight;
+		}
+		set
+		{
+			s_viewHeight = value;
+		}
+	}
+
+	internal static bool TypeSelfPaints(Type type)
+	{
+		return s_selfPaints.GetOrAdd(type, (Type type2) =>
+		{
+			MethodInfo method = type2.GetMethod("OnPaint", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+			if ((object)method != null && method.DeclaringType != typeof(System.Windows.Forms.Control))
+			{
+				return true;
+			}
+			MethodInfo method2 = type2.GetMethod("OnPaintBackground", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+			return (object)method2 != null && method2.DeclaringType != typeof(System.Windows.Forms.Control);
+		});
+	}
+
+	internal static bool ButtonPaintsItself(Type type)
+	{
+		Type typeFromHandle = typeof(System.Windows.Forms.Button);
+		if (type == null || type == typeFromHandle || !typeFromHandle.IsAssignableFrom(type))
+		{
+			return false;
+		}
+		MethodInfo method = type.GetMethod("OnPaint", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+		if (method != null && method.DeclaringType != null && method.DeclaringType != typeFromHandle && typeFromHandle.IsAssignableFrom(method.DeclaringType))
+		{
+			return true;
+		}
+		MethodInfo method2 = type.GetMethod("OnPaintBackground", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+		return method2 != null && method2.DeclaringType != null && method2.DeclaringType != typeFromHandle && typeFromHandle.IsAssignableFrom(method2.DeclaringType);
+	}
+
+	private static void LogFirstPaint(System.Windows.Forms.Control c)
+	{
+		try
+		{
+			string text = c.GetType().FullName ?? c.GetType().Name;
+			if (s_firstPaintLogged.TryAdd(text, 1))
+			{
+				Console.WriteLine("[paint] first-painted " + text);
+				if (text.Contains("Panorama", StringComparison.Ordinal))
+				{
+					DumpTileVisualState(c);
+				}
+				if (text.Contains("RadGridView", StringComparison.Ordinal) || text.Contains("RadDiagram", StringComparison.Ordinal))
+				{
+					DumpInkCensus();
+				}
+			}
+			if (!s_tileLateDumpDone && text.Contains("Panorama", StringComparison.Ordinal) && PanoramaHasGroups(c))
+			{
+				s_tileLateDumpDone = true;
+				DumpTileVisualState(c);
+				MaybeEnsureTileRepaint(c);
+				SubscribeTilePaintFire(c);
+				ArmTileRedumpOnResize(c);
+			}
+		}
+		catch
+		{
+		}
+	}
+
+	internal static void TakeSlow(out long ticks, out string? type, out long draws, out long px)
+	{
+		ticks = Interlocked.Exchange(ref s_slowTicks, 0L);
+		type = Interlocked.Exchange(ref s_slowType, null);
+		draws = Interlocked.Exchange(ref s_slowDraws, 0L);
+		px = Interlocked.Exchange(ref s_slowPx, 0L);
+	}
+
+	internal static void HookFirstChance()
+	{
+		if (Interlocked.Exchange(ref s_firstChanceHooked, 1) == 0)
+		{
+			EventHandler<FirstChanceExceptionEventArgs> value = (s_firstChanceHandler = (object? _, FirstChanceExceptionEventArgs _) =>
+			{
+				Interlocked.Increment(ref s_firstChanceCount);
+			});
+			AppDomain.CurrentDomain.FirstChanceException += value;
+		}
+	}
+
+	internal static void UnhookFirstChance()
+	{
+		if (Interlocked.Exchange(ref s_firstChanceHooked, 0) == 0)
+		{
+			return;
+		}
+		try
+		{
+			EventHandler<FirstChanceExceptionEventArgs> eventHandler = Volatile.Read(in s_firstChanceHandler);
+			if (eventHandler != null)
+			{
+				AppDomain.CurrentDomain.FirstChanceException -= eventHandler;
+			}
+		}
+		catch
+		{
+		}
+	}
+
+	internal static long TakeFirstChance()
+	{
+		return Interlocked.Exchange(ref s_firstChanceCount, 0L);
+	}
+
+	internal static int ListViewCapacity(int height)
+	{
+		return Math.Max(1, (height - 24 - 2) / 22);
+	}
+
+	internal static int ListViewClampTop(int top, int count, int capacity)
+	{
+		return Math.Clamp(top, 0, Math.Max(0, count - capacity));
+	}
+
+	internal int ResolveListViewTop(System.Windows.Forms.ListView lv)
+	{
+		int num = ListViewCapacity(lv.Height);
+		int count;
+		try
+		{
+			count = lv.Items.Count;
+		}
+		catch
+		{
+			count = 0;
+		}
+		ListViewScroll orCreateValue = _listViewScroll.GetOrCreateValue(lv);
+		int num2 = ListViewClampTop(orCreateValue.Top, count, num);
+		int num3 = -1;
+		try
+		{
+			IEnumerator enumerator = lv.SelectedIndices.GetEnumerator();
+			try
+			{
+				if (enumerator.MoveNext())
+				{
+					int num4 = (int)enumerator.Current;
+					num3 = num4;
+				}
+			}
+			finally
+			{
+				IDisposable disposable = enumerator as IDisposable;
+				if (disposable != null)
+				{
+					disposable.Dispose();
+				}
+			}
+			if (num3 < 0 && lv.FocusedItem != null)
+			{
+				num3 = lv.FocusedItem.Index;
+			}
+		}
+		catch
+		{
+			num3 = -1;
+		}
+		if (num3 >= 0 && num3 != orCreateValue.Anchor)
+		{
+			if (num3 < num2)
+			{
+				num2 = num3;
+			}
+			if (num3 >= num2 + num)
+			{
+				num2 = num3 - num + 1;
+			}
+			orCreateValue.Anchor = num3;
+		}
+		orCreateValue.Top = num2;
+		return num2;
+	}
+
+	internal bool ScrollListView(System.Windows.Forms.ListView lv, int lines)
+	{
+		int num = ListViewCapacity(lv.Height);
+		int count;
+		try
+		{
+			count = lv.Items.Count;
+		}
+		catch
+		{
+			return false;
+		}
+		if (count <= num || lines == 0)
+		{
+			return false;
+		}
+		ListViewScroll orCreateValue = _listViewScroll.GetOrCreateValue(lv);
+		int num2 = ListViewClampTop(orCreateValue.Top + lines, count, num);
+		if (num2 == orCreateValue.Top)
+		{
+			return false;
+		}
+		orCreateValue.Top = num2;
+		return true;
+	}
 
 	internal void SetDocumentPageBounds(int x, int y, int w, int h)
 	{
@@ -484,39 +659,64 @@ public sealed class WinFormsAppHost : IDisposable
 
 	public void Dispose()
 	{
-		try { _hoverTimer?.Dispose(); } catch { }
+		try
+		{
+			_hoverTimer?.Dispose();
+		}
+		catch
+		{
+		}
 		_hoverTimer = null;
-		// Test + scene lifecycle: an abandoned host leaves its forms
-		// Visible in the process-global WasmDialogHost registry, where
-		// TopTrackedWindowAt prefers them over later hosts' own forms
-		// at the same coords (suite order-contamination: clicks land on
-		// stale forms). Disposing closes the owned forms so the registry
-		// prunes them (Visible/Disposed); never throws.
-		// Paint.NET forms are hidden, not disposed: PDN is a genuine
-		// single-instance app whose MainForm teardown disposes process
-		// statics (color profiles, device contexts) that later scenes
-		// reuse (ObjectDisposedException in doc creation). Hiding still
-		// prunes them from routing (invisible entries drop on snapshot)
-		// while keeping the shared statics alive, matching the browser
-		// (one PDN app per session, never torn down mid-session).
-		foreach (var form in _forms.Values.ToList())
+		foreach (System.Windows.Forms.Form item in _forms.Values.ToList())
 		{
 			try
 			{
-				string? fullName = null;
-				try { fullName = form.GetType().FullName; } catch { }
-				if (fullName != null && fullName.StartsWith("PaintDotNet.", StringComparison.Ordinal))
+				string text = null;
+				try
 				{
-					try { form.Visible = false; } catch { }
-					try { System.Windows.Forms.WasmDialogHost.Untrack(form); } catch { }
+					text = item.GetType().FullName;
+				}
+				catch
+				{
+				}
+				if (text != null && text.StartsWith("PaintDotNet.", StringComparison.Ordinal))
+				{
+					try
+					{
+						item.Visible = false;
+					}
+					catch
+					{
+					}
+					try
+					{
+						WasmDialogHost.Untrack(item);
+					}
+					catch
+					{
+					}
 				}
 				else
 				{
-					try { form.Close(); } catch { }
-					try { form.Dispose(); } catch { }
+					try
+					{
+						item.Close();
+					}
+					catch
+					{
+					}
+					try
+					{
+						item.Dispose();
+					}
+					catch
+					{
+					}
 				}
 			}
-			catch { }
+			catch
+			{
+			}
 		}
 		_forms.Clear();
 		_activeForm = null;
@@ -527,41 +727,46 @@ public sealed class WinFormsAppHost : IDisposable
 	{
 		InitializeAppDomainResolver();
 		ResetProcessInputSingletons();
-		// Viewport statics back the instance properties: a previous
-		// host's dimensions must not leak into a new host (defaults
-		// 1200x950; the browser reports the real size right after).
 		s_viewWidth = 1200;
 		s_viewHeight = 950;
 	}
 
-	// Fresh-host isolation: mouse/capture/dialog state lives in process
-	// singletons (one cursor, one capture, one dialog registry: desktop
-	// parity for a single user). A previous host's leftovers (stale
-	// capture, cursor buttons, abandoned tracked windows) would otherwise
-	// steal the new host's input routing. The browser constructs one host
-	// per session (fresh singletons: no-op); tests construct one per test
-	// (leftovers cleared). Never throws.
 	private static void ResetProcessInputSingletons()
 	{
-		try { System.Windows.Forms.WasmMouseState.Reset(); } catch { }
-		try { System.Windows.Forms.WasmCaptureState.Clear(); } catch { }
-		try { System.Windows.Forms.WasmDialogHost.ResetForNewHost(); } catch { }
+		try
+		{
+			WasmMouseState.Reset();
+		}
+		catch
+		{
+		}
+		try
+		{
+			WasmCaptureState.Clear();
+		}
+		catch
+		{
+		}
+		try
+		{
+			WasmDialogHost.ResetForNewHost();
+		}
+		catch
+		{
+		}
 	}
 
 	private static void InitializeAppDomainResolver()
 	{
-		AppDomain.CurrentDomain.AssemblyResolve += delegate(object? sender, ResolveEventArgs args)
+		AppDomain.CurrentDomain.AssemblyResolve += (object? sender, ResolveEventArgs args) =>
 		{
 			AssemblyName an = new AssemblyName(args.Name);
 			if (an.Name == "System.Windows.Forms" || an.Name == "System.Windows.Forms.Primitives")
 			{
 				return typeof(System.Windows.Forms.Form).Assembly;
 			}
-			if (an.Name == "System.ComponentModel.Primitives")
-			{
-				return typeof(Component).Assembly;
-			}
-			return (an.Name == "System.Drawing.Common" || an.Name == "System.Drawing" || an.Name == "System.Drawing.Primitives") ? typeof(Font).Assembly : AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault((Assembly a) => a.GetName().Name == an.Name);
+			Assembly? result = ((an.Name == "System.ComponentModel.Primitives") ? typeof(Component).Assembly : ((an.Name == "System.Drawing.Common" || an.Name == "System.Drawing" || an.Name == "System.Drawing.Primitives") ? typeof(Font).Assembly : AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault((Assembly a) => a.GetName().Name == an.Name)));
+			return result;
 		};
 		try
 		{
@@ -612,25 +817,63 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 	}
 
-	private static Exception? s_lastFirstChance;
-	private static bool s_globalFirstChanceHooked;
-
 	private static Exception RootCause(Exception ex)
 	{
-		Exception root = ex;
-		while (root.InnerException is not null)
-			root = root.InnerException;
-		return root;
+		Exception ex2 = ex;
+		while (ex2.InnerException != null)
+		{
+			ex2 = ex2.InnerException;
+		}
+		return ex2;
+	}
+
+	private static string StackHead(Exception ex, int maxFrames)
+	{
+		try
+		{
+			string stackTrace = ex.StackTrace;
+			if (string.IsNullOrEmpty(stackTrace))
+			{
+				return "";
+			}
+			StringBuilder stringBuilder = new StringBuilder(" STACK=");
+			int num = 0;
+			string[] array = stackTrace.Split('\n');
+			foreach (string text in array)
+			{
+				if (num >= maxFrames)
+				{
+					break;
+				}
+				string text2 = text.Trim();
+				if (text2.Length != 0)
+				{
+					if (text2.Length > 160)
+					{
+						text2 = text2.Substring(0, 160);
+					}
+					stringBuilder.Append(" <= ").Append(text2);
+					num++;
+				}
+			}
+			return stringBuilder.ToString();
+		}
+		catch
+		{
+			return " STACK=?";
+		}
 	}
 
 	private static string SiteOf(Exception ex)
 	{
 		try
 		{
-			MethodBase? site = ex.TargetSite;
-			if (site?.DeclaringType is null)
+			MethodBase targetSite = ex.TargetSite;
+			if ((object)targetSite?.DeclaringType == null)
+			{
 				return "";
-			return site.DeclaringType.FullName + "." + site.Name;
+			}
+			return targetSite.DeclaringType.FullName + "." + targetSite.Name;
 		}
 		catch
 		{
@@ -640,204 +883,347 @@ public sealed class WinFormsAppHost : IDisposable
 
 	private static string SiteChain(Exception ex)
 	{
-		StringBuilder sb = new();
-		for (Exception? e = ex; e is not null; e = e.InnerException)
+		StringBuilder stringBuilder = new StringBuilder();
+		for (Exception ex2 = ex; ex2 != null; ex2 = ex2.InnerException)
 		{
-			if (sb.Length > 0)
-				sb.Append(" <- ");
-			sb.Append(e.GetType().Name);
-			string site = SiteOf(e);
-			if (site.Length > 0)
-				sb.Append('@').Append(site);
+			if (stringBuilder.Length > 0)
+			{
+				stringBuilder.Append(" <- ");
+			}
+			stringBuilder.Append(ex2.GetType().Name);
+			string text = SiteOf(ex2);
+			if (text.Length > 0)
+			{
+				stringBuilder.Append('@').Append(text);
+			}
 		}
-		return sb.ToString();
+		return stringBuilder.ToString();
 	}
 
 	public static object? FindCaretElement(object? node, int depth)
 	{
 		try
 		{
-			if (node is null || depth > 64)
-				return null;
-			System.Reflection.PropertyInfo? caretProp = node.GetType().GetProperty("Caret");
-			object? caret = null;
-			try { caret = caretProp?.GetValue(node); } catch { }
-			if (caret is not null)
-				return caret;
-			System.Reflection.PropertyInfo? kidsProp = node.GetType().GetProperty("Children");
-			object? kids = null;
-			try { kids = kidsProp?.GetValue(node); } catch { }
-			if (kids is System.Collections.IEnumerable seq)
+			if (node == null || depth > 64)
 			{
-				foreach (object? kid in seq)
+				return null;
+			}
+			PropertyInfo property = node.GetType().GetProperty("Caret");
+			object obj = null;
+			try
+			{
+				obj = property?.GetValue(node);
+			}
+			catch
+			{
+			}
+			if (obj != null)
+			{
+				return obj;
+			}
+			PropertyInfo property2 = node.GetType().GetProperty("Children");
+			object obj3 = null;
+			try
+			{
+				obj3 = property2?.GetValue(node);
+			}
+			catch
+			{
+			}
+			if (obj3 is IEnumerable enumerable)
+			{
+				foreach (object item in enumerable)
 				{
-					object? found = FindCaretElement(kid, depth + 1);
-					if (found is not null)
-						return found;
+					object obj5 = FindCaretElement(item, depth + 1);
+					if (obj5 != null)
+					{
+						return obj5;
+					}
 				}
 			}
 			return null;
 		}
-		catch { return null; }
+		catch
+		{
+			return null;
+		}
 	}
 
-	public static string CaretProbeInfo(object? control, System.Drawing.Rectangle rc)
+	public static string CaretProbeInfo(object? control, Rectangle rc)
 	{
 		try
 		{
-			if (control is null)
+			if (control == null)
+			{
 				return "no-root-element";
-			System.Reflection.PropertyInfo? rootProp = control.GetType().GetProperty("RootElement");
-			if (rootProp is null)
+			}
+			PropertyInfo property = control.GetType().GetProperty("RootElement");
+			if ((object)property == null)
+			{
 				return "no-root-element";
-			object? root = null;
-			try { root = rootProp.GetValue(control); } catch { }
-			if (root is null)
+			}
+			object obj = null;
+			try
+			{
+				obj = property.GetValue(control);
+			}
+			catch
+			{
+			}
+			if (obj == null)
+			{
 				return "no-root-element";
-			object? caret = FindCaretElement(root, 0);
-			if (caret is null)
+			}
+			object obj3 = FindCaretElement(obj, 0);
+			if (obj3 == null)
+			{
 				return "caret-not-found";
-			System.Type ct = caret.GetType();
-			string color = "";
-			string vis = "";
-			System.Drawing.PointF pos = new();
-			float w = 0, h = 0;
-			System.Drawing.Rectangle crect = new();
-			try { color = (string?)ct.GetProperty("Color")?.GetValue(caret) ?? ""; } catch { }
-			try { vis = (string?)ct.GetProperty("Visibility")?.GetValue(caret) ?? ""; } catch { }
-			try { pos = (System.Drawing.PointF)(ct.GetProperty("Position")?.GetValue(caret) ?? new System.Drawing.PointF()); } catch { }
-			try { w = System.Convert.ToSingle(ct.GetProperty("Width")?.GetValue(caret) ?? 0f); } catch { }
-			try { h = System.Convert.ToSingle(ct.GetProperty("Height")?.GetValue(caret) ?? 0f); } catch { }
-			try { crect = (System.Drawing.Rectangle)(ct.GetProperty("ControlBoundingRectangle")?.GetValue(caret) ?? new System.Drawing.Rectangle()); } catch { }
-			var tick = new System.Drawing.Rectangle(crect.X + (int)pos.X - (int)w, crect.Y + (int)pos.Y - (int)h, (int)w, (int)h);
-			string geom = rc.Contains(tick) ? "ok" : "miss";
-			return $"caret={ct.Name} color={color} pos={pos.X:0.0},{pos.Y:0.0} visible={vis} geom={geom}";
+			}
+			Type type = obj3.GetType();
+			string value = "";
+			string value2 = "";
+			PointF pointF = default;
+			float num = 0f;
+			float num2 = 0f;
+			Rectangle rectangle = default;
+			try
+			{
+				value = ((string)type.GetProperty("Color")?.GetValue(obj3)) ?? "";
+			}
+			catch
+			{
+			}
+			try
+			{
+				value2 = ((string)type.GetProperty("Visibility")?.GetValue(obj3)) ?? "";
+			}
+			catch
+			{
+			}
+			try
+			{
+				pointF = (PointF)(type.GetProperty("Position")?.GetValue(obj3) ?? ((object)default(PointF)));
+			}
+			catch
+			{
+			}
+			try
+			{
+				num = Convert.ToSingle(type.GetProperty("Width")?.GetValue(obj3) ?? ((object)0f));
+			}
+			catch
+			{
+			}
+			try
+			{
+				num2 = Convert.ToSingle(type.GetProperty("Height")?.GetValue(obj3) ?? ((object)0f));
+			}
+			catch
+			{
+			}
+			try
+			{
+				rectangle = (Rectangle)(type.GetProperty("ControlBoundingRectangle")?.GetValue(obj3) ?? ((object)default(Rectangle)));
+			}
+			catch
+			{
+			}
+			Rectangle rect = new Rectangle(rectangle.X + (int)pointF.X - (int)num, rectangle.Y + (int)pointF.Y - (int)num2, (int)num, (int)num2);
+			string value3 = (rc.Contains(rect) ? "ok" : "miss");
+			return $"caret={type.Name} color={value} pos={pointF.X:0.0},{pointF.Y:0.0} visible={value2} geom={value3}";
 		}
-		catch { return "probe-error"; }
+		catch
+		{
+			return "probe-error";
+		}
 	}
 
 	private static System.Windows.Forms.Form? CreateAppForm(string typeName, string assemblyName)
 	{
 		try
 		{
-			Type? type = Type.GetType(typeName + ", " + assemblyName);
-			type ??= AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault((Assembly a) => string.Equals(a.GetName().Name, assemblyName, StringComparison.OrdinalIgnoreCase))?.GetType(typeName);
+			Type type = Type.GetType(typeName + ", " + assemblyName);
+			if ((object)type == null)
+			{
+				type = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault((Assembly a) => string.Equals(a.GetName().Name, assemblyName, StringComparison.OrdinalIgnoreCase))?.GetType(typeName);
+			}
 			if (type == null)
 			{
-				Console.WriteLine($"[WinFormsAppHost] Form type not found: {typeName} in {assemblyName}");
+				Console.WriteLine("[WinFormsAppHost] Form type not found: " + typeName + " in " + assemblyName);
 				type = FindSingleStartupForm(assemblyName, out string available);
-				if (type is null)
+				if ((object)type == null)
 				{
 					BrowserErrorReporter.Report("form-create", new TypeLoadException($"Form type not found: {typeName} in {assemblyName}. Available: {available}"));
 					return null;
 				}
 				Console.WriteLine($"[WinFormsAppHost] Form fallback engaged: {type.FullName} (requested {typeName})");
 			}
-			try { Console.WriteLine("[APP-LIFE] create " + type.FullName); } catch { }
-			Exception? firstChance = null;
-		void FirstChanceHandler(object? sender, FirstChanceExceptionEventArgs args)
-		{
 			try
 			{
-				Exception? e = args.Exception;
-				if (e is not null)
-				{
-					string msg = "";
-					try { msg = (e.Message ?? "").Split('\n')[0]; } catch { }
-					try { Console.WriteLine("[CTOR-1ST] " + e.GetType().Name + ": " + msg); } catch { }
-				}
+				Console.WriteLine("[APP-LIFE] create " + type.FullName);
 			}
-			catch { }
-			try { firstChance ??= args.Exception; } catch { }
-		}
-		AppDomain.CurrentDomain.FirstChanceException += FirstChanceHandler;
-		System.Windows.Forms.Form? created = null;
-		try
-		{
-			created = (System.Windows.Forms.Form)Activator.CreateInstance(type);
-				try { Console.WriteLine("[APP-LIFE] constructed " + type.FullName); } catch { }
-				System.Exception? guarded = null;
-				try { guarded = System.Windows.Forms.WasmCtorGuard.TakeStashed(); } catch { }
-				if (guarded is not null)
+			catch
+			{
+			}
+			Exception firstChance = null;
+			List<Exception> ctorFirsts = new List<Exception>(4);
+			AppDomain.CurrentDomain.FirstChanceException += FirstChanceHandler;
+			System.Windows.Forms.Form form = null;
+			try
+			{
+				form = (System.Windows.Forms.Form)Activator.CreateInstance(type);
+				try
 				{
-					try { Console.WriteLine("[WinFormsAppHost] ctor-guard stashed " + type.FullName + ": " + guarded.GetType().Name + ": " + (guarded.Message ?? "").Split('\n')[0]); } catch { }
-					try { BrowserErrorReporter.Report("form-create", guarded); } catch { }
-					try { created?.Dispose(); } catch { }
+					Console.WriteLine("[APP-LIFE] constructed " + type.FullName);
+				}
+				catch
+				{
+				}
+				try
+				{
+					foreach (Exception item in ctorFirsts)
+					{
+						Console.WriteLine("[CTOR-FIRST] " + type.FullName + ": " + item.GetType().Name + ": " + (item.Message ?? "").Split('\n')[0] + StackHead(item, 8));
+					}
+				}
+				catch
+				{
+				}
+				Exception ex = null;
+				try
+				{
+					ex = WasmCtorGuard.TakeStashed();
+				}
+				catch
+				{
+				}
+				if (ex != null)
+				{
+					try
+					{
+						Console.WriteLine("[WinFormsAppHost] ctor-guard stashed " + type.FullName + ": " + ex.GetType().Name + ": " + (ex.Message ?? "").Split('\n')[0]);
+					}
+					catch
+					{
+					}
+					try
+					{
+						BrowserErrorReporter.Report("form-create", ex);
+					}
+					catch
+					{
+					}
+					try
+					{
+						form?.Dispose();
+					}
+					catch
+					{
+					}
 					return null;
 				}
-				return created;
+				return form;
+			}
+			finally
+			{
+				AppDomain.CurrentDomain.FirstChanceException -= FirstChanceHandler;
+				if (firstChance != null)
+				{
+					s_lastFirstChance = firstChance;
+				}
+			}
+			void FirstChanceHandler(object? sender, FirstChanceExceptionEventArgs args)
+			{
+				try
+				{
+					Exception exception = args.Exception;
+					if (exception != null)
+					{
+						string text = "";
+						try
+						{
+							text = (exception.Message ?? "").Split('\n')[0];
+						}
+						catch
+						{
+						}
+						try
+						{
+							Console.WriteLine("[CTOR-1ST] " + exception.GetType().Name + ": " + text);
+						}
+						catch
+						{
+						}
+					}
+				}
+				catch
+				{
+				}
+				try
+				{
+					if (firstChance == null)
+					{
+						firstChance = args.Exception;
+					}
+					if (ctorFirsts.Count < 4 && args.Exception != null)
+					{
+						ctorFirsts.Add(args.Exception);
+					}
+				}
+				catch
+				{
+				}
+			}
 		}
-		finally
+		catch (Exception ex2)
 		{
-			AppDomain.CurrentDomain.FirstChanceException -= FirstChanceHandler;
-			if (firstChance is not null)
-				s_lastFirstChance = firstChance;
-		}
-		}
-		catch (Exception ex)
-		{
-			// Print + report BEFORE any TargetSite touch: resolving
-			// hostile (COM-interop/cctor) frames aborts the browser
-			// runtime uncatchably (func96 OOB trap).
-			Console.WriteLine($"[WinFormsAppHost] Error creating {typeName}: {ex.GetType().Name}: {ex.Message.Split('\n')[0]}");
-			BrowserErrorReporter.Report("form-create", ex);
-			if (s_lastFirstChance is not null && !ReferenceEquals(s_lastFirstChance, RootCause(ex)))
+			Console.WriteLine($"[WinFormsAppHost] Error creating {typeName}: {ex2.GetType().Name}: {ex2.Message.Split('\n')[0]}");
+			BrowserErrorReporter.Report("form-create", ex2);
+			if (s_lastFirstChance != null && s_lastFirstChance != RootCause(ex2))
+			{
 				Console.WriteLine($"[WinFormsAppHost] First-chance during create: {s_lastFirstChance.GetType().Name} site={SiteOf(s_lastFirstChance)} msg={(s_lastFirstChance.Message ?? "").Split('\n')[0]}");
+			}
 			s_lastFirstChance = null;
-			try { System.Windows.Forms.WasmCtorGuard.TakeStashed(); } catch { }
-			Console.WriteLine($"[WinFormsAppHost] Error creating {typeName}: site={SiteChain(ex)}");
+			try
+			{
+				WasmCtorGuard.TakeStashed();
+			}
+			catch
+			{
+			}
+			Console.WriteLine("[WinFormsAppHost] Error creating " + typeName + ": site=" + SiteChain(ex2));
 			return null;
 		}
 	}
 
-	private static bool s_erpSeeded;
-
 	private static void EnsureErpDataInitialized()
 	{
-		// Desktop Program.Main seeds MainRepository.InitializeData() before
-		// Application.Run; the browser never invokes Main (forms are
-		// constructed directly), so the 14 JSON caches stay null and every
-		// grid ctor dies at Enumerable.Count. Invoke the same public static
-		// seed Main calls (content is already restored: LoadSelectionAsync
-		// awaits EnsureAppAsync before SelectScene creates the form).
-		// The once-guard sets only on success so a failed attempt retries
-		// on the next scene entry.
 		if (s_erpSeeded)
+		{
 			return;
+		}
 		try
 		{
-			Assembly asm = AppDomain.CurrentDomain.GetAssemblies()
-				.FirstOrDefault(a => string.Equals(a.GetName().Name, "ERP.Repository", StringComparison.OrdinalIgnoreCase))
-				?? Assembly.Load("ERP.Repository");
-			asm.GetType("ERP.Repository.MainRepository")
-				?.GetMethod("InitializeData", BindingFlags.Static | BindingFlags.Public)
-				?.Invoke(null, null);
+			Assembly assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault((Assembly a) => string.Equals(a.GetName().Name, "ERP.Repository", StringComparison.OrdinalIgnoreCase)) ?? Assembly.Load("ERP.Repository");
+			assembly.GetType("ERP.Repository.MainRepository")?.GetMethod("InitializeData", BindingFlags.Static | BindingFlags.Public)?.Invoke(null, null);
 			s_erpSeeded = true;
 			Console.WriteLine("[WinFormsAppHost] ERP InitializeData invoked.");
 		}
 		catch (Exception ex)
 		{
-			Console.WriteLine($"[WinFormsAppHost] ERP InitializeData FAILED: {ex.GetType().Name}: {ex.Message.Split('\n')[0]}");
+			Console.WriteLine("[WinFormsAppHost] ERP InitializeData FAILED: " + ex.GetType().Name + ": " + ex.Message.Split('\n')[0]);
 		}
 	}
 
-	/// <summary>
-	/// Raises <see cref="Form.Load"/> exactly once per form.
-	/// The fork guards its native OnLoad paths with the private CalledOnLoad
-	/// flag, but the explicit host invoke below used to bypass it: every form
-	/// whose native show path fired Load got a second Load here (duplicate
-	/// DataBindings -&gt; TargetInvocationException, e.g.
-	/// syncfusion-grid-grouping). Skip when native already fired; set the
-	/// guard after a manual fire so a later native path also skips.
-	/// </summary>
 	public static void EnsureOnLoadOnce(System.Windows.Forms.Form form)
 	{
-		System.Type formType = typeof(System.Windows.Forms.Form);
-		System.Reflection.PropertyInfo? guard = formType.GetProperty("CalledOnLoad", BindingFlags.Instance | BindingFlags.NonPublic);
-		if ((bool?)guard?.GetValue(form) == true)
-			return;
-		formType.GetMethod("OnLoad", BindingFlags.Instance | BindingFlags.NonPublic)?.Invoke(form, new object[1] { EventArgs.Empty });
-		guard?.SetValue(form, true);
+		Type typeFromHandle = typeof(System.Windows.Forms.Form);
+		PropertyInfo property = typeFromHandle.GetProperty("CalledOnLoad", BindingFlags.Instance | BindingFlags.NonPublic);
+		if ((bool?)property?.GetValue(form) != true)
+		{
+			typeFromHandle.GetMethod("OnLoad", BindingFlags.Instance | BindingFlags.NonPublic)?.Invoke(form, new object[1] { EventArgs.Empty });
+			property?.SetValue(form, true);
+		}
 	}
 
 	public System.Windows.Forms.Form? GetOrCreateForm(AppScene scene)
@@ -932,6 +1318,7 @@ public sealed class WinFormsAppHost : IDisposable
 				break;
 			case AppScene.TelerikRichTextEditor:
 				form = CreateAppForm("RichTextEditor.FirstLook.Form1", "RichTextEditor");
+				s_rteScrollWatch.Ensure(form);
 				break;
 			case AppScene.TelerikRssReader:
 				form = CreateAppForm("RssReader.RadForm1", "RssReader");
@@ -943,10 +1330,22 @@ public sealed class WinFormsAppHost : IDisposable
 				form = CreateAppForm("ToastNotificationManagerExamples.FirstLook.Form1", "ToastNotificationManagerExamples");
 				break;
 			}
-			if (form is null && DesktopBenchmarks.Find(scene) is { } benchmark)
-				form = DesktopBenchmarkForms.Create(benchmark);
-			if (form is null && SyncfusionDemos.Find(scene) is { } sfdemo)
-				form = CreateAppForm(sfdemo.FormType, sfdemo.Assembly);
+			if (form == null)
+			{
+				DesktopBenchmarks.Benchmark benchmark = DesktopBenchmarks.Find(scene);
+				if ((object)benchmark != null)
+				{
+					form = DesktopBenchmarkForms.Create(benchmark);
+				}
+			}
+			if (form == null)
+			{
+				SyncfusionDemos.Demo demo = SyncfusionDemos.Find(scene);
+				if ((object)demo != null)
+				{
+					form = CreateAppForm(demo.FormType, demo.Assembly);
+				}
+			}
 			if (form != null)
 			{
 				form.Visible = true;
@@ -998,51 +1397,47 @@ public sealed class WinFormsAppHost : IDisposable
 		{
 			Console.WriteLine($"[WinFormsAppHost] Error creating form for {scene}: {ex2.GetType().Name}: {ex2.Message.Split('\n')[0]} site={SiteOf(ex2)}");
 			Console.WriteLine($"[WinFormsAppHost] Error creating form for {scene}: root={RootCause(ex2).GetType().Name} site={SiteOf(RootCause(ex2))} msg={(RootCause(ex2).Message ?? "").Split('\n')[0]}");
-			try { Console.WriteLine("[diagstack] " + string.Join(" <- ", new System.Diagnostics.StackTrace(RootCause(ex2), false).GetFrames().Take(12).Select(f => f.GetMethod()))); } catch { }
+			try
+			{
+				Console.WriteLine("[diagstack] " + string.Join(" <- ", from f in new StackTrace(RootCause(ex2), fNeedFileInfo: false).GetFrames().Take(12)
+					select f.GetMethod()));
+			}
+			catch
+			{
+			}
 			BrowserErrorReporter.Report("form-create", ex2);
 		}
 		return form;
 	}
-	/// <summary>
-	/// Fallback when the configured form type name is wrong: if the app assembly
-	/// contains exactly one concrete Form subclass with a public parameterless
-	/// constructor, return it; otherwise null. 'available' lists candidate names
-	/// for the error report so a human can fix the mapping.
-	/// </summary>
+
 	private static Type? FindSingleStartupForm(string assemblyName, out string available)
 	{
 		available = "";
 		try
 		{
-			System.Reflection.Assembly? asm = AppDomain.CurrentDomain.GetAssemblies()
-				.FirstOrDefault(a => string.Equals(a.GetName().Name, assemblyName, StringComparison.OrdinalIgnoreCase));
-			if (asm is null)
+			Assembly assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault((Assembly a) => string.Equals(a.GetName().Name, assemblyName, StringComparison.OrdinalIgnoreCase));
+			if ((object)assembly == null)
 			{
 				return null;
 			}
-			Type[] forms;
+			Type[] source;
 			try
 			{
-				forms = asm.GetTypes();
+				source = assembly.GetTypes();
 			}
-			catch (System.Reflection.ReflectionTypeLoadException rtle)
+			catch (ReflectionTypeLoadException ex)
 			{
-				forms = rtle.Types.Where(tt => tt is not null).ToArray()!;
+				source = ex.Types.Where((Type tt) => (object)tt != null).ToArray();
 			}
-			var candidates = forms
-				.Where(tt => tt is not null && tt.IsClass && !tt.IsAbstract
-					&& typeof(System.Windows.Forms.Form).IsAssignableFrom(tt)
-					&& tt.GetConstructor(Type.EmptyTypes) is not null)
-				.ToArray();
-			available = string.Join(",", candidates.Select(tt => tt!.FullName));
-			return candidates.Length == 1 ? candidates[0] : null;
+			Type[] array = source.Where((Type tt) => (object)tt != null && tt.IsClass && !tt.IsAbstract && typeof(System.Windows.Forms.Form).IsAssignableFrom(tt) && (object)tt.GetConstructor(Type.EmptyTypes) != null).ToArray();
+			available = string.Join(",", array.Select((Type tt) => tt.FullName));
+			return (array.Length == 1) ? array[0] : null;
 		}
 		catch
 		{
 			return null;
 		}
 	}
-
 
 	private static System.Windows.Forms.Form CreateSmokeForm()
 	{
@@ -1096,18 +1491,9 @@ public sealed class WinFormsAppHost : IDisposable
 			return;
 		}
 		s_pdnInitialized = true;
-		try
-		{
-			ConcurrentDictionary<int, string> concurrentDictionary = new ConcurrentDictionary<int, string>(20, 0);
-			string orAdd = concurrentDictionary.GetOrAdd(1, (int _) => "x");
-			Console.WriteLine("[DICTNULL] nonnull-factory ok=" + orAdd);
-			string orAdd2 = concurrentDictionary.GetOrAdd(2, (int _) => (string)null);
-			Console.WriteLine("[DICTNULL] null-factory returned " + ((orAdd2 == null) ? "null" : orAdd2));
-		}
-		catch (Exception ex)
-		{
-			Console.WriteLine("[DICTNULL] threw " + ex.GetType().Name + ": " + ex.Message.Split('\n')[0]);
-		}
+		// (DICTNULL probe removed WF-R-070: leftover first-chance-noise
+		// diagnostic; GetOrAdd-with-null-factory throws NRE on some runtimes
+		// and its frames pollute crash attribution.)
 		try
 		{
 			Directory.CreateDirectory("C:\\PaintDotNet\\Wasm\\FileTypes");
@@ -1151,50 +1537,39 @@ public sealed class WinFormsAppHost : IDisposable
 		{
 			if (!OperatingSystem.IsBrowser())
 			{
-				// Testhost-only: Microsoft.NETCore.App ships a WindowsBase facade
-				// without DependencyObject. If it loads first, PDN type-init dies
-				// with TypeLoadException and wedges the init lock (PaintSceneTests
-				// hang). Pre-load the full app-local copy so every later
-				// WindowsBase resolution binds to it (first-loaded wins).
 				try
 				{
-					string wbPreloadPath = System.IO.Path.Combine(System.AppContext.BaseDirectory, "WindowsBase.dll");
-					if (System.IO.File.Exists(wbPreloadPath))
+					string text = Path.Combine(AppContext.BaseDirectory, "WindowsBase.dll");
+					if (File.Exists(text))
 					{
-						System.Runtime.Loader.AssemblyLoadContext.Default.LoadFromAssemblyPath(wbPreloadPath);
+						AssemblyLoadContext.Default.LoadFromAssemblyPath(text);
 						Console.WriteLine("[PaintDotNet] Full WindowsBase pre-loaded.");
 					}
 				}
-				catch (Exception exWbPreload)
+				catch (Exception ex2)
 				{
-					Console.WriteLine("[PaintDotNet] WindowsBase pre-load skipped: " + exWbPreload.GetType().Name);
+					Console.WriteLine("[PaintDotNet] WindowsBase pre-load skipped: " + ex2.GetType().Name);
 				}
 			}
-			// (UI culture pin hoisted to SelectScene: all scenes, not just Paint.)
 			PreseedWpfSystemParameters();
-			AppDomain.CurrentDomain.FirstChanceException += delegate(object? s, FirstChanceExceptionEventArgs e)
+			AppDomain.CurrentDomain.FirstChanceException += (object? s, FirstChanceExceptionEventArgs e) =>
 			{
 				if (!(e.Exception is MissingManifestResourceException))
 				{
-					StackFrame[] frames = new StackTrace(2, fNeedFileInfo: false).GetFrames();
 					try
 					{
-						string stackTrace = e.Exception.StackTrace;
-						Console.WriteLine("[1ST-EST] " + ((stackTrace == null) ? "null" : stackTrace.Substring(0, Math.Min(600, stackTrace.Length))).Replace('\r', ' ').Replace('\n', ' '));
+						StackFrame[]? frames = null;
+						try { frames = new StackTrace(0, fNeedFileInfo: false).GetFrames(); } catch { }
+						var (lines, topFrame) = FormatFirstChance(e.Exception, frames);
+						foreach (string line in lines)
+						{
+							Console.WriteLine(line);
+						}
+						BrowserErrorReporter.Report("first-chance", e.Exception, topFrame);
 					}
 					catch
 					{
 					}
-					string value3 = ((frames == null) ? "" : string.Join(" <- ", from f in frames.Take(8)
-						select f.GetMethod()?.DeclaringType?.Name + "." + f.GetMethod()?.Name));
-					string text = $"[1ST] {e.Exception.GetType().Name}: {e.Exception.Message.Split('\n')[0]} :: {value3}";
-					for (int num = 0; num * 400 < text.Length; num++)
-					{
-						Console.WriteLine($"[1ST-{num}] " + text.Substring(num * 400, Math.Min(400, text.Length - num * 400)));
-					}
-					MethodBase methodBase = ((frames == null || frames.Length == 0) ? null : frames[0].GetMethod());
-					string topFrame = ((methodBase == null) ? null : (methodBase.DeclaringType?.Name + "." + methodBase.Name));
-					BrowserErrorReporter.Report("first-chance", e.Exception, topFrame);
 				}
 			};
 			if (SynchronizationContext.Current == null)
@@ -1219,9 +1594,9 @@ public sealed class WinFormsAppHost : IDisposable
 			{
 				type3?.GetMethod("Initialize", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)?.Invoke(null, null);
 			}
-			catch (Exception ex2)
+			catch (Exception ex3)
 			{
-				Console.WriteLine("[PaintDotNet] AnimationService init skipped: " + ex2.GetType().Name);
+				Console.WriteLine("[PaintDotNet] AnimationService init skipped: " + ex3.GetType().Name);
 			}
 			Type type4 = assembly3.GetType("PaintDotNet.Settings.MemoryStorageHandler");
 			if (type4 != null)
@@ -1247,6 +1622,41 @@ public sealed class WinFormsAppHost : IDisposable
 		{
 			Console.WriteLine($"[PaintDotNet] Bootstrap exception: {value2}");
 		}
+	}
+
+	// WF-R-NRE-0730 lane A: pure first-chance formatter, extracted from the
+	// EnsurePaintDotNetInitialized probe so it is unit-testable and can
+	// never throw. The format matches the historical console lines exactly
+	// ([1ST-EST] stack-text estimate, [1ST-N] 400-char chunks, top frame).
+	// Guards added over the inline version: null Message (previously the
+	// formatter itself threw NRE here, filing handler noise and masking
+	// the real report), null frames, and null frame elements.
+	public static (string[] ConsoleLines, string? TopFrame) FormatFirstChance(Exception exception, StackFrame[]? frames)
+	{
+		var lines = new List<string>();
+		string? topFrame = null;
+		try
+		{
+			ArgumentNullException.ThrowIfNull(exception);
+			string? stackTrace = null;
+			try { stackTrace = exception.StackTrace; } catch { }
+			lines.Add("[1ST-EST] " + (((stackTrace == null) ? "null" : stackTrace.Substring(0, Math.Min(600, stackTrace.Length))).Replace('\r', ' ').Replace('\n', ' ')));
+			string value = ((frames == null) ? "" : string.Join(" <- ", frames.Take(12).Where(f => f is not null).Select(f => f.GetMethod()?.DeclaringType?.Name + "." + f.GetMethod()?.Name)));
+			string message = exception.Message ?? "";
+			int nl = message.IndexOf('\n');
+			string firstLine = ((nl < 0) ? message : message.Substring(0, nl));
+			string text = $"[1ST] {exception.GetType().Name}: {firstLine} :: {value}";
+			for (int num = 0; num * 400 < text.Length; num++)
+			{
+				lines.Add($"[1ST-{num}] " + text.Substring(num * 400, Math.Min(400, text.Length - num * 400)));
+			}
+			MethodBase? methodBase = ((frames == null || frames.Length == 0) ? null : frames[0]?.GetMethod());
+			topFrame = ((methodBase == null) ? null : (methodBase.DeclaringType?.Name + "." + methodBase.Name));
+		}
+		catch
+		{
+		}
+		return (lines.ToArray(), topFrame);
 	}
 
 	private static System.Windows.Forms.Form CreatePaintForm()
@@ -1383,7 +1793,7 @@ public sealed class WinFormsAppHost : IDisposable
 					typeof(int)
 				});
 				object obj5 = null;
-				obj5 = ((!(methodInfo != null) || methodInfo.GetParameters().Length != 3) ? methodInfo?.Invoke(null, new object[2] { num, num2 }) : methodInfo.Invoke(null, new object[3] { num, num2, "Background" }));
+				obj5 = ((methodInfo != null && methodInfo.GetParameters().Length == 3) ? methodInfo.Invoke(null, new object[3] { num, num2, "Background" }) : methodInfo?.Invoke(null, new object[2] { num, num2 }));
 				Console.WriteLine($"[PaintDotNet] BackgroundLayer created: {obj5 != null}");
 				object obj6 = type3.GetProperty("Layers", BindingFlags.Instance | BindingFlags.Public)?.GetValue(obj4);
 				(obj6?.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public).FirstOrDefault((MethodInfo m) => m.Name == "Add" && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType.IsAssignableFrom(layerType)))?.Invoke(obj6, new object[1] { obj5 });
@@ -1445,7 +1855,8 @@ public sealed class WinFormsAppHost : IDisposable
 			}
 			object obj2 = Activator.CreateInstance(type);
 			FieldInfo[] fields = type.GetFields(BindingFlags.Instance | BindingFlags.Public);
-			foreach (FieldInfo fieldInfo in fields)
+			FieldInfo[] array = fields;
+			foreach (FieldInfo fieldInfo in array)
 			{
 				if (fieldInfo.FieldType == logFontType)
 				{
@@ -1492,26 +1903,30 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 	}
 
-	private static bool s_bookShelfFitDone;
 	private static bool IsBookShelfForm(System.Windows.Forms.Form? form)
 	{
-		try { return form?.GetType().FullName?.Contains("BookShelf", System.StringComparison.Ordinal) == true; }
-		catch { return false; }
+		try
+		{
+			return form != null && form.GetType().FullName?.Contains("BookShelf", StringComparison.Ordinal) == true;
+		}
+		catch
+		{
+			return false;
+		}
 	}
 
-	// Maximized-start: a form whose app code requests Maximized (e.g. DockSample
-	// sets it in InitializeComponent) fills the viewport client area instead of
-	// sitting at design size; the fork stores the state but has no window manager
-	// to act on it. Returns true when applied (caller then skips centering).
 	private bool ApplyMaximizedPlacement(System.Windows.Forms.Form form)
 	{
 		try
 		{
-			if (form.IsDisposed) return false;
-			if (form.WindowState != System.Windows.Forms.FormWindowState.Maximized) return false;
-			// Size sets while Maximized are diverted to restore-bounds storage
-			// headless (no window manager ever applies them), so the design size
-			// would stick: drop to Normal, assign, re-assert Maximized.
+			if (form.IsDisposed)
+			{
+				return false;
+			}
+			if (form.WindowState != System.Windows.Forms.FormWindowState.Maximized)
+			{
+				return false;
+			}
 			form.WindowState = System.Windows.Forms.FormWindowState.Normal;
 			form.Location = new Point(0, 0);
 			form.Width = ViewWidth;
@@ -1521,43 +1936,46 @@ public sealed class WinFormsAppHost : IDisposable
 			Console.WriteLine($"[Host] maximized {form.GetType().Name} to {form.Width}x{form.Height} (view {ViewWidth}x{ViewHeight})");
 			return true;
 		}
-		catch { return false; }
+		catch
+		{
+			return false;
+		}
 	}
 
 	private static void CenterInViewport(System.Windows.Forms.Form form)
 	{
-		// Fit every scene (generalizes the Paint-only clamp): shrink
-		// oversized forms so the bottom never clips off-viewport.
-		// BookShelf deferral: its MainForm_SizeChanged centers groups from
-		// live content sizes, so a fit before the books arrive locks in a
-		// padding computed from 0-height content (tiles below the fold).
-		// Positioning always runs; the shrink waits for the deferred fit
-		// once groups exist (MaybeEnsureTileRepaint).
-		bool fit = !(IsBookShelfForm(form) && !s_bookShelfFitDone);
-		if (fit)
+		if (!IsBookShelfForm(form) || s_bookShelfFitDone)
 		{
-			int maxW = Math.Max(200, s_viewWidth - 20);
-			int maxH = Math.Max(150, s_viewHeight - 40 - ChromeHeight(form));
-			bool resized = false;
-			if (form.Width > maxW) { form.Width = maxW; resized = true; }
-			if (form.Height > maxH) { form.Height = maxH; resized = true; }
-			if (resized)
+			int num = Math.Max(200, s_viewWidth - 20);
+			int num2 = Math.Max(150, s_viewHeight - 40 - ChromeHeight(form));
+			bool flag = false;
+			if (form.Width > num)
+			{
+				form.Width = num;
+				flag = true;
+			}
+			if (form.Height > num2)
+			{
+				form.Height = num2;
+				flag = true;
+			}
+			if (flag)
 			{
 				form.PerformLayout();
 			}
 		}
-		int num = Math.Max(form.Width, form.ClientSize.Width);
-		int num2 = Math.Max(form.Height, form.ClientSize.Height);
-		int num3 = Math.Max(300, (num > 0) ? num : 600);
-		int num4 = Math.Max(200, (num2 > 0) ? num2 : 450);
-		int x = Math.Max(10, (s_viewWidth - num3) / 2);
-		int y = Math.Max(10, (s_viewHeight - num4) / 2);
+		int num3 = Math.Max(form.Width, form.ClientSize.Width);
+		int num4 = Math.Max(form.Height, form.ClientSize.Height);
+		int num5 = Math.Max(300, (num3 > 0) ? num3 : 600);
+		int num6 = Math.Max(200, (num4 > 0) ? num4 : 450);
+		int x = Math.Max(10, (s_viewWidth - num5) / 2);
+		int y = Math.Max(10, (s_viewHeight - num6) / 2);
 		form.Location = new Point(x, y);
 	}
 
 	public void OnViewportChanged()
 	{
-		System.Windows.Forms.WasmRepaintGate.MarkGlobalDirty();
+		WasmRepaintGate.MarkGlobalDirty();
 		foreach (var (appScene2, form2) in _forms)
 		{
 			if (appScene2 == AppScene.Paint)
@@ -1584,33 +2002,19 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 	}
 
-	private static bool s_threadExHooked;
-
-	// Thread-pump failures surface as a stock ThreadExceptionDialog with
-	// no console record (first-chance may be capped or pre-hook): log the
-	// type + first message line so every dialog self-attributes. Never
-	// touches StackTrace/TargetSite (hostile frames abort the runtime).
-	// Dynamic by necessity: ThreadExceptionEventArgs exists in both BCL
-	// and the shim (CS0433 either way), so neither the handler signature
-	// nor the member read can name it; the subscriber infers the event.
-	// Side effect is the point: upstream shows the stock crash dialog
-	// only when nobody subscribes; a subscriber replaces the modal (whose
-	// Quit button would Environment.Exit the runtime) with this log line.
 	internal static void LogThreadExceptionArgs(object? args)
 	{
 		try
 		{
-			Exception? ex = null;
+			Exception ex = null;
 			try
 			{
-				dynamic d = args!;
-				ex = d.Exception as Exception;
+				ex = ((dynamic)args).Exception as Exception;
 			}
 			catch
 			{
 			}
-
-			Console.WriteLine($"[THREAD-EX] {(ex?.GetType().FullName ?? "?")}: {((ex?.Message ?? "").Split('\n')[0])}");
+			Console.WriteLine("[THREAD-EX] " + (ex?.GetType().FullName ?? "?") + ": " + (ex?.Message ?? "").Split('\n')[0]);
 		}
 		catch
 		{
@@ -1619,21 +2023,24 @@ public sealed class WinFormsAppHost : IDisposable
 
 	public bool HasScene(AppScene scene)
 	{
-		try { return _forms.TryGetValue(scene, out System.Windows.Forms.Form? f) && f is not null && !f.IsDisposed; }
-		catch { return false; }
+		try
+		{
+			System.Windows.Forms.Form value;
+			return _forms.TryGetValue(scene, out value) && value != null && !value.IsDisposed;
+		}
+		catch
+		{
+			return false;
+		}
 	}
 
 	public void SelectScene(AppScene scene)
 	{
-		System.Threading.Interlocked.Increment(ref System.Windows.Forms.WasmFrameCounters.SceneEpoch); // Perf item 4 (W-4)
-		System.Windows.Forms.WasmRepaintGate.MarkGlobalDirty();
-		// Once-per-process UI culture pin, hoisted from the Paint-only
-		// init path: satellite-assembly probes (FileNotFound first-chance
-		// on every ResourceManager fallback) are pure noise in the
-		// browser, where only invariant resources ship. Idempotent.
+		Interlocked.Increment(ref WasmFrameCounters.SceneEpoch);
+		WasmRepaintGate.MarkGlobalDirty();
 		try
 		{
-			System.Globalization.CultureInfo.DefaultThreadCurrentUICulture = System.Globalization.CultureInfo.InvariantCulture;
+			CultureInfo.DefaultThreadCurrentUICulture = CultureInfo.InvariantCulture;
 		}
 		catch
 		{
@@ -1662,10 +2069,6 @@ public sealed class WinFormsAppHost : IDisposable
 		_focusedControl = null;
 		_pressedButton = null;
 		_mouseTarget = null;
-		// FIX3/G6: hover/drag entries must not survive the scene switch -
-		// their forms are disposed above, and a later move would raise
-		// enter/leave/drag on dead controls. Nulled directly (no
-		// SetHoverControl: leaving a dying form must not raise).
 		_hoverControl = null;
 		_hoverItem = null;
 		_dragForm = null;
@@ -1676,29 +2079,28 @@ public sealed class WinFormsAppHost : IDisposable
 		_hoverX = int.MinValue;
 		_hoverY = int.MinValue;
 		_hoverFired = false;
-		_wheelRemainder = 0;
+		_wheelRemainder = 0.0;
 		if (!s_threadExHooked)
 		{
 			s_threadExHooked = true;
-			System.Windows.Forms.Application.ThreadException += (_, args) => LogThreadExceptionArgs(args);
+			System.Windows.Forms.Application.ThreadException += (_, args) =>
+			{
+				LogThreadExceptionArgs(args);
+			};
 		}
 		if (!s_globalFirstChanceHooked)
 		{
-			// Minimal first-chance trace: type + first message line
-			// ONLY. Never Environment.StackTrace or ex.TargetSite
-			// here: resolving hostile frames aborts the runtime.
 			s_globalFirstChanceHooked = true;
-			AppDomain.CurrentDomain.FirstChanceException += (sender, args) =>
+			AppDomain.CurrentDomain.FirstChanceException += (object? sender, FirstChanceExceptionEventArgs args) =>
 			{
 				try
 				{
-					Exception ex = args.Exception;
-					string msg = (ex.Message ?? "").Split('\n')[0];
-					if (msg.Contains("UITypeEditor") || msg.Contains("System.Diagnostics.Process"))
-						return;
-					if (!FirstChanceLogGate.ShouldLog(ex.GetType().FullName + "|" + msg))
-						return;
-					Console.WriteLine($"[1ST-GLOBAL] {ex.GetType().FullName}: {msg}");
+					Exception exception = args.Exception;
+					string text = (exception.Message ?? "").Split('\n')[0];
+					if (!text.Contains("UITypeEditor") && !text.Contains("System.Diagnostics.Process") && FirstChanceLogGate.ShouldLog(exception.GetType().FullName + "|" + text))
+					{
+						Console.WriteLine("[1ST-GLOBAL] " + exception.GetType().FullName + ": " + text);
+					}
 				}
 				catch
 				{
@@ -1708,20 +2110,18 @@ public sealed class WinFormsAppHost : IDisposable
 		_activeForm = GetOrCreateForm(scene);
 		SyncForkForeground(_activeForm);
 		Console.WriteLine($"[Scene] Selected {scene}, Form={_activeForm?.GetType().FullName}, Size={_activeForm?.Size}, ClientSize={_activeForm?.ClientSize}, Controls={_activeForm?.Controls.Count}");
-		if (_activeForm is System.Windows.Forms.ContainerControl cc)
-			Console.WriteLine($"[Scene] Scale: mode={cc.AutoScaleMode} dims={cc.AutoScaleDimensions} current={cc.CurrentAutoScaleDimensions} font={cc.Font?.Name} {cc.Font?.SizeInPoints:F2}pt");
+		System.Windows.Forms.ContainerControl activeForm = _activeForm;
+		if (activeForm != null)
+		{
+			Console.WriteLine($"[Scene] Scale: mode={activeForm.AutoScaleMode} dims={activeForm.AutoScaleDimensions} current={activeForm.CurrentAutoScaleDimensions} font={activeForm.Font?.Name} {activeForm.Font?.SizeInPoints:F2}pt");
+		}
 		if (_activeForm != null)
 		{
 			DumpControlTree(_activeForm, 0);
 			DumpGridState(_activeForm);
-
 		}
 	}
 
-	// Data-aware grid dump (reflection: Telerik types are app-loaded):
-	// distinguishes data/binding gaps (rows=0) from pure paint gaps
-	// (rows>0 but nothing renders) for every grid on the form. Best
-	// effort only; never breaks scene select.
 	internal static void DumpGridState(System.Windows.Forms.Control root)
 	{
 		try
@@ -1737,833 +2137,1295 @@ public sealed class WinFormsAppHost : IDisposable
 	{
 		try
 		{
-			string full = c.GetType().FullName ?? "";
-			if (full.Contains("RadGridView", System.StringComparison.Ordinal)
-				|| full.Contains("DataGridView", System.StringComparison.Ordinal))
+			string text = c.GetType().FullName ?? "";
+			if (text.Contains("RadGridView", StringComparison.Ordinal) || text.Contains("DataGridView", StringComparison.Ordinal))
 			{
-				string detail = "?";
+				string text2 = "?";
 				try
 				{
-					object? mt = c.GetType().GetProperty("MasterTemplate")?.GetValue(c);
-					mt ??= c;
-					int rows = (int?)mt.GetType().GetProperty("RowCount")?.GetValue(mt) ?? -1;
-					if (rows < 0)
+					object obj = c.GetType().GetProperty("MasterTemplate")?.GetValue(c);
+					if (obj == null)
 					{
-						object? rowList = mt.GetType().GetProperty("Rows")?.GetValue(mt);
-						rows = (int?)rowList?.GetType().GetProperty("Count")?.GetValue(rowList) ?? -1;
+						obj = c;
 					}
-					object? colList = mt.GetType().GetProperty("Columns")?.GetValue(mt);
-					int cols = (int?)colList?.GetType().GetProperty("Count")?.GetValue(colList) ?? -1;
-					object? ds = null;
-					try { ds = mt.GetType().GetProperty("DataSource")?.GetValue(mt); } catch { }
-					detail = $"rows={rows} cols={cols} datasource={(ds == null ? "null" : ds.GetType().Name)}";
+					int num = ((int?)obj.GetType().GetProperty("RowCount")?.GetValue(obj)) ?? (-1);
+					if (num < 0)
+					{
+						object obj2 = obj.GetType().GetProperty("Rows")?.GetValue(obj);
+						num = ((int?)obj2?.GetType().GetProperty("Count")?.GetValue(obj2)) ?? (-1);
+					}
+					object obj3 = obj.GetType().GetProperty("Columns")?.GetValue(obj);
+					int value = ((int?)obj3?.GetType().GetProperty("Count")?.GetValue(obj3)) ?? (-1);
+					object obj4 = null;
+					try
+					{
+						obj4 = obj.GetType().GetProperty("DataSource")?.GetValue(obj);
+					}
+					catch
+					{
+					}
+					text2 = $"rows={num} cols={value} datasource={((obj4 == null) ? "null" : obj4.GetType().Name)}";
 				}
-				catch (System.Exception ex)
+				catch (Exception ex)
 				{
-					detail = "ERR " + ex.GetType().Name;
+					text2 = "ERR " + ex.GetType().Name;
 				}
-				Console.WriteLine($"[GRID-STATE] {c.GetType().Name} '{c.Name}' Bounds={c.Bounds} Visible={c.Visible} {detail}");
+				Console.WriteLine($"[GRID-STATE] {c.GetType().Name} '{c.Name}' Bounds={c.Bounds} Visible={c.Visible} {text2}");
 				try
 				{
-					object? mt2 = c.GetType().GetProperty("MasterTemplate")?.GetValue(c); mt2 ??= c; object? rows2 = mt2.GetType().GetProperty("Rows")?.GetValue(mt2);
-					System.Collections.IEnumerator? en2 = (rows2 as System.Collections.IEnumerable)?.GetEnumerator();
-					if (en2 is not null && en2.MoveNext() && en2.Current is not null)
+					object obj6 = c.GetType().GetProperty("MasterTemplate")?.GetValue(c);
+					if (obj6 == null)
 					{
-						var sb = new System.Text.StringBuilder();
-						int shown = 0;
-						foreach (var prop in en2.Current.GetType().GetProperties())
+						obj6 = c;
+					}
+					object obj7 = obj6.GetType().GetProperty("Rows")?.GetValue(obj6);
+					IEnumerator enumerator = (obj7 as IEnumerable)?.GetEnumerator();
+					if (enumerator != null && enumerator.MoveNext() && enumerator.Current != null)
+					{
+						StringBuilder stringBuilder = new StringBuilder();
+						int num2 = 0;
+						PropertyInfo[] properties = enumerator.Current.GetType().GetProperties();
+						foreach (PropertyInfo propertyInfo in properties)
 						{
-							if (shown >= 8) break;
-							string tn = prop.PropertyType.FullName ?? "";
-							if (!tn.StartsWith("System.Int32") && !tn.StartsWith("System.Single") && !tn.StartsWith("System.Boolean") && !tn.StartsWith("System.Drawing.Size")) continue;
-							object? v = null;
-							try { v = prop.GetValue(en2.Current); } catch { continue; }
-							sb.Append(prop.Name).Append('=').Append(v).Append(';');
-							shown++;
+							if (num2 >= 8)
+							{
+								break;
+							}
+							string text3 = propertyInfo.PropertyType.FullName ?? "";
+							if (text3.StartsWith("System.Int32") || text3.StartsWith("System.Single") || text3.StartsWith("System.Boolean") || text3.StartsWith("System.Drawing.Size"))
+							{
+								object obj8 = null;
+								try
+								{
+									obj8 = propertyInfo.GetValue(enumerator.Current);
+								}
+								catch
+								{
+									continue;
+								}
+								stringBuilder.Append(propertyInfo.Name).Append('=').Append(obj8)
+									.Append(';');
+								num2++;
+							}
 						}
-						Console.WriteLine($"[GRID-ROW0] {sb}");
-						var sb2 = new System.Text.StringBuilder();
+						Console.WriteLine($"[GRID-ROW0] {stringBuilder}");
+						StringBuilder stringBuilder2 = new StringBuilder();
 						try
 						{
-							object? cells = en2.Current.GetType().GetProperty("Cells")?.GetValue(en2.Current);
-							int cc = (int?)cells?.GetType().GetProperty("Count")?.GetValue(cells) ?? -1;
-							sb2.Append("cells=").Append(cc).Append(';');
-							System.Collections.IEnumerator? ce = (cells as System.Collections.IEnumerable)?.GetEnumerator();
-							if (ce is not null && ce.MoveNext() && ce.Current is not null)
+							object obj10 = enumerator.Current.GetType().GetProperty("Cells")?.GetValue(enumerator.Current);
+							int value2 = ((int?)obj10?.GetType().GetProperty("Count")?.GetValue(obj10)) ?? (-1);
+							stringBuilder2.Append("cells=").Append(value2).Append(';');
+							IEnumerator enumerator2 = (obj10 as IEnumerable)?.GetEnumerator();
+							if (enumerator2 != null && enumerator2.MoveNext() && enumerator2.Current != null)
 							{
-								foreach (var prop in ce.Current.GetType().GetProperties())
+								PropertyInfo[] properties2 = enumerator2.Current.GetType().GetProperties();
+								foreach (PropertyInfo propertyInfo2 in properties2)
 								{
-									string pn = prop.Name;
-									if (pn != "Size" && pn != "Location" && pn != "Bounds" && pn != "Visible" && pn != "Value") continue;
-									object? v2 = null;
-									try { v2 = prop.GetValue(ce.Current); } catch { continue; }
-									string vs = v2 is string s ? (s.Length > 24 ? s.Substring(0, 24) : s) : (v2?.ToString() ?? "null");
-								sb2.Append(pn).Append('=').Append(vs).Append(';');
+									string name = propertyInfo2.Name;
+									if (!(name != "Size") || !(name != "Location") || !(name != "Bounds") || !(name != "Visible") || !(name != "Value"))
+									{
+										object obj11 = null;
+										try
+										{
+											obj11 = propertyInfo2.GetValue(enumerator2.Current);
+										}
+										catch
+										{
+											continue;
+										}
+										string value3;
+										if (obj11 is string text4)
+										{
+											value3 = ((text4.Length > 24) ? text4.Substring(0, 24) : text4);
+										}
+										else
+										{
+											value3 = obj11?.ToString() ?? "null";
+										}
+										stringBuilder2.Append(name).Append('=').Append(value3)
+											.Append(';');
+									}
 								}
 							}
 						}
-						catch (System.Exception ex3)
+						catch (Exception ex2)
 						{
-							sb2.Append("ERR ").Append(ex3.GetType().Name);
+							stringBuilder2.Append("ERR ").Append(ex2.GetType().Name);
 						}
-						Console.WriteLine($"[GRID-CELL0] {sb2}");
+						Console.WriteLine($"[GRID-CELL0] {stringBuilder2}");
 					}
 				}
-				catch (System.Exception ex2)
+				catch (Exception ex3)
 				{
-					Console.WriteLine($"[GRID-ROW0] ERR {ex2.GetType().Name}");
+					Console.WriteLine("[GRID-ROW0] ERR " + ex3.GetType().Name);
 				}
 			}
 		}
 		catch
 		{
 		}
-
 		foreach (System.Windows.Forms.Control control in c.Controls)
 		{
 			DumpGridStateCore(control);
 		}
 	}
 
-	// Paint-time visual dump: virtualization builds row/cell elements
-	// during layout, so pre-paint reflection only sees data. Called on
-	// the first frame; best effort, never throws out.
 	internal static void DumpGridVisualState(System.Windows.Forms.Control root)
 	{
-		try { DumpGridVisualCore(root); } catch { }
+		try
+		{
+			DumpGridVisualCore(root);
+		}
+		catch
+		{
+		}
 	}
 
 	private static void DumpGridVisualCore(System.Windows.Forms.Control c)
 	{
 		try
 		{
-			string full = c.GetType().FullName ?? "";
-			if (full.Contains("RadGridView", System.StringComparison.Ordinal))
+			string text = c.GetType().FullName ?? "";
+			if (text.Contains("RadGridView", StringComparison.Ordinal))
 			{
-				var sb = new System.Text.StringBuilder();
+				StringBuilder stringBuilder = new StringBuilder();
 				try
 				{
-					object? table = c.GetType().GetProperty("TableElement")?.GetValue(c);
-					DescribeVisual(table, "table", sb);
-					object? firstRow = FirstVisualChild(table);
-					DescribeVisual(firstRow, "row0", sb);
-					object? firstCell = FirstVisualChild(firstRow);
-					DescribeVisual(firstCell, "cell0", sb);
+					object element = c.GetType().GetProperty("TableElement")?.GetValue(c);
+					DescribeVisual(element, "table", stringBuilder);
+					object element2 = FirstVisualChild(element);
+					DescribeVisual(element2, "row0", stringBuilder);
+					object element3 = FirstVisualChild(element2);
+					DescribeVisual(element3, "cell0", stringBuilder);
 					DumpGridColumns(c);
 					DumpGridTree(c);
 					s_gateBudget = 0;
 					DumpGridLayoutGate(c);
 					ProbeGridPaint(c);
 				}
-				catch (System.Exception ex) { sb.Append("ERR ").Append(ex.GetType().Name); }
-				Console.WriteLine($"[GRID-VIS] {c.GetType().Name} '{c.Name}' {sb}");
+				catch (Exception ex)
+				{
+					stringBuilder.Append("ERR ").Append(ex.GetType().Name);
+				}
+				Console.WriteLine($"[GRID-VIS] {c.GetType().Name} '{c.Name}' {stringBuilder}");
 			}
 		}
-		catch { }
-		foreach (System.Windows.Forms.Control control in c.Controls) DumpGridVisualCore(control);
+		catch
+		{
+		}
+		foreach (System.Windows.Forms.Control control in c.Controls)
+		{
+			DumpGridVisualCore(control);
+		}
 	}
 
-	// Tile-tree visual dump: panorama tiles are TPF elements (not
-	// Controls), so the [Scene] control dump cannot see them. First-frame
-	// dump answers "text missing vs zero-size" for tile content (e.g.
-	// BookShelf cover-only tiles): Text present + Size>0 => paint gap;
-	// Size=0 => layout/measure gap; Text empty => binding gap.
-	// Best effort only; never breaks the frame.
 	internal static void DumpInkCensus()
 	{
-		try { Console.WriteLine($"[INK] TEXT-CENSUS {WfWasm.Shim.TextRenderer.DumpCensus()}"); } catch { }
 		try
 		{
-			string gdiCensus = System.Windows.Forms.WasmGdiText.DumpGdiPaintCensus();
-			Console.WriteLine("[INK] GDI-CENSUS " + gdiCensus);
+			Console.WriteLine("[INK] TEXT-CENSUS " + WfWasm.Shim.TextRenderer.DumpCensus());
 		}
-		catch { }
+		catch
+		{
+		}
 		try
 		{
-			string dsCensus = System.Drawing.Graphics.DumpDrawStringCensus();
-			Console.WriteLine("[INK] DS-CENSUS " + dsCensus);
+			string text = WasmGdiText.DumpGdiPaintCensus();
+			Console.WriteLine("[INK] GDI-CENSUS " + text);
 		}
-		catch { }
-	}
-	internal static void DumpTileVisualState(System.Windows.Forms.Control root)
-	{
-		try { s_tileLines = 0; DumpTileVisualCore(root); } catch { }
-		try { Console.WriteLine($"[TILE-VIS] TEXT-CENSUS {WfWasm.Shim.TextRenderer.DumpCensus()}"); } catch { }
+		catch
+		{
+		}
 		try
 		{
-			string gdiCensus = System.Windows.Forms.WasmGdiText.DumpGdiPaintCensus();
-			Console.WriteLine("[TILE-VIS] GDI-CENSUS " + gdiCensus);
+			string text2 = Graphics.DumpDrawStringCensus();
+			Console.WriteLine("[INK] DS-CENSUS " + text2);
 		}
-		catch { }
-		try
+		catch
 		{
-			string dsCensus = System.Drawing.Graphics.DumpDrawStringCensus();
-			Console.WriteLine("[TILE-VIS] DS-CENSUS " + dsCensus);
 		}
-		catch { }
 	}
 
-	private static int s_tileLines;
-	private static bool s_tileLateDumpDone;
-	// Working-vs-broken diff experiment: a browser resize inks tile text
-	// while steady-state repaints don't. Re-arm the one-shot tile
-	// diagnostics on form resize (debounced) so the post-resize dump,
-	// census, subs and paint trace capture the WORKING state for diffing.
-	private static bool s_tileResizeArmed;
-	private static long s_tileRearmTicks;
+	internal static void DumpTileVisualState(System.Windows.Forms.Control root)
+	{
+		try
+		{
+			s_tileLines = 0;
+			DumpTileVisualCore(root);
+		}
+		catch
+		{
+		}
+		try
+		{
+			Console.WriteLine("[TILE-VIS] TEXT-CENSUS " + WfWasm.Shim.TextRenderer.DumpCensus());
+		}
+		catch
+		{
+		}
+		try
+		{
+			string text = WasmGdiText.DumpGdiPaintCensus();
+			Console.WriteLine("[TILE-VIS] GDI-CENSUS " + text);
+		}
+		catch
+		{
+		}
+		try
+		{
+			string text2 = Graphics.DumpDrawStringCensus();
+			Console.WriteLine("[TILE-VIS] DS-CENSUS " + text2);
+		}
+		catch
+		{
+		}
+	}
+
 	internal static void ArmTileRedumpOnResize(System.Windows.Forms.Control c)
 	{
 		try
 		{
-			if (s_tileResizeArmed) return;
+			if (s_tileResizeArmed)
+			{
+				return;
+			}
 			s_tileResizeArmed = true;
-			System.Windows.Forms.Form? f = c.FindForm();
-			if (f is null) return;
-			f.SizeChanged += (_, _) =>
+			System.Windows.Forms.Form form = c.FindForm();
+			if (form == null)
+			{
+				return;
+			}
+			form.SizeChanged += (object? _, EventArgs _) =>
 			{
 				try
 				{
-					long now = System.DateTime.UtcNow.Ticks;
-					if (now - s_tileRearmTicks < 600_000_000L) return;
-					s_tileRearmTicks = now;
+					long ticks = DateTime.UtcNow.Ticks;
+					if (ticks - s_tileRearmTicks < 600000000)
+					{
+						return;
+					}
+					s_tileRearmTicks = ticks;
 					s_tileLateDumpDone = false;
 					s_panoPaintTrace = 0;
 					s_paintSubs = 0;
 					s_paintFire.Clear();
-					try { Console.WriteLine("[TILE-VIS] redump-armed on resize"); } catch { }
+					try
+					{
+						Console.WriteLine("[TILE-VIS] redump-armed on resize");
+					}
+					catch
+					{
+					}
 				}
-				catch { }
+				catch
+				{
+				}
 			};
 		}
-		catch { }
+		catch
+		{
+		}
 	}
 
 	private static void DumpTileVisualCore(System.Windows.Forms.Control c)
 	{
 		try
 		{
-			string full = c.GetType().FullName ?? "";
-			if (full.Contains("Panorama", System.StringComparison.Ordinal))
+			string text = c.GetType().FullName ?? "";
+			if (text.Contains("Panorama", StringComparison.Ordinal))
 			{
 				Console.WriteLine($"[TILE-VIS] {c.GetType().Name} '{c.Name}' Bounds={c.Bounds} Visible={c.Visible}");
-				object?[] roots = new object?[]
+				object[] array = new object[4]
 				{
 					SafeGetObj(c, "PanoramaElement"),
 					SafeGetObj(c, "RootElement"),
 					SafeGetObj(c, "Groups"),
-					SafeGetObj(c, "Items"),
+					SafeGetObj(c, "Items")
 				};
-				foreach (object? r in roots)
-					if (r is not null) DumpTileElement(r, 1);
+				object[] array2 = array;
+				foreach (object obj in array2)
+				{
+					if (obj != null)
+					{
+						DumpTileElement(obj, 1);
+					}
+				}
 			}
 		}
-		catch { }
-		foreach (System.Windows.Forms.Control control in c.Controls) DumpTileVisualCore(control);
+		catch
+		{
+		}
+		foreach (System.Windows.Forms.Control control in c.Controls)
+		{
+			DumpTileVisualCore(control);
+		}
 	}
 
 	private static object? SafeGetObj(object? o, string name)
 	{
-		try { return o?.GetType().GetProperty(name)?.GetValue(o); }
-		catch { return null; }
+		try
+		{
+			return o?.GetType().GetProperty(name)?.GetValue(o);
+		}
+		catch
+		{
+			return null;
+		}
 	}
 
-	// Presence probe for the late tile re-dump: true once the panorama
-	// element carries groups (books arrived). Reflection-only, no layout.
 	private static bool PanoramaHasGroups(object? panoramaControl)
 	{
 		try
 		{
-			object? el = SafeGetObj(panoramaControl, "PanoramaElement");
-			el ??= SafeGetObj(panoramaControl, "RootElement");
-			object? groups = SafeGetObj(el, "Groups");
-			if (groups is System.Collections.IEnumerable en)
+			object obj = SafeGetObj(panoramaControl, "PanoramaElement");
+			if (obj == null)
 			{
-				foreach (object? g in en) return true;
+				obj = SafeGetObj(panoramaControl, "RootElement");
+			}
+			object obj2 = SafeGetObj(obj, "Groups");
+			if (obj2 is IEnumerable enumerable)
+			{
+				{
+					IEnumerator enumerator = enumerable.GetEnumerator();
+					try
+					{
+						if (enumerator.MoveNext())
+						{
+							object current = enumerator.Current;
+							return true;
+						}
+					}
+					finally
+					{
+						IDisposable disposable = enumerator as IDisposable;
+						if (disposable != null)
+						{
+							disposable.Dispose();
+						}
+					}
+				}
 			}
 			return false;
 		}
-		catch { return false; }
+		catch
+		{
+			return false;
+		}
 	}
 
-	// Tile text inks only under a full clip, but the steady-state
-	// panorama repaints carry partial (cover-arrival) clips, so tile
-	// text added after first paint stays blank until a full repaint
-	// (resize-proven). One-shot: repaint-gate the panorama whole the
-	// first time its groups are non-empty so tiles paint once with
-	// settled layout. Mirrors desktop (adding children invalidates).
-	// NOTE: plain Control.Invalidate is a handleless no-op headless
-	// (the rewriter redirects it only in transformed assemblies, not
-	// here), so this must go through WasmRepaintGate directly.
 	internal static bool MaybeEnsureTileRepaint(System.Windows.Forms.Control c)
 	{
 		try
 		{
-			if (!PanoramaHasGroups(c)) return false;
-			try { System.Windows.Forms.WasmRepaintGate.RequestRepaint(c, true); } catch { }
-			try { Console.WriteLine("[TILE-VIS] ensure-paint invalidated " + c.GetType().Name); } catch { }
-			// Deferred fit (BookShelf tile text below the fold): the app
-			// centers its groups in MainForm_SizeChanged from live content
-			// sizes. A host fit before the books arrive computes padding
-			// from unmeasured (0-height) content and parks the tiles below
-			// the fold permanently (Padding.Top=283). Creation/viewport
-			// fits are therefore skipped for BookShelf until the groups
-			// exist; this one-shot applies the fit now (content measurable)
-			// so SizeChanged computes the correct padding, then repaints.
+			if (!PanoramaHasGroups(c))
+			{
+				return false;
+			}
 			try
 			{
-				System.Windows.Forms.Form? bf = c.FindForm();
-				if (!s_bookShelfFitDone && IsBookShelfForm(bf))
+				WasmRepaintGate.RequestRepaint(c, invalidateChildren: true);
+			}
+			catch
+			{
+			}
+			try
+			{
+				Console.WriteLine("[TILE-VIS] ensure-paint invalidated " + c.GetType().Name);
+			}
+			catch
+			{
+			}
+			try
+			{
+				System.Windows.Forms.Form form = c.FindForm();
+				if (!s_bookShelfFitDone && IsBookShelfForm(form))
 				{
 					s_bookShelfFitDone = true;
-					CenterInViewport(bf!);
-					Console.WriteLine("[TILE-VIS] deferred-fit applied BookShelf size=" + bf!.Size);
-					try { System.Windows.Forms.WasmRepaintGate.RequestRepaint(c, true); } catch { }
+					CenterInViewport(form);
+					Console.WriteLine("[TILE-VIS] deferred-fit applied BookShelf size=" + form.Size);
+					try
+					{
+						WasmRepaintGate.RequestRepaint(c, invalidateChildren: true);
+					}
+					catch
+					{
+					}
 				}
 			}
-			catch { }
+			catch
+			{
+			}
 			return true;
 		}
-		catch { return false; }
+		catch
+		{
+			return false;
+		}
 	}
 
 	private static void DumpTileList(object? list, int depth)
 	{
-		if (list is System.Collections.IEnumerable en && list is not string)
+		if (!(list is IEnumerable enumerable) || list is string)
 		{
-			int shown = 0;
-			foreach (object? child in en)
+			return;
+		}
+		int num = 0;
+		foreach (object item in enumerable)
+		{
+			if (item == null || num >= 12 || s_tileLines >= 300)
 			{
-				if (child is null || shown >= 12 || s_tileLines >= 300) break;
-				DumpTileElement(child, depth);
-				shown++;
+				break;
 			}
+			DumpTileElement(item, depth);
+			num++;
 		}
 	}
 
 	private static void DumpTileElement(object? element, int depth)
 	{
-		if (element is null || depth > 7 || s_tileLines >= 300) return;
-		if (element is System.Collections.IEnumerable && element is not string)
+		if (element == null || depth > 7 || s_tileLines >= 300)
+		{
+			return;
+		}
+		if (element is IEnumerable && !(element is string))
 		{
 			DumpTileList(element, depth);
 			return;
 		}
 		try
 		{
-			var sb = new System.Text.StringBuilder();
-			sb.Append(' ', depth * 2);
-			sb.Append('[').Append(element.GetType().Name).Append(']');
-			DescribeVisual(element, "el", sb);
-			sb.Append("Arrange=").Append(SafeProp(element, "IsArrangeValid")).Append(';');
-			sb.Append("Measure=").Append(SafeProp(element, "IsMeasureValid")).Append(';');
-			sb.Append("En=").Append(SafeProp(element, "Enabled")).Append(';');
-			sb.Append("SP=").Append(SafeProp(element, "ShouldPaint")).Append(';');
-			sb.Append("DT=").Append(SafeProp(element, "DrawText")).Append(';');
-			sb.Append("Img=").Append(SafeGetObj(element, "Image") is null ? "null" : "set").Append(';');
-			sb.Append("PR=").Append(SafeSubProp(element, "TextParams", "paintingRectangle")).Append(';');
-			sb.Append("FNT=").Append(SafeProp(element, "Font")).Append(';');
-			sb.Append("TPF=").Append(SafeSubProp(element, "TextParams", "font")).Append(';');
-			sb.Append("CBR=").Append(SafeProp(element, "ControlBoundingRectangle")).Append(';');
-			sb.Append("TT=").Append(SafeProp(element, "TotalTransform")).Append(';');
-			sb.Append("SPC=").Append(SafeProp(element, "ShouldPaintChildren")).Append(';');
-			sb.Append("IMPL=").Append(SafeFieldType(element, "textPrimitiveImpl")).Append(';');
-			sb.Append("LAYC=").Append(SafeProp(element, "LayoutableChildrenCount")).Append(';');
-			sb.Append("ZC2=").Append(SafeZOrderedCount(element)).Append(';');
+			StringBuilder stringBuilder = new StringBuilder();
+			stringBuilder.Append(' ', depth * 2);
+			stringBuilder.Append('[').Append(element.GetType().Name).Append(']');
+			DescribeVisual(element, "el", stringBuilder);
+			stringBuilder.Append("Arrange=").Append(SafeProp(element, "IsArrangeValid")).Append(';');
+			stringBuilder.Append("Measure=").Append(SafeProp(element, "IsMeasureValid")).Append(';');
+			stringBuilder.Append("En=").Append(SafeProp(element, "Enabled")).Append(';');
+			stringBuilder.Append("SP=").Append(SafeProp(element, "ShouldPaint")).Append(';');
+			stringBuilder.Append("DT=").Append(SafeProp(element, "DrawText")).Append(';');
+			stringBuilder.Append("Img=").Append((SafeGetObj(element, "Image") == null) ? "null" : "set").Append(';');
+			stringBuilder.Append("PR=").Append(SafeSubProp(element, "TextParams", "paintingRectangle")).Append(';');
+			stringBuilder.Append("FNT=").Append(SafeProp(element, "Font")).Append(';');
+			stringBuilder.Append("TPF=").Append(SafeSubProp(element, "TextParams", "font")).Append(';');
+			stringBuilder.Append("CBR=").Append(SafeProp(element, "ControlBoundingRectangle")).Append(';');
+			stringBuilder.Append("TT=").Append(SafeProp(element, "TotalTransform")).Append(';');
+			stringBuilder.Append("SPC=").Append(SafeProp(element, "ShouldPaintChildren")).Append(';');
+			stringBuilder.Append("IMPL=").Append(SafeFieldType(element, "textPrimitiveImpl")).Append(';');
+			stringBuilder.Append("LAYC=").Append(SafeProp(element, "LayoutableChildrenCount")).Append(';');
+			stringBuilder.Append("ZC2=").Append(SafeZOrderedCount(element)).Append(';');
 			string text = SafeProp(element, "Text");
-			if (text.Length > 48) text = text.Substring(0, 48);
-			sb.Append("Text='").Append(text.Replace('\r', ' ').Replace('\n', ' ')).Append("';");
-			Console.WriteLine($"[TILE-VIS] {sb}");
+			if (text.Length > 48)
+			{
+				text = text.Substring(0, 48);
+			}
+			stringBuilder.Append("Text='").Append(text.Replace('\r', ' ').Replace('\n', ' ')).Append("';");
+			Console.WriteLine($"[TILE-VIS] {stringBuilder}");
 			s_tileLines++;
-			object?[] kids = new object?[]
+			object[] array = new object[3]
 			{
 				SafeGetObj(element, "Children"),
 				SafeGetObj(element, "Groups"),
-				SafeGetObj(element, "Items"),
+				SafeGetObj(element, "Items")
 			};
-			int before = s_tileLines;
-			foreach (object? k in kids)
-				DumpTileList(k, depth + 1);
-			int total = ChildCount(element);
-			int shown = s_tileLines - before;
-			if (total > shown) Console.WriteLine($"[TILE-VIS] {new string(' ', depth * 2)}... +{total - shown} more");
+			int num = s_tileLines;
+			object[] array2 = array;
+			foreach (object list in array2)
+			{
+				DumpTileList(list, depth + 1);
+			}
+			int num2 = ChildCount(element);
+			int num3 = s_tileLines - num;
+			if (num2 > num3)
+			{
+				Console.WriteLine($"[TILE-VIS] {new string(' ', depth * 2)}... +{num2 - num3} more");
+			}
 		}
-		catch { }
+		catch
+		{
+		}
 	}
-
 
 	private static string SafeSubProp(object? o, string outer, string inner)
 	{
 		try
 		{
-			object? mid = SafeGetObj(o, outer);
-			if (mid is null) return "null";
-			object? v = mid.GetType().GetProperty(inner)?.GetValue(mid);
-			v ??= mid.GetType().GetField(inner, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)?.GetValue(mid);
-			return v?.ToString() ?? "null";
+			object obj = SafeGetObj(o, outer);
+			if (obj == null)
+			{
+				return "null";
+			}
+			object obj2 = obj.GetType().GetProperty(inner)?.GetValue(obj);
+			if (obj2 == null)
+			{
+				obj2 = obj.GetType().GetField(inner, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(obj);
+			}
+			return obj2?.ToString() ?? "null";
 		}
-		catch { return "ERR"; }
+		catch
+		{
+			return "ERR";
+		}
 	}
 
 	private static string SafeFieldType(object? o, string field)
 	{
 		try
 		{
-			object? v = o?.GetType().GetField(field, System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)?.GetValue(o);
-			return v?.GetType().Name ?? "null";
+			return (o?.GetType().GetField(field, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(o))?.GetType().Name ?? "null";
 		}
-		catch { return "ERR"; }
+		catch
+		{
+			return "ERR";
+		}
 	}
 
-	// Z-ordered child count through the exact path PaintChildren uses
-	// (GetChildren(ZOrdered) yield iterator, not the Children list).
-	// A yield divergence headless would empty the paint walk while
-	// layout (Children-based) stays healthy.
 	private static string SafeZOrderedCount(object? o)
 	{
 		try
 		{
-			if (o is null) return "null";
-			System.Reflection.MethodInfo? mi = null;
-			for (System.Type? t = o.GetType(); t is not null && mi is null; t = t.BaseType)
-				mi = t.GetMethod("GetChildren", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-			if (mi is null) return "no-m";
-			System.Reflection.ParameterInfo[] ps = mi.GetParameters();
-			if (ps.Length != 1) return "no-1p";
-			object arg = System.Enum.Parse(ps[0].ParameterType, "ZOrdered");
-			object? res = mi.Invoke(o, new object?[] { arg });
-			if (res is not System.Collections.IEnumerable en) return "no-en";
-			int n = 0;
-			foreach (object? _ in en) { n++; if (n > 20) break; }
-			return n.ToString();
+			if (o == null)
+			{
+				return "null";
+			}
+			MethodInfo methodInfo = null;
+			Type type = o.GetType();
+			while ((object)type != null && (object)methodInfo == null)
+			{
+				methodInfo = type.GetMethod("GetChildren", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+				type = type.BaseType;
+			}
+			if ((object)methodInfo == null)
+			{
+				return "no-m";
+			}
+			ParameterInfo[] parameters = methodInfo.GetParameters();
+			if (parameters.Length != 1)
+			{
+				return "no-1p";
+			}
+			object obj = Enum.Parse(parameters[0].ParameterType, "ZOrdered");
+			object obj2 = methodInfo.Invoke(o, new object[1] { obj });
+			if (!(obj2 is IEnumerable enumerable))
+			{
+				return "no-en";
+			}
+			int num = 0;
+			foreach (object item in enumerable)
+			{
+				num++;
+				if (num > 20)
+				{
+					break;
+				}
+			}
+			return num.ToString();
 		}
-		catch { return "ERR"; }
+		catch
+		{
+			return "ERR";
+		}
 	}
 
 	private static string SafeProp(object? o, string name)
 	{
 		try
 		{
-			if (o is null) return "?";
-			object? v = o.GetType().GetProperty(name)?.GetValue(o);
-			return v?.ToString() ?? "null";
+			if (o == null)
+			{
+				return "?";
+			}
+			return (o.GetType().GetProperty(name)?.GetValue(o))?.ToString() ?? "null";
 		}
-		catch { return "ERR"; }
+		catch
+		{
+			return "ERR";
+		}
 	}
 
 	private static int ChildCount(object? element)
 	{
 		try
 		{
-			object? kids = element?.GetType().GetProperty("Children")?.GetValue(element);
-			return (int?)kids?.GetType().GetProperty("Count")?.GetValue(kids) ?? -1;
+			object obj = element?.GetType().GetProperty("Children")?.GetValue(element);
+			return ((int?)obj?.GetType().GetProperty("Count")?.GetValue(obj)) ?? (-1);
 		}
-		catch { return -2; }
+		catch
+		{
+			return -2;
+		}
 	}
 
-	// Column widths + template flags: answers whether BestFit/AutoSize
-	// produced widths (layout ran) or columns stayed 0 (layout broken).
 	private static void DumpGridColumns(System.Windows.Forms.Control c)
 	{
 		try
 		{
-			var sb = new System.Text.StringBuilder();
-			object? cols = c.GetType().GetProperty("Columns")?.GetValue(c);
-			int n = (int?)cols?.GetType().GetProperty("Count")?.GetValue(cols) ?? -1;
-			sb.Append("cols=").Append(n).Append(';');
-			System.Collections.IEnumerator? en = (cols as System.Collections.IEnumerable)?.GetEnumerator();
-			int i = 0;
-			while (en is not null && en.MoveNext() && i < 15)
+			StringBuilder stringBuilder = new StringBuilder();
+			object obj = c.GetType().GetProperty("Columns")?.GetValue(c);
+			int value = ((int?)obj?.GetType().GetProperty("Count")?.GetValue(obj)) ?? (-1);
+			stringBuilder.Append("cols=").Append(value).Append(';');
+			IEnumerator enumerator = (obj as IEnumerable)?.GetEnumerator();
+			int num = 0;
+			while (enumerator != null && enumerator.MoveNext() && num < 15)
 			{
-				object? col = en.Current;
-				sb.Append('[').Append(i).Append(' ').Append(SafeProp(col, "Name"));
-				sb.Append(" W=").Append(SafeProp(col, "Width")).Append(" Min=").Append(SafeProp(col, "MinWidth"));
-				sb.Append(" Max=").Append(SafeProp(col, "MaxWidth")).Append(" Vis=").Append(SafeProp(col, "IsVisible")).Append(']');
-				i++;
+				object current = enumerator.Current;
+				stringBuilder.Append('[').Append(num).Append(' ')
+					.Append(SafeProp(current, "Name"));
+				stringBuilder.Append(" W=").Append(SafeProp(current, "Width")).Append(" Min=")
+					.Append(SafeProp(current, "MinWidth"));
+				stringBuilder.Append(" Max=").Append(SafeProp(current, "MaxWidth")).Append(" Vis=")
+					.Append(SafeProp(current, "IsVisible"))
+					.Append(']');
+				num++;
 			}
-			object? mt = c.GetType().GetProperty("MasterTemplate")?.GetValue(c);
-			sb.Append("tmpl[AutoSize=").Append(SafeProp(mt ?? c, "AutoSizeColumnsMode"));
-			sb.Append(" RowH=").Append(SafeProp(mt, "RowHeight")).Append(" Grp=").Append(SafeProp(mt, "EnableGrouping")).Append("];");
-			Console.WriteLine($"[GRID-COLS] {c.GetType().Name} '{c.Name}' {sb}");
+			object obj2 = c.GetType().GetProperty("MasterTemplate")?.GetValue(c);
+			stringBuilder.Append("tmpl[AutoSize=").Append(SafeProp(obj2 ?? c, "AutoSizeColumnsMode"));
+			stringBuilder.Append(" RowH=").Append(SafeProp(obj2, "RowHeight")).Append(" Grp=")
+				.Append(SafeProp(obj2, "EnableGrouping"))
+				.Append("];");
+			Console.WriteLine($"[GRID-COLS] {c.GetType().Name} '{c.Name}' {stringBuilder}");
 		}
-		catch (System.Exception ex) { Console.WriteLine($"[GRID-COLS] ERR {ex.GetType().Name}"); }
+		catch (Exception ex)
+		{
+			Console.WriteLine("[GRID-COLS] ERR " + ex.GetType().Name);
+		}
 	}
 
-	private static int s_gridTreeBudget;
-
-	// Full visual subtree with type names: identifies what FirstVisualChild
-	// actually grabbed (row0 full-table is either header or container).
-	private static void WalkGridTree(object? el, int depth, System.Text.StringBuilder sb)
+	private static void WalkGridTree(object? el, int depth, StringBuilder sb)
 	{
-		if (el is null || depth > 5 || s_gridTreeBudget > 120) return;
+		if (el == null || depth > 5 || s_gridTreeBudget > 120)
+		{
+			return;
+		}
 		s_gridTreeBudget++;
 		try
 		{
-			sb.Append('[').Append(depth).Append(' ').Append(el.GetType().Name);
-			sb.Append(' ').Append(SafeProp(el, "Bounds")).Append(' ').Append(SafeProp(el, "Visibility"));
+			sb.Append('[').Append(depth).Append(' ')
+				.Append(el.GetType().Name);
+			sb.Append(' ').Append(SafeProp(el, "Bounds")).Append(' ')
+				.Append(SafeProp(el, "Visibility"));
 			sb.Append(" kids=").Append(ChildCount(el)).Append(']');
-			object? kids = el.GetType().GetProperty("Children")?.GetValue(el);
-			System.Collections.IEnumerator? en = (kids as System.Collections.IEnumerable)?.GetEnumerator();
-			while (en is not null && en.MoveNext()) WalkGridTree(en.Current, depth + 1, sb);
+			object obj = el.GetType().GetProperty("Children")?.GetValue(el);
+			IEnumerator enumerator = (obj as IEnumerable)?.GetEnumerator();
+			while (enumerator != null && enumerator.MoveNext())
+			{
+				WalkGridTree(enumerator.Current, depth + 1, sb);
+			}
 		}
-		catch { sb.Append("[ERR]"); }
+		catch
+		{
+			sb.Append("[ERR]");
+		}
 	}
 
 	private static void DumpGridTree(System.Windows.Forms.Control c)
 	{
 		try
 		{
-			object? table = c.GetType().GetProperty("TableElement")?.GetValue(c);
-			var sb = new System.Text.StringBuilder();
+			object el = c.GetType().GetProperty("TableElement")?.GetValue(c);
+			StringBuilder stringBuilder = new StringBuilder();
 			s_gridTreeBudget = 0;
-			WalkGridTree(table, 0, sb);
-			Console.WriteLine($"[GRID-TREE] {c.GetType().Name} '{c.Name}' {sb}");
+			WalkGridTree(el, 0, stringBuilder);
+			Console.WriteLine($"[GRID-TREE] {c.GetType().Name} '{c.Name}' {stringBuilder}");
 		}
-		catch (System.Exception ex) { Console.WriteLine($"[GRID-TREE] ERR {ex.GetType().Name}"); }
+		catch (Exception ex)
+		{
+			Console.WriteLine("[GRID-TREE] ERR " + ex.GetType().Name);
+		}
 	}
-
 
 	private static string SafeField(object? o, string name)
 	{
 		try
 		{
-			if (o is null) return "?";
-			System.Reflection.FieldInfo? f = null;
-			for (System.Type? t = o.GetType(); t is not null && f is null; t = t.BaseType)
-				f = t.GetField(name, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.DeclaredOnly);
-			object? v = f?.GetValue(o);
-			return v?.ToString() ?? "null";
+			if (o == null)
+			{
+				return "?";
+			}
+			FieldInfo fieldInfo = null;
+			Type type = o.GetType();
+			while ((object)type != null && (object)fieldInfo == null)
+			{
+				fieldInfo = type.GetField(name, BindingFlags.DeclaredOnly | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+				type = type.BaseType;
+			}
+			return (fieldInfo?.GetValue(o))?.ToString() ?? "null";
 		}
-		catch { return "ERR"; }
+		catch
+		{
+			return "ERR";
+		}
 	}
 
-	// Layout-gate dump: CanExecuteLayoutOperation = state==Loaded(4) &&
-	// suspend==0. If state never reaches Loaded on WASM, the arrange
-	// queue never drains (all cells X=0/Y=0).
 	private static void DumpGridLayoutGate(System.Windows.Forms.Control c)
 	{
 		try
 		{
-			var sb = new System.Text.StringBuilder();
-			object? table = c.GetType().GetProperty("TableElement")?.GetValue(c);
-			WalkLayoutGate(table, 0, sb);
-			Console.WriteLine($"[GRID-GATE] {c.GetType().Name} '{c.Name}' {sb}");
+			StringBuilder stringBuilder = new StringBuilder();
+			object el = c.GetType().GetProperty("TableElement")?.GetValue(c);
+			WalkLayoutGate(el, 0, stringBuilder);
+			Console.WriteLine($"[GRID-GATE] {c.GetType().Name} '{c.Name}' {stringBuilder}");
 		}
-		catch (System.Exception ex) { Console.WriteLine($"[GRID-GATE] ERR {ex.GetType().Name}"); }
+		catch (Exception ex)
+		{
+			Console.WriteLine("[GRID-GATE] ERR " + ex.GetType().Name);
+		}
 	}
 
-	private static int s_gateBudget;
-
-	private static void WalkLayoutGate(object? el, int depth, System.Text.StringBuilder sb)
+	private static void WalkLayoutGate(object? el, int depth, StringBuilder sb)
 	{
-		if (el is null || depth > 4 || s_gateBudget > 40) return;
+		if (el == null || depth > 4 || s_gateBudget > 40)
+		{
+			return;
+		}
 		s_gateBudget++;
 		try
 		{
-			sb.Append('[').Append(depth).Append(' ').Append(el.GetType().Name);
-			sb.Append(" state=").Append(SafeField(el, "state")).Append(" susp=").Append(SafeField(el, "layoutSuspendCount"));
-			sb.Append(" treeNull=").Append(SafeField(el, "elementTree") == "null" ? "Y" : "n");
-			sb.Append(" measQ?=").Append(SafeField(el, "layoutManager") == "null" ? "noMgr" : "mgr").Append(']');
-			object? kids = el.GetType().GetProperty("Children")?.GetValue(el);
-			System.Collections.IEnumerator? en = (kids as System.Collections.IEnumerable)?.GetEnumerator();
-			int i = 0;
-			while (en is not null && en.MoveNext() && i < 6) { WalkLayoutGate(en.Current, depth + 1, sb); i++; }
+			sb.Append('[').Append(depth).Append(' ')
+				.Append(el.GetType().Name);
+			sb.Append(" state=").Append(SafeField(el, "state")).Append(" susp=")
+				.Append(SafeField(el, "layoutSuspendCount"));
+			sb.Append(" treeNull=").Append((SafeField(el, "elementTree") == "null") ? "Y" : "n");
+			sb.Append(" measQ?=").Append((SafeField(el, "layoutManager") == "null") ? "noMgr" : "mgr").Append(']');
+			object obj = el.GetType().GetProperty("Children")?.GetValue(el);
+			IEnumerator enumerator = (obj as IEnumerable)?.GetEnumerator();
+			int num = 0;
+			while (enumerator != null && enumerator.MoveNext() && num < 6)
+			{
+				WalkLayoutGate(enumerator.Current, depth + 1, sb);
+				num++;
+			}
 		}
-		catch { sb.Append("[ERR]"); }
+		catch
+		{
+			sb.Append("[ERR]");
+		}
 	}
 
-
-	private static readonly System.Collections.Generic.List<object> s_paintHooks = new();
-
-	// Paint-attribution probe: records each grid element's paint inputs
-	// (layoutOffset, Transform DX/DY, BoundingRectangle) and subscribes
-	// ElementPainted to learn which elements actually execute paint.
 	private static void ProbeGridPaint(System.Windows.Forms.Control c)
 	{
 		try
 		{
-			object? table = c.GetType().GetProperty("TableElement")?.GetValue(c);
-			var sb = new System.Text.StringBuilder();
+			object el = c.GetType().GetProperty("TableElement")?.GetValue(c);
+			StringBuilder stringBuilder = new StringBuilder();
 			s_gridTreeBudget = 0;
-			WalkPaintProbe(table, 0, sb, c.Name ?? "?");
-			Console.WriteLine($"[GRID-PAINT] {c.GetType().Name} '{c.Name}' {sb}");
+			WalkPaintProbe(el, 0, stringBuilder, c.Name ?? "?");
+			Console.WriteLine($"[GRID-PAINT] {c.GetType().Name} '{c.Name}' {stringBuilder}");
 		}
-		catch (System.Exception ex) { Console.WriteLine($"[GRID-PAINT] ERR {ex.GetType().Name}"); }
+		catch (Exception ex)
+		{
+			Console.WriteLine("[GRID-PAINT] ERR " + ex.GetType().Name);
+		}
 	}
 
-	private static void WalkPaintProbe(object? el, int depth, System.Text.StringBuilder sb, string grid)
+	private static void WalkPaintProbe(object? el, int depth, StringBuilder sb, string grid)
 	{
-		if (el is null || depth > 6 || s_gridTreeBudget > 140) return;
+		if (el == null || depth > 6 || s_gridTreeBudget > 140)
+		{
+			return;
+		}
 		s_gridTreeBudget++;
 		try
 		{
 			string tn = el.GetType().Name;
-			sb.Append('[').Append(depth).Append(' ').Append(tn);
+			sb.Append('[').Append(depth).Append(' ')
+				.Append(tn);
 			sb.Append(" off=").Append(SafeField(el, "layoutOffset"));
-				object? tr = null;
-				try { tr = el.GetType().GetProperty("Transform")?.GetValue(el); } catch { }
-				sb.Append(" dx=").Append(tr is null ? "?" : SafeProp(tr, "DX")).Append(" dy=").Append(tr is null ? "?" : SafeProp(tr, "DY"));
+			object obj = null;
+			try
+			{
+				obj = el.GetType().GetProperty("Transform")?.GetValue(el);
+			}
+			catch
+			{
+			}
+			sb.Append(" dx=").Append((obj == null) ? "?" : SafeProp(obj, "DX")).Append(" dy=")
+				.Append((obj == null) ? "?" : SafeProp(obj, "DY"));
 			sb.Append(" bbox=").Append(SafeProp(el, "BoundingRectangle"));
 			sb.Append(" cbbox=").Append(SafeProp(el, "ControlBoundingRectangle"));
 			sb.Append(" clip=").Append(SafeProp(el, "ClipDrawing")).Append(']');
 			try
 			{
-				var evt = el.GetType().GetEvent("ElementPainted");
-				if (evt is not null)
+				EventInfo eventInfo = el.GetType().GetEvent("ElementPainted");
+				if ((object)eventInfo != null)
 				{
-					System.Windows.Forms.PaintEventHandler h = (s, e) =>
+					System.Windows.Forms.PaintEventHandler paintEventHandler = (object? s, System.Windows.Forms.PaintEventArgs e) =>
 					{
-						if (!PaintDiagnosticsEnabled) return;
-					try { Console.WriteLine($"[GRID-PAINTED] {grid} {tn} clip={e.ClipRectangle}"); } catch { }
+						if (!PaintDiagnosticsEnabled)
+						{
+							return;
+						}
+						try
+						{
+							Console.WriteLine($"[GRID-PAINTED] {grid} {tn} clip={e.ClipRectangle}");
+						}
+						catch
+						{
+						}
 					};
-					evt.AddEventHandler(el, h);
-					s_paintHooks.Add(h);
+					eventInfo.AddEventHandler(el, paintEventHandler);
+					s_paintHooks.Add(paintEventHandler);
 				}
 			}
-			catch { }
-			object? kids = el.GetType().GetProperty("Children")?.GetValue(el);
-			System.Collections.IEnumerator? en = (kids as System.Collections.IEnumerable)?.GetEnumerator();
-			int limit = depth >= 4 ? 2 : 99;
-			int ci = 0;
-			while (en is not null && en.MoveNext() && ci < limit)
+			catch
+			{
+			}
+			object obj4 = el.GetType().GetProperty("Children")?.GetValue(el);
+			IEnumerator enumerator = (obj4 as IEnumerable)?.GetEnumerator();
+			int num = ((depth >= 4) ? 2 : 99);
+			int num2 = 0;
+			while (enumerator != null && enumerator.MoveNext() && num2 < num)
 			{
 				try
 				{
-					var spc = el.GetType().GetMethod("ShouldPaintChild", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
-					object? verdict = spc?.Invoke(el, new object?[] { en.Current });
-					sb.Append("{spc:").Append(en.Current?.GetType().Name).Append('=').Append(verdict).Append('}');
+					object value = el.GetType().GetMethod("ShouldPaintChild", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.Invoke(el, new object[1] { enumerator.Current });
+					sb.Append("{spc:").Append(enumerator.Current?.GetType().Name).Append('=')
+						.Append(value)
+						.Append('}');
 				}
-				catch { }
-				WalkPaintProbe(en.Current, depth + 1, sb, grid);
-				ci++;
+				catch
+				{
+				}
+				WalkPaintProbe(enumerator.Current, depth + 1, sb, grid);
+				num2++;
 			}
 		}
-		catch { sb.Append("[ERR]"); }
+		catch
+		{
+			sb.Append("[ERR]");
+		}
 	}
 
-
-	// Dock/tab text probe: distinguishes empty tab data (binding gap)
-	// from present-but-unpainted text (paint gap) for the missing
-	// Projects/Bugs/Features/Details/General captions.
 	internal static void DumpDockTabText(System.Windows.Forms.Control root)
 	{
 		try
 		{
-			var sb = new System.Text.StringBuilder();
-			WalkDockTabs(root, 0, sb);
-			Console.WriteLine($"[DOCK-TABS] {sb}");
+			StringBuilder stringBuilder = new StringBuilder();
+			WalkDockTabs(root, 0, stringBuilder);
+			Console.WriteLine($"[DOCK-TABS] {stringBuilder}");
 		}
-		catch (System.Exception ex) { Console.WriteLine($"[DOCK-TABS] ERR {ex.GetType().Name}"); }
+		catch (Exception ex)
+		{
+			Console.WriteLine("[DOCK-TABS] ERR " + ex.GetType().Name);
+		}
 	}
 
-	private static void WalkDockTabs(object? o, int depth, System.Text.StringBuilder sb)
+	private static void WalkDockTabs(object? o, int depth, StringBuilder sb)
 	{
-		if (o is null || depth > 6 || sb.Length > 6000) return;
+		if (o == null || depth > 6 || sb.Length > 6000)
+		{
+			return;
+		}
 		try
 		{
-			string tn = o.GetType().Name;
-			if (tn == "DocumentTabStrip" || tn == "TabStripPanel")
+			string name = o.GetType().Name;
+			if (name == "DocumentTabStrip" || name == "TabStripPanel")
 			{
 				try
 				{
-					object? se = o.GetType().GetProperty("TabStripElement")?.GetValue(o);
-					var lsb = new System.Text.StringBuilder(); lsb.Append("{stripel:").Append(se?.GetType().Name);
-					object? items = se?.GetType().GetProperty("Items")?.GetValue(se);
-					System.Collections.IEnumerator? en = (items as System.Collections.IEnumerable)?.GetEnumerator();
-					int ii = 0;
-					while (en is not null && en.MoveNext() && ii < 6)
+					object obj = o.GetType().GetProperty("TabStripElement")?.GetValue(o);
+					StringBuilder stringBuilder = new StringBuilder();
+					stringBuilder.Append("{stripel:").Append(obj?.GetType().Name);
+					object obj2 = obj?.GetType().GetProperty("Items")?.GetValue(obj);
+					IEnumerator enumerator = (obj2 as IEnumerable)?.GetEnumerator();
+					int num = 0;
+					while (enumerator != null && enumerator.MoveNext() && num < 6)
 					{
-						lsb.Append("[itm:").Append(SafeProp(en.Current, "Text")).Append("/sel=").Append(SafeProp(en.Current, "IsSelected")).Append("/vis=").Append(SafeProp(en.Current, "Visibility")).Append("/b=").Append(SafeProp(en.Current, "Bounds"));
-						lsb.Append("/st:").Append(SafeProp(en.Current, "DrawFill")).Append(",").Append(SafeProp(en.Current, "DrawText")).Append(",").Append(SafeProp(en.Current, "DrawBorder"));
-						lsb.Append("/c:").Append(SafeProp(en.Current, "BackColor")).Append(",").Append(SafeProp(en.Current, "ForeColor")).Append(",").Append(SafeProp(en.Current, "Font"));
-						lsb.Append("/g:").Append(SafeProp(en.Current, "BackColor2")).Append(",").Append(SafeProp(en.Current, "BackColor3")).Append(",").Append(SafeProp(en.Current, "BackColor4")).Append(",").Append(SafeProp(en.Current, "GradientStyle")).Append(",").Append(SafeProp(en.Current, "NumberOfColors"));
-						lsb.Append("/th:").Append(SafeProp(en.Current, "ThemeRole")).Append(",").Append(SafeProp(en.Current, "ThemeEffectiveType")).Append(",").Append(SafeProp(en.Current, "ElementState"));
-						lsb.Append("/kids").Append(ChildCount(en.Current)).Append(':');
+						stringBuilder.Append("[itm:").Append(SafeProp(enumerator.Current, "Text")).Append("/sel=")
+							.Append(SafeProp(enumerator.Current, "IsSelected"))
+							.Append("/vis=")
+							.Append(SafeProp(enumerator.Current, "Visibility"))
+							.Append("/b=")
+							.Append(SafeProp(enumerator.Current, "Bounds"));
+						stringBuilder.Append("/st:").Append(SafeProp(enumerator.Current, "DrawFill")).Append(",")
+							.Append(SafeProp(enumerator.Current, "DrawText"))
+							.Append(",")
+							.Append(SafeProp(enumerator.Current, "DrawBorder"));
+						stringBuilder.Append("/c:").Append(SafeProp(enumerator.Current, "BackColor")).Append(",")
+							.Append(SafeProp(enumerator.Current, "ForeColor"))
+							.Append(",")
+							.Append(SafeProp(enumerator.Current, "Font"));
+						stringBuilder.Append("/g:").Append(SafeProp(enumerator.Current, "BackColor2")).Append(",")
+							.Append(SafeProp(enumerator.Current, "BackColor3"))
+							.Append(",")
+							.Append(SafeProp(enumerator.Current, "BackColor4"))
+							.Append(",")
+							.Append(SafeProp(enumerator.Current, "GradientStyle"))
+							.Append(",")
+							.Append(SafeProp(enumerator.Current, "NumberOfColors"));
+						stringBuilder.Append("/th:").Append(SafeProp(enumerator.Current, "ThemeRole")).Append(",")
+							.Append(SafeProp(enumerator.Current, "ThemeEffectiveType"))
+							.Append(",")
+							.Append(SafeProp(enumerator.Current, "ElementState"));
+						stringBuilder.Append("/kids").Append(ChildCount(enumerator.Current)).Append(':');
 						try
 						{
-							object? ik = en.Current?.GetType().GetProperty("Children")?.GetValue(en.Current);
-							System.Collections.IEnumerator? ien = (ik as System.Collections.IEnumerable)?.GetEnumerator();
-							int ikn = 0;
-							while (ien is not null && ien.MoveNext() && ikn < 6)
+							object obj3 = enumerator.Current?.GetType().GetProperty("Children")?.GetValue(enumerator.Current);
+							IEnumerator enumerator2 = (obj3 as IEnumerable)?.GetEnumerator();
+							int num2 = 0;
+							while (enumerator2 != null && enumerator2.MoveNext() && num2 < 6)
 							{
-								lsb.Append(ien.Current?.GetType().Name).Append('(').Append(SafeProp(ien.Current, "Visibility")).Append(',').Append(SafeProp(ien.Current, "BackColor")).Append(',').Append(SafeProp(ien.Current, "Bounds")).Append(");");
-								ikn++;
+								stringBuilder.Append(enumerator2.Current?.GetType().Name).Append('(').Append(SafeProp(enumerator2.Current, "Visibility"))
+									.Append(',')
+									.Append(SafeProp(enumerator2.Current, "BackColor"))
+									.Append(',')
+									.Append(SafeProp(enumerator2.Current, "Bounds"))
+									.Append(");");
+								num2++;
 							}
 						}
-						catch { lsb.Append("kERR;"); }
+						catch
+						{
+							stringBuilder.Append("kERR;");
+						}
 						try
 						{
-							object? bgs = en.Current?.GetType().GetProperty("BackgroundShape")?.GetValue(en.Current);
-							lsb.Append("/bg:").Append(bgs?.GetType().Name ?? "null");
-							object? bgi = bgs?.GetType().GetProperty("Image")?.GetValue(bgs);
-							if (bgi is System.Drawing.Image bmi)
+							object obj5 = enumerator.Current?.GetType().GetProperty("BackgroundShape")?.GetValue(enumerator.Current);
+							stringBuilder.Append("/bg:").Append(obj5?.GetType().Name ?? "null");
+							object obj6 = obj5?.GetType().GetProperty("Image")?.GetValue(obj5);
+							if (obj6 is Image image)
 							{
-								lsb.Append(',').Append(bmi.Width).Append('x').Append(bmi.Height);
-								try { lsb.Append(',').Append((bmi as System.Drawing.Bitmap)?.GetPixel(0, 0).ToString() ?? "nopx"); }
-								catch { lsb.Append(",pxERR"); }
+								stringBuilder.Append(',').Append(image.Width).Append('x')
+									.Append(image.Height);
+								try
+								{
+									stringBuilder.Append(',').Append((image as Bitmap)?.GetPixel(0, 0).ToString() ?? "nopx");
+								}
+								catch
+								{
+									stringBuilder.Append(",pxERR");
+								}
 							}
-							else lsb.Append(",noimg");
-							lsb.Append(',').Append(SafeProp(en.Current, "BackgroundShapePaintMode"));
+							else
+							{
+								stringBuilder.Append(",noimg");
+							}
+							stringBuilder.Append(',').Append(SafeProp(enumerator.Current, "BackgroundShapePaintMode"));
 						}
-						catch { lsb.Append("/bg:ERR"); }
+						catch
+						{
+							stringBuilder.Append("/bg:ERR");
+						}
 						try
 						{
-							Type? tt = en.Current?.GetType();
-							System.Reflection.Assembly? coreAsm = null;
-							while (tt != null) { if (tt.Assembly.GetName().Name == "Telerik.WinControls") { coreAsm = tt.Assembly; break; } tt = tt.BaseType; }
-							lsb.Append("/theme:core=").Append(coreAsm == null ? "null" : "ok");
-							Type? trs = coreAsm?.GetType("Telerik.WinControls.ThemeResolutionService");
-							lsb.Append(",trs=").Append(trs == null ? "null" : "ok");
-							object? theme = trs?.GetMethod("GetTheme", new Type[] { typeof(string) })?.Invoke(null, new object[] { "TelerikMetro" });
-							lsb.Append(",theme=").Append(theme == null ? "null" : theme.GetType().Name);
-							object? selrepo = theme?.GetType().GetMethod("FindRepository", new Type[] { typeof(string) })?.Invoke(theme, new object[] { "PageViewItemSelectedImageShape" });
-							lsb.Append(",selrepo=").Append(selrepo == null ? "null" : "ok");
-							object? bgset = selrepo?.GetType().GetMethod("FindSetting", new Type[] { typeof(string) })?.Invoke(selrepo, new object[] { "BackgroundShape" });
-							lsb.Append(",set=").Append(bgset == null ? "null" : "ok");
-							object? bgval = bgset?.GetType().GetProperty("Value")?.GetValue(bgset);
-							lsb.Append(",val=").Append(bgval == null ? "null" : bgval.GetType().Name);
-							if (bgval != null)
+							Type type = enumerator.Current?.GetType();
+							Assembly assembly = null;
+							while (type != null)
 							{
-								object? thimg = bgval.GetType().GetProperty("Image")?.GetValue(bgval);
-								if (thimg is System.Drawing.Image tbi) { lsb.Append(",img=").Append(tbi.Width).Append('x').Append(tbi.Height); try { lsb.Append(',').Append((tbi as System.Drawing.Bitmap)?.GetPixel(0, 0).ToString() ?? "nopx"); } catch { lsb.Append(",pxERR"); } }
-								else lsb.Append(",imgnull");
+								if (type.Assembly.GetName().Name == "Telerik.WinControls")
+								{
+									assembly = type.Assembly;
+									break;
+								}
+								type = type.BaseType;
+							}
+							stringBuilder.Append("/theme:core=").Append((assembly == null) ? "null" : "ok");
+							Type type2 = assembly?.GetType("Telerik.WinControls.ThemeResolutionService");
+							stringBuilder.Append(",trs=").Append((type2 == null) ? "null" : "ok");
+							object obj9 = type2?.GetMethod("GetTheme", new Type[1] { typeof(string) })?.Invoke(null, new object[1] { "TelerikMetro" });
+							stringBuilder.Append(",theme=").Append((obj9 == null) ? "null" : obj9.GetType().Name);
+							object obj10 = obj9?.GetType().GetMethod("FindRepository", new Type[1] { typeof(string) })?.Invoke(obj9, new object[1] { "PageViewItemSelectedImageShape" });
+							stringBuilder.Append(",selrepo=").Append((obj10 == null) ? "null" : "ok");
+							object obj11 = obj10?.GetType().GetMethod("FindSetting", new Type[1] { typeof(string) })?.Invoke(obj10, new object[1] { "BackgroundShape" });
+							stringBuilder.Append(",set=").Append((obj11 == null) ? "null" : "ok");
+							object obj12 = obj11?.GetType().GetProperty("Value")?.GetValue(obj11);
+							stringBuilder.Append(",val=").Append((obj12 == null) ? "null" : obj12.GetType().Name);
+							if (obj12 != null)
+							{
+								object obj13 = obj12.GetType().GetProperty("Image")?.GetValue(obj12);
+								if (obj13 is Image image2)
+								{
+									stringBuilder.Append(",img=").Append(image2.Width).Append('x')
+										.Append(image2.Height);
+									try
+									{
+										stringBuilder.Append(',').Append((image2 as Bitmap)?.GetPixel(0, 0).ToString() ?? "nopx");
+									}
+									catch
+									{
+										stringBuilder.Append(",pxERR");
+									}
+								}
+								else
+								{
+									stringBuilder.Append(",imgnull");
+								}
 							}
 						}
-						catch (Exception tex) { lsb.Append("/theme:ERR-").Append(tex.GetType().Name); }
+						catch (Exception ex)
+						{
+							stringBuilder.Append("/theme:ERR-").Append(ex.GetType().Name);
+						}
+						try
+						{
+							Type type3 = enumerator.Current?.GetType();
+							Assembly assembly2 = null;
+							while (type3 != null)
+							{
+								if (type3.Assembly.GetName().Name == "Telerik.WinControls")
+								{
+									assembly2 = type3.Assembly;
+									break;
+								}
+								type3 = type3.BaseType;
+							}
+							if (assembly2 != null)
+							{
+								stringBuilder.Append("/gt:");
+								string[] array = new string[3] { "Telerik.WinControls.RadImageShape", "Telerik.WinControls.RadImageShape, Telerik.WinControls", "Telerik.WinControls.RadImageShape, Telerik.WinControls, Version=2026.3.1008.462, Culture=neutral, PublicKeyToken=5bb2a467cbec794e" };
+								for (int i = 0; i < array.Length; i++)
+								{
+									try
+									{
+										stringBuilder.Append((assembly2.GetType(array[i], throwOnError: false, ignoreCase: false) == null) ? "null;" : "ok;");
+									}
+									catch (Exception ex2)
+									{
+										stringBuilder.Append("EX-").Append(ex2.GetType().Name).Append(";");
+									}
+								}
+							}
+							else
+							{
+								stringBuilder.Append("/gt:nocore");
+							}
+						}
+						catch (Exception ex3)
+						{
+							stringBuilder.Append("/gt:ERR-").Append(ex3.GetType().Name);
+						}
+						stringBuilder.Append("]");
+						num++;
+					}
+					stringBuilder.Append("/stripkids").Append(ChildCount(obj)).Append(':');
 					try
 					{
-						Type? tt2 = en.Current?.GetType();
-						System.Reflection.Assembly? c2 = null;
-						while (tt2 != null) { if (tt2.Assembly.GetName().Name == "Telerik.WinControls") { c2 = tt2.Assembly; break; } tt2 = tt2.BaseType; }
-						if (c2 != null)
+						object obj15 = obj?.GetType().GetProperty("Children")?.GetValue(obj);
+						IEnumerator enumerator3 = (obj15 as IEnumerable)?.GetEnumerator();
+						int num3 = 0;
+						while (enumerator3 != null && enumerator3.MoveNext() && num3 < 10)
 						{
-							lsb.Append("/gt:");
-							string[] names = new string[] { "Telerik.WinControls.RadImageShape", "Telerik.WinControls.RadImageShape, Telerik.WinControls", "Telerik.WinControls.RadImageShape, Telerik.WinControls, Version=2026.3.1008.462, Culture=neutral, PublicKeyToken=5bb2a467cbec794e" };
-							for (int gi = 0; gi < names.Length; gi++) { try { lsb.Append(c2.GetType(names[gi], false, false) == null ? "null;" : "ok;"); } catch (Exception gex) { lsb.Append("EX-").Append(gex.GetType().Name).Append(";"); } }
+							stringBuilder.Append(enumerator3.Current?.GetType().Name).Append('(').Append(SafeProp(enumerator3.Current, "Visibility"))
+								.Append(',')
+								.Append(SafeProp(enumerator3.Current, "BackColor"))
+								.Append(',')
+								.Append(SafeProp(enumerator3.Current, "Bounds"))
+								.Append(");");
+							num3++;
 						}
-						else lsb.Append("/gt:nocore");
 					}
-					catch (Exception gex2) { lsb.Append("/gt:ERR-").Append(gex2.GetType().Name); }
-						lsb.Append("]");
-						ii++;
-					}
-					lsb.Append("/stripkids").Append(ChildCount(se)).Append(':');
-				try
-				{
-					object? sk = se?.GetType().GetProperty("Children")?.GetValue(se);
-					System.Collections.IEnumerator? sen = (sk as System.Collections.IEnumerable)?.GetEnumerator();
-					int skn = 0;
-					while (sen is not null && sen.MoveNext() && skn < 10)
+					catch
 					{
-						lsb.Append(sen.Current?.GetType().Name).Append('(').Append(SafeProp(sen.Current, "Visibility")).Append(',').Append(SafeProp(sen.Current, "BackColor")).Append(',').Append(SafeProp(sen.Current, "Bounds")).Append(");");
-						skn++;
+						stringBuilder.Append("skERR;");
 					}
+					stringBuilder.Append("}");
+					Console.WriteLine($"[DOCK-STRIP] {stringBuilder}");
 				}
-				catch { lsb.Append("skERR;"); }
-				lsb.Append("}");
-					Console.WriteLine($"[DOCK-STRIP] {lsb}");
+				catch (Exception ex4)
+				{
+					sb.Append("{stripelERR:").Append(ex4.GetType().Name).Append("}");
 				}
-				catch (System.Exception exx3) { sb.Append("{stripelERR:").Append(exx3.GetType().Name).Append("}"); }
 			}
-			if (o is System.Windows.Forms.Control cc && (tn.Contains("ToolWindow") || tn.Contains("DocumentWindow") || tn == "RadDock"))
+			if (o is System.Windows.Forms.Control control && (name.Contains("ToolWindow") || name.Contains("DocumentWindow") || name == "RadDock"))
 			{
-				sb.Append("{win:").Append(cc.Name).Append(" h=").Append(cc.IsHandleCreated).Append(" hwnd=").Append(cc.Handle.ToInt64());
+				sb.Append("{win:").Append(control.Name).Append(" h=")
+					.Append(control.IsHandleCreated)
+					.Append(" hwnd=")
+					.Append(((IntPtr)control.Handle).ToInt64());
 				try
 				{
-					var wt = cc.GetType().GetProperty("WindowText", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-					sb.Append(" wtxt=").Append(wt?.GetValue(cc) ?? "null");
-					string? raw = null;
-					for (System.Type? tt = cc.GetType(); tt is not null; tt = tt.BaseType)
+					PropertyInfo property = control.GetType().GetProperty("WindowText", BindingFlags.Instance | BindingFlags.NonPublic);
+					sb.Append(" wtxt=").Append(property?.GetValue(control) ?? "null");
+					string text = null;
+					Type type4 = control.GetType();
+					while ((object)type4 != null)
 					{
-						var f = tt.GetField("_text", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.DeclaredOnly);
-						if (f is not null) { raw = (string?)f.GetValue(cc); break; }
+						FieldInfo field = type4.GetField("_text", BindingFlags.DeclaredOnly | BindingFlags.Instance | BindingFlags.NonPublic);
+						if ((object)field != null)
+						{
+							text = (string)field.GetValue(control);
+							break;
+						}
+						type4 = type4.BaseType;
 					}
-					sb.Append(" _text=").Append(raw ?? "null");
+					sb.Append(" _text=").Append(text ?? "null");
 					try
 					{
-						var ct = typeof(System.Windows.Forms.Control);
-						var kf = ct.GetField("s_cacheTextCountProperty", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
-						var props = ct.GetProperty("Properties", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.GetValue(cc);
-						var get = props?.GetType().GetMethod("GetValueOrDefault", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
-						var gm = get?.MakeGenericMethod(typeof(int));
-						object? cnt = gm?.Invoke(props, new object?[] { kf?.GetValue(null), 0 });
-						sb.Append(" ctc=").Append(cnt);
-						var cti = ct.GetProperty("CacheTextInternal", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.GetValue(cc);
-						sb.Append(" cti=").Append(cti);
+						Type typeFromHandle = typeof(System.Windows.Forms.Control);
+						FieldInfo field2 = typeFromHandle.GetField("s_cacheTextCountProperty", BindingFlags.Static | BindingFlags.NonPublic);
+						object obj17 = typeFromHandle.GetProperty("Properties", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(control);
+						object value = ((obj17?.GetType().GetMethod("GetValueOrDefault", BindingFlags.Instance | BindingFlags.Public))?.MakeGenericMethod(typeof(int)))?.Invoke(obj17, new object[2]
+						{
+							field2?.GetValue(null),
+							0
+						});
+						sb.Append(" ctc=").Append(value);
+						object value2 = typeFromHandle.GetProperty("CacheTextInternal", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(control);
+						sb.Append(" cti=").Append(value2);
 					}
-					catch (System.Exception exx2) { sb.Append(" ctcERR=").Append(exx2.GetType().Name); }
+					catch (Exception ex5)
+					{
+						sb.Append(" ctcERR=").Append(ex5.GetType().Name);
+					}
 				}
-				catch (System.Exception exx) { sb.Append(" winERR=").Append(exx.GetType().Name); }
+				catch (Exception ex6)
+				{
+					sb.Append(" winERR=").Append(ex6.GetType().Name);
+				}
 				sb.Append('}');
 			}
-			if (tn.Contains("TabStrip") || tn.Contains("DockWindow") || tn.Contains("SplitContainer") || tn.Contains("TabItem") || tn.Contains("DocumentTabStrip") || tn.Contains("ToolWindow") || tn == "RadDock" || tn == "TabPanel" || tn == "DockWindowCollection" || tn == "CaptionElement" || tn.Contains("Caption") || tn.Contains("PageViewStrip"))
+			if (!name.Contains("TabStrip") && !name.Contains("DockWindow") && !name.Contains("SplitContainer") && !name.Contains("TabItem") && !name.Contains("DocumentTabStrip") && !name.Contains("ToolWindow"))
 			{
-				sb.Append('[').Append(depth).Append(' ').Append(tn);
-				sb.Append(" txt=").Append(SafeProp(o, "Text")).Append(" cap=").Append(SafeProp(o, "Caption"));
-				sb.Append(" vis=").Append(SafeProp(o, "Visibility")).Append((char)93);
-				try
+				switch (name)
 				{
-					foreach (var prop in o.GetType().GetProperties())
-					{
-						string pn = prop.Name;
-						if (!pn.Contains("Text") && !pn.Contains("Title") && !pn.Contains("Caption") && !pn.Contains("Item") && !pn.Contains("Panel") && !pn.Contains("Strip") && !pn.Contains("Window") && !pn.Contains("Associated")) continue;
-						if (prop.GetIndexParameters().Length > 0) continue;
-						object? v = null;
-						try { v = prop.GetValue(o); } catch { continue; }
-						if (v is string s) { sb.Append(pn).Append('=').Append(s.Length > 40 ? s.Substring(0, 40) : s).Append(';'); }
-						else if (v is System.Collections.IEnumerable e && v is not string)
-						{
-							int n = 0; var ie = e.GetEnumerator();
-							sb.Append(pn).Append(':');
-							while (n < 6 && ie.MoveNext()) { sb.Append(SafeProp(ie.Current, "Text")).Append('/').Append(SafeProp(ie.Current, "Title")).Append(','); n++; }
-							sb.Append(';');
-						}
-						else if (v is not null) { sb.Append(pn).Append('=').Append(v.GetType().Name).Append(';'); }
-					}
+				case "RadDock":
+				case "TabPanel":
+				case "DockWindowCollection":
+				case "CaptionElement":
+					goto IL_0f51;
 				}
-				catch { }
+				if (!name.Contains("Caption") && !name.Contains("PageViewStrip"))
+				{
+					goto IL_11e6;
+				}
 			}
-			if (o is System.Windows.Forms.Control c)
-				foreach (System.Windows.Forms.Control k in c.Controls) WalkDockTabs(k, depth + 1, sb);
+			goto IL_0f51;
+			IL_0f51:
+			sb.Append('[').Append(depth).Append(' ')
+				.Append(name);
+			sb.Append(" txt=").Append(SafeProp(o, "Text")).Append(" cap=")
+				.Append(SafeProp(o, "Caption"));
+			sb.Append(" vis=").Append(SafeProp(o, "Visibility")).Append(']');
 			try
 			{
-				object? kids = o.GetType().GetProperty("Children")?.GetValue(o);
-				System.Collections.IEnumerator? en2 = (kids as System.Collections.IEnumerable)?.GetEnumerator();
-				while (en2 is not null && en2.MoveNext()) WalkDockTabs(en2.Current, depth + 1, sb);
+				PropertyInfo[] properties = o.GetType().GetProperties();
+				foreach (PropertyInfo propertyInfo in properties)
+				{
+					string name2 = propertyInfo.Name;
+					if ((!name2.Contains("Text") && !name2.Contains("Title") && !name2.Contains("Caption") && !name2.Contains("Item") && !name2.Contains("Panel") && !name2.Contains("Strip") && !name2.Contains("Window") && !name2.Contains("Associated")) || propertyInfo.GetIndexParameters().Length != 0)
+					{
+						continue;
+					}
+					object obj18 = null;
+					try
+					{
+						obj18 = propertyInfo.GetValue(o);
+					}
+					catch
+					{
+						continue;
+					}
+					if (obj18 is string text2)
+					{
+						sb.Append(name2).Append('=').Append((text2.Length > 40) ? text2.Substring(0, 40) : text2)
+							.Append(';');
+					}
+					else if (obj18 is IEnumerable enumerable && !(obj18 is string))
+					{
+						int k = 0;
+						IEnumerator enumerator4 = enumerable.GetEnumerator();
+						sb.Append(name2).Append(':');
+						for (; k < 6; k++)
+						{
+							if (!enumerator4.MoveNext())
+							{
+								break;
+							}
+							sb.Append(SafeProp(enumerator4.Current, "Text")).Append('/').Append(SafeProp(enumerator4.Current, "Title"))
+								.Append(',');
+						}
+						sb.Append(';');
+					}
+					else if (obj18 != null)
+					{
+						sb.Append(name2).Append('=').Append(obj18.GetType().Name)
+							.Append(';');
+					}
+				}
 			}
-			catch { }
+			catch
+			{
+			}
+			goto IL_11e6;
+			IL_11e6:
+			if (o is System.Windows.Forms.Control control2)
+			{
+				foreach (System.Windows.Forms.Control control3 in control2.Controls)
+				{
+					WalkDockTabs(control3, depth + 1, sb);
+				}
+			}
+			try
+			{
+				object obj21 = o.GetType().GetProperty("Children")?.GetValue(o);
+				IEnumerator enumerator6 = (obj21 as IEnumerable)?.GetEnumerator();
+				while (enumerator6 != null && enumerator6.MoveNext())
+				{
+					WalkDockTabs(enumerator6.Current, depth + 1, sb);
+				}
+			}
+			catch
+			{
+			}
 		}
-		catch { }
+		catch
+		{
+		}
 	}
+
 	private static object? FirstVisualChild(object? element)
 	{
 		try
 		{
-			object? kids = element?.GetType().GetProperty("Children")?.GetValue(element);
-			System.Collections.IEnumerator? en = (kids as System.Collections.IEnumerable)?.GetEnumerator();
-			if (en is not null && en.MoveNext()) return en.Current;
-		} catch { }
+			object obj = element?.GetType().GetProperty("Children")?.GetValue(element);
+			IEnumerator enumerator = (obj as IEnumerable)?.GetEnumerator();
+			if (enumerator != null && enumerator.MoveNext())
+			{
+				return enumerator.Current;
+			}
+		}
+		catch
+		{
+		}
 		return null;
 	}
 
-	private static void DescribeVisual(object? element, string tag, System.Text.StringBuilder sb)
+	private static void DescribeVisual(object? element, string tag, StringBuilder sb)
 	{
-		if (element is null) { sb.Append(tag).Append("=null;"); return; }
+		if (element == null)
+		{
+			sb.Append(tag).Append("=null;");
+			return;
+		}
 		sb.Append(tag).Append('[');
 		try
 		{
-			foreach (var prop in element.GetType().GetProperties())
+			PropertyInfo[] properties = element.GetType().GetProperties();
+			foreach (PropertyInfo propertyInfo in properties)
 			{
-				string pn = prop.Name;
-				if (pn != "Size" && pn != "Location" && pn != "Bounds" && pn != "Visible" && pn != "Visibility") continue;
-				object? v = null;
-				try { v = prop.GetValue(element); } catch { continue; }
-				sb.Append(pn).Append('=').Append(v).Append(';');
+				string name = propertyInfo.Name;
+				if (!(name != "Size") || !(name != "Location") || !(name != "Bounds") || !(name != "Visible") || !(name != "Visibility"))
+				{
+					object obj = null;
+					try
+					{
+						obj = propertyInfo.GetValue(element);
+					}
+					catch
+					{
+						continue;
+					}
+					sb.Append(name).Append('=').Append(obj)
+						.Append(';');
+				}
 			}
-			object? kids2 = element.GetType().GetProperty("Children")?.GetValue(element);
-			int cc = (int?)kids2?.GetType().GetProperty("Count")?.GetValue(kids2) ?? -1;
-			sb.Append("kids=").Append(cc).Append(';');
+			object obj3 = element.GetType().GetProperty("Children")?.GetValue(element);
+			int value = ((int?)obj3?.GetType().GetProperty("Count")?.GetValue(obj3)) ?? (-1);
+			sb.Append("kids=").Append(value).Append(';');
 		}
-		catch (System.Exception ex) { sb.Append("ERR ").Append(ex.GetType().Name); }
+		catch (Exception ex)
+		{
+			sb.Append("ERR ").Append(ex.GetType().Name);
+		}
 		sb.Append("];");
 	}
 
@@ -2578,49 +3440,51 @@ public sealed class WinFormsAppHost : IDisposable
 				Console.WriteLine($"{value}   [Item] {item.GetType().Name} '{item.Name}' Text='{item.Text}' Bounds={item.Bounds} Visible={item.Visible}");
 			}
 		}
-		// Palette wells diagnosis (read-only): palette controls expose
-		// Colors; reporting the count makes empty-vs-transparent
-		// decidable from the tree dump.
 		try
 		{
-			object? colors = c.GetType().GetProperty("Colors")?.GetValue(c);
-			int n = (int?)colors?.GetType().GetProperty("Count")?.GetValue(colors) ?? -1;
-			if (n >= 0)
-				Console.WriteLine($"{value}  [Colors] Count={n}");
+			object obj = c.GetType().GetProperty("Colors")?.GetValue(c);
+			int num = ((int?)obj?.GetType().GetProperty("Count")?.GetValue(obj)) ?? (-1);
+			if (num >= 0)
+			{
+				Console.WriteLine($"{value}  [Colors] Count={num}");
+			}
 		}
-		catch { }
+		catch
+		{
+		}
 		foreach (System.Windows.Forms.Control control in c.Controls)
 		{
 			DumpControlTree(control, indent + 1);
 		}
 	}
 
-	// Host caption: 30px for captioned forms, none for borderless or
-	// custom-chrome ones (FormBorderStyle.None, RadForm). The fork seeds
-	// emulated GWL_STYLE from CreateParams at handle creation, so the
-	// WS_CAPTION bit is a truthful signal next to the managed property.
-	// Telerik RadForm/RadRibbonForm/ShapedForm keep WS_CAPTION in style but
-	// suppress the non-client area via NCCALCSIZE (native client fills the
-	// window); the style bit cannot see that, so detect the custom-chrome
-	// family by base-type name (BugTracker native parity: no host caption).
 	internal static int ChromeHeight(System.Windows.Forms.Form form)
 	{
 		if (form.FormBorderStyle == System.Windows.Forms.FormBorderStyle.None)
-			return 0;
-		for (System.Type? t = form.GetType(); t is not null; t = t.BaseType)
 		{
-			string tn = t.Name;
-			if (tn.Contains("RadForm", System.StringComparison.Ordinal)
-				|| tn.Contains("ShapedForm", System.StringComparison.Ordinal))
+			return 0;
+		}
+		Type type = form.GetType();
+		while ((object)type != null)
+		{
+			string name = type.Name;
+			if (name.Contains("RadForm", StringComparison.Ordinal) || name.Contains("ShapedForm", StringComparison.Ordinal))
+			{
 				return 0;
-			if (tn == "Form")
+			}
+			if (name == "Form")
+			{
 				break;
+			}
+			type = type.BaseType;
 		}
 		try
 		{
-			int style = System.Windows.Forms.WasmWindowLongs.GetWindowStyle(form.Handle);
-			if (style != 0 && (style & 0x00C00000) != 0x00C00000)
+			int windowStyle = WasmWindowLongs.GetWindowStyle(form.Handle);
+			if (windowStyle != 0 && (windowStyle & 0xC00000) != 12582912)
+			{
 				return 0;
+			}
 		}
 		catch
 		{
@@ -2631,65 +3495,46 @@ public sealed class WinFormsAppHost : IDisposable
 	public void Paint(ICanvas canvas)
 	{
 		ArgumentNullException.ThrowIfNull(canvas, "canvas");
-		// Drain posted layout work first (desktop drains BeginInvoke
-		// posts on the message loop before painting); layout invalidates
-		// as it runs, and the drain below collects those marks for this
-		// same frame.
-		// Perf item 4 S5 split: time the layout drain separately so the
-		// frame sample can tell layout cost (drainS) from raster cost
-		// (recS minus drainS). One bool read when the timeline is off.
-		bool perfDrain = System.Windows.Forms.WasmFrameCounters.PerfEnabled;
-		long tDrain0 = perfDrain ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-		int layoutDrained = System.Windows.Forms.WasmLayoutQueue.Drain();
-		long layoutTicks = perfDrain ? System.Diagnostics.Stopwatch.GetTimestamp() - tDrain0 : 0;
-		if (layoutDrained > 0)
+		bool perfEnabled = WasmFrameCounters.PerfEnabled;
+		long num = (perfEnabled ? Stopwatch.GetTimestamp() : 0);
+		int num2 = WasmLayoutQueue.Drain();
+		long num3 = (perfEnabled ? (Stopwatch.GetTimestamp() - num) : 0);
+		if (num2 > 0)
 		{
-			// Throttled: first 3 drains, then at most one line per 5 s,
-			// plus on any drain where the lifetime fault count moved.
-			// A layout callback faulting per frame (TPF reposts after
-			// exceptions) must stay visible without flooding frames,
-			// and post-boot layout activity must not go silent the way
-			// a pure count throttle hid it (rev60 ZZ investigation).
-			int layoutLog = System.Threading.Interlocked.Increment(ref s_layoutLogCount);
-			long faulted = System.Windows.Forms.WasmLayoutQueue.TotalFaulted;
-			long nowTick = Environment.TickCount64;
-			if (layoutLog <= 3 || faulted != s_layoutFaultedSeen || nowTick - s_layoutLogTick >= 5000)
+			int num4 = Interlocked.Increment(ref s_layoutLogCount);
+			long totalFaulted = WasmLayoutQueue.TotalFaulted;
+			long tickCount = Environment.TickCount64;
+			if (num4 <= 3 || totalFaulted != s_layoutFaultedSeen || tickCount - s_layoutLogTick >= 5000)
 			{
-				s_layoutFaultedSeen = faulted;
-				s_layoutLogTick = nowTick;
-				Console.WriteLine($"[LayoutQueue] drained={layoutDrained} posted={System.Windows.Forms.WasmLayoutQueue.TotalPosted} drainedTotal={System.Windows.Forms.WasmLayoutQueue.TotalDrained} faulted={faulted} pending={System.Windows.Forms.WasmLayoutQueue.PendingCount}");
+				s_layoutFaultedSeen = totalFaulted;
+				s_layoutLogTick = tickCount;
+				Console.WriteLine($"[LayoutQueue] drained={num2} posted={WasmLayoutQueue.TotalPosted} drainedTotal={WasmLayoutQueue.TotalDrained} faulted={totalFaulted} pending={WasmLayoutQueue.PendingCount}");
 			}
 		}
-		// Strict GPU mode (opt-in): fail closed before any drawing until a
-		// GPU render target exists. Capability detection arrives with the
-		// GPU backend; until then no target qualifies. Switch defaults off.
-		if (AppContext.TryGetSwitch("WfWasm.RequireGpuRendering", out bool requireGpu) && requireGpu)
-			throw new NotSupportedException("GPU rendering is required (WfWasm.RequireGpuRendering) but no GPU render target is available; the software target is rejected before painting.");
-		// Dirty-gated frame: drain once; a fully-idle frame (no app
-		// Invalidate, no host marking) emits nothing (RepaintAsync skips
-		// the interop round trip for empty command lists).
-		s_frameGlobal = System.Windows.Forms.WasmRepaintGate.DrainDirty(out var frameDirty);
-		s_frameDirty = frameDirty;
-		// Perf item 4 frame open (W-1): claim one fork frame seq,
-		// snapshot the dirty gate + pending input range, reset the
-		// per-frame counters. The empty early-return below still
-		// presents a consistent (empty) frame to the pump sample.
-		if (System.Windows.Forms.WasmFrameCounters.PerfEnabled)
+		if (AppContext.TryGetSwitch("WfWasm.RequireGpuRendering", out var isEnabled) & isEnabled)
 		{
-			System.Windows.Forms.WasmFrameCounters.ClaimFrame();
-			System.Windows.Forms.WasmFrameCounters.ResetFrame();
-			// The layout drain above runs before the frame reset, so its
-			// ticks are added back here (ResetFrame zeroes DrainTicks).
-			if (layoutTicks != 0)
-				System.Windows.Forms.WasmFrameCounters.AddDrainTicks(layoutTicks);
-			System.Windows.Forms.WasmFrameCounters.FrameGlobal = s_frameGlobal ? 1 : 0;
-			System.Windows.Forms.WasmFrameCounters.FrameDirtyCount = frameDirty.Count;
-			System.Windows.Forms.WasmFrameCounters.TakePending(out int perfCsFrom, out int perfCsTo);
-			System.Windows.Forms.WasmFrameCounters.CsFrom = perfCsFrom;
-			System.Windows.Forms.WasmFrameCounters.CsTo = perfCsTo;
-			System.Windows.Forms.WasmFrameCounters.TakeMarks();
+			throw new NotSupportedException("GPU rendering is required (WfWasm.RequireGpuRendering) but no GPU render target is available; the software target is rejected before painting.");
 		}
-		if (!s_frameGlobal && frameDirty.Count == 0)
+		s_frameGlobal = WasmRepaintGate.DrainDirty(out Dictionary<System.Windows.Forms.Control, Rectangle?> dirty);
+		PollGridScrollWatches();
+		s_rteScrollWatch.Poll();
+		s_frameDirty = dirty;
+		if (WasmFrameCounters.PerfEnabled)
+		{
+			WasmFrameCounters.ClaimFrame();
+			WasmFrameCounters.ResetFrame();
+			if (num3 != 0)
+			{
+				WasmFrameCounters.AddDrainTicks(num3);
+			}
+			WasmFrameCounters.FrameGlobal = (s_frameGlobal ? 1 : 0);
+			WasmFrameCounters.FrameDirtyCount = dirty.Count;
+			WasmFrameCounters.TakePending(out var from, out var to);
+			WasmFrameCounters.CsFrom = from;
+			WasmFrameCounters.CsTo = to;
+			WasmFrameCounters.TakeMarks();
+		}
+		if (!s_frameGlobal && dirty.Count == 0)
 		{
 			s_frameDirty = null;
 			s_frameGlobal = false;
@@ -2705,51 +3550,61 @@ public sealed class WinFormsAppHost : IDisposable
 			EmitRetain(canvas);
 			return;
 		}
-		int num = ChromeHeight(_activeForm);
+		int num5 = ChromeHeight(_activeForm);
 		int x = _activeForm.Location.X;
 		int y = _activeForm.Location.Y;
 		int width = _activeForm.Width;
 		int height = _activeForm.Height;
 		uint value = ToRgba(_activeForm.BackColor, 4042322175u);
-		int paintLog = System.Threading.Interlocked.Increment(ref s_paintLogCount);
-		if (PaintDiagnosticsEnabled && paintLog == 1 && _activeForm is not null)
+		int num6 = Interlocked.Increment(ref s_paintLogCount);
+		if (PaintDiagnosticsEnabled && num6 == 1 && _activeForm != null)
 		{
 			try
 			{
-				var chain = new System.Text.StringBuilder();
-				for (System.Type? t = _activeForm.GetType(); t is not null; t = t.BaseType) { chain.Append(t.Name).Append('/'); if (t.Name == "Form") break; }
-				Console.WriteLine($"[CHROME] type={_activeForm.GetType().FullName} chain={chain} border={_activeForm.FormBorderStyle} h={ChromeHeight(_activeForm)}");
+				StringBuilder stringBuilder = new StringBuilder();
+				Type type = _activeForm.GetType();
+				while ((object)type != null)
+				{
+					stringBuilder.Append(type.Name).Append('/');
+					if (type.Name == "Form")
+					{
+						break;
+					}
+					type = type.BaseType;
+				}
+				Console.WriteLine($"[CHROME] type={_activeForm.GetType().FullName} chain={stringBuilder} border={_activeForm.FormBorderStyle} h={ChromeHeight(_activeForm)}");
 			}
-			catch { }
+			catch
+			{
+			}
 		}
-		if (PaintDiagnosticsEnabled && (paintLog <= 3 || paintLog % 64 == 0))
+		if (PaintDiagnosticsEnabled && (num6 <= 3 || num6 % 64 == 0))
+		{
 			Console.WriteLine($"[Paint] Form: X={x}, Y={y}, W={width}, H={height}, BackColor={_activeForm.BackColor.Name} (0x{value:X8}), Controls={_activeForm.Controls.Count}");
+		}
 		if (PaintDiagnosticsEnabled)
 		{
-			if (paintLog == 1 && _activeForm is not null)
+			if (num6 == 1 && _activeForm != null)
 			{
 				DumpGridVisualState(_activeForm);
 				DumpTileVisualState(_activeForm);
 			}
 			DumpDockTabText(_activeForm);
 		}
-		// Late tile re-dump lives in LogFirstPaint (per-control paints
-		// keep firing while async book loads repaint; this frame path
-		// idles once settled).
-		canvas.FillRectangle(x + 4, y + 4, width, height + num, 64u);
-		if (num > 0)
+		canvas.FillRectangle(x + 4, y + 4, width, height + num5, 64u);
+		if (num5 > 0)
 		{
-		canvas.FillGradientVertical(x, y, width, num, 7919615u, 5938943u);
-		canvas.DrawTextAligned(_activeForm.Text ?? "Window", x + 10, y + num / 2, "bold 13px 'Segoe UI', sans-serif", uint.MaxValue, TextHAlign.Left, TextVAlign.Middle);
-		int num2 = x + width - 28;
-		int num3 = y + 6;
-		canvas.FillRectangle(num2, num3, 18f, 18f, 3893437439u);
-		canvas.DrawTextAligned("\u00d7", num2 + 9, num3 + 9, "bold 14px sans-serif", uint.MaxValue, TextHAlign.Center, TextVAlign.Middle);
+			canvas.FillGradientVertical(x, y, width, num5, 7919615u, 5938943u);
+			canvas.DrawTextAligned(_activeForm.Text ?? "Window", x + 10, y + num5 / 2, "bold 13px 'Segoe UI', sans-serif", uint.MaxValue, TextHAlign.Left, TextVAlign.Middle);
+			int num7 = x + width - 28;
+			int num8 = y + 6;
+			canvas.FillRectangle(num7, num8, 18f, 18f, 3893437439u);
+			canvas.DrawTextAligned("\u00d7", num7 + 9, num8 + 9, "bold 14px sans-serif", uint.MaxValue, TextHAlign.Center, TextVAlign.Middle);
 		}
 		value = ToRgba(_activeForm.BackColor, 4042322175u);
-		int num4 = y + num;
-		canvas.FillRectangle(x, num4, width, height, value);
-		RenderControls(canvas, _activeForm.Controls, x, num4);
+		int num9 = y + num5;
+		canvas.FillRectangle(x, num9, width, height, value);
+		RenderControls(canvas, _activeForm.Controls, x, num9);
 		RenderShownWindows(canvas);
 		RenderOpenDropdowns(canvas);
 		RenderTrackedPopups(canvas);
@@ -2764,71 +3619,72 @@ public sealed class WinFormsAppHost : IDisposable
 		return s_layerIds.GetValue(key, (object _) => "L" + Interlocked.Increment(ref s_layerSeq));
 	}
 
-	// Clean-layer fast path: a control that is neither dirty, new, nor
-	// resized keeps its retained pixels; re-blit without CPU re-raster
-	// (no Bitmap alloc, no OnPaint invoke, no extract, no re-hash).
-	// Plain (non-layer) canvases always raster (they need the bytes).
 	internal static bool TryBlitCleanLayer(ICanvas canvas, System.Windows.Forms.Control c, int absX, int absY, int w, int h)
 	{
 		if (IsFrameDirty(c))
+		{
 			return false;
+		}
 		if (!(canvas is ICanvasRenderer { SupportsBitmapLayers: not false } canvasRenderer))
+		{
 			return false;
-		string id = LayerIdFor(c);
+		}
+		string text = LayerIdFor(c);
 		lock (s_layerHash)
 		{
-			if (!s_layerHash.ContainsKey(id))
+			if (!s_layerHash.ContainsKey(text))
+			{
 				return false;
-			if (s_layerSize.TryGetValue(id, out var size) && (size.w != w || size.h != h))
+			}
+			if (s_layerSize.TryGetValue(text, out (int, int) value) && (value.Item1 != w || value.Item2 != h))
+			{
 				return false;
+			}
 		}
 		lock (s_liveLayers)
 		{
-			s_liveLayers.Add(id);
+			s_liveLayers.Add(text);
 		}
-		canvasRenderer.BlitBitmap(id, absX, absY, w, h);
-		if (System.Windows.Forms.WasmFrameCounters.PerfEnabled)
-			System.Windows.Forms.WasmFrameCounters.CountBlitClean();
+		canvasRenderer.BlitBitmap(text, absX, absY, w, h);
+		if (WasmFrameCounters.PerfEnabled)
+		{
+			WasmFrameCounters.CountBlitClean();
+		}
 		return true;
 	}
 
 	internal static bool IsFrameDirty(System.Windows.Forms.Control c)
 	{
 		if (s_frameGlobal)
+		{
 			return true;
-		var set = s_frameDirty;
-		if (set is null)
-			return true;
-		return set.ContainsKey(c);
+		}
+		return s_frameDirty?.ContainsKey(c) ?? true;
 	}
 
-	// Dirty region for the frame (null rect = whole control). A missing
-	// entry is clean; global or undrained frames are whole-control.
-	internal static bool FrameDirtyRect(System.Windows.Forms.Control c, out System.Drawing.Rectangle? rc)
+	internal static bool FrameDirtyRect(System.Windows.Forms.Control c, out Rectangle? rc)
 	{
-		if (s_frameGlobal || s_frameDirty is null)
+		if (s_frameGlobal || s_frameDirty == null)
 		{
 			rc = null;
 			return true;
 		}
 		if (s_frameDirty.TryGetValue(c, out rc))
+		{
 			return true;
+		}
 		rc = null;
 		return false;
 	}
 
-	// Change-detection hash (FNV-1a over 32-bit words with a byte tail:
-	// 4x fewer multiplies than the byte loop; values are internal, only
-	// determinism + single-byte sensitivity are pinned).
 	internal static ulong HashBytes(byte[] data)
 	{
 		ulong num = 14695981039346656037uL;
 		int i = 0;
-		int intEnd = data.Length & ~3;
-		for (; i < intEnd; i += 4)
+		for (int num2 = data.Length & -4; i < num2; i += 4)
 		{
-			uint word = (uint)(data[i] | (data[i + 1] << 8) | (data[i + 2] << 16) | (data[i + 3] << 24));
-			num ^= word;
+			uint num3 = (uint)(data[i] | (data[i + 1] << 8) | (data[i + 2] << 16) | (data[i + 3] << 24));
+			num ^= num3;
 			num *= 1099511628211L;
 		}
 		for (; i < data.Length; i++)
@@ -2844,38 +3700,40 @@ public sealed class WinFormsAppHost : IDisposable
 		if (canvas is ICanvasRenderer { SupportsBitmapLayers: not false } canvasRenderer)
 		{
 			string text = LayerIdFor(layerKey);
-			// A full Def replaces the patch base: drop any retained
-			// self-paint surface (the self-paint path re-stores below),
-			// unless the caller just painted over that surface in place
-			// (scroll-shift reuse keeps the object it shifted and repainted).
 			if (!keepRetained)
-			lock (s_retainedPaint)
 			{
-				if (s_retainedPaint.TryGetValue(text, out Bitmap? stale))
+				lock (s_retainedPaint)
 				{
-					s_retainedPaint.Remove(text);
-					stale.Dispose();
+					if (s_retainedPaint.TryGetValue(text, out Bitmap value))
+					{
+						s_retainedPaint.Remove(text);
+						value.Dispose();
+					}
 				}
 			}
 			lock (s_liveLayers)
 			{
 				s_liveLayers.Add(text);
 			}
-            ulong num = HashBytes(rgba);
-            if (System.Windows.Forms.WasmFrameCounters.PerfEnabled)
-                System.Windows.Forms.WasmFrameCounters.AddBytesHashed(rgba.Length);
+			ulong num = HashBytes(rgba);
+			if (WasmFrameCounters.PerfEnabled)
+			{
+				WasmFrameCounters.AddBytesHashed(rgba.Length);
+			}
 			bool flag;
 			lock (s_layerHash)
 			{
-				flag = s_layerHash.TryGetValue(text, out var value) && value == num;
+				flag = s_layerHash.TryGetValue(text, out var value2) && value2 == num;
 				s_layerHash[text] = num;
 				s_layerSize[text] = (w, h);
-			if (System.Windows.Forms.WasmFrameCounters.PerfEnabled)
-				System.Windows.Forms.WasmFrameCounters.CountLayerHashHit(flag);
+				if (WasmFrameCounters.PerfEnabled)
+				{
+					WasmFrameCounters.CountLayerHashHit(flag);
+				}
 			}
 			if (!flag)
 			{
-                canvasRenderer.DefBitmap(text, rgba, w, h);
+				canvasRenderer.DefBitmap(text, rgba, w, h);
 			}
 			canvasRenderer.BlitBitmap(text, x, y, dw, dh);
 		}
@@ -2899,16 +3757,17 @@ public sealed class WinFormsAppHost : IDisposable
 			{
 				string[] array = s_layerHash.Keys.Where((string k) => !s_liveLayers.Contains(k)).ToArray();
 				string[] array2 = array;
-				foreach (string key in array2)
+				string[] array3 = array2;
+				foreach (string key in array3)
 				{
 					s_layerHash.Remove(key);
 					s_layerSize.Remove(key);
 					lock (s_retainedPaint)
 					{
-						if (s_retainedPaint.TryGetValue(key, out Bitmap? dead))
+						if (s_retainedPaint.TryGetValue(key, out Bitmap value))
 						{
 							s_retainedPaint.Remove(key);
-							dead.Dispose();
+							value.Dispose();
 						}
 					}
 				}
@@ -2986,139 +3845,136 @@ public sealed class WinFormsAppHost : IDisposable
 			return;
 		}
 		WasmShownWindow[] array2 = array;
-		foreach (WasmShownWindow wasmShownWindow in array2)
+		WasmShownWindow[] array3 = array2;
+		foreach (WasmShownWindow wasmShownWindow in array3)
 		{
 			System.Windows.Forms.Form form = wasmShownWindow.Form;
-			if (!form.Visible || form.IsDisposed || form.Disposing)
+			if (IsEffectWindow(form) || !form.Visible || form.IsDisposed || form.Disposing)
 			{
 				continue;
 			}
 			if (wasmShownWindow.IsModal && form.DialogResult != System.Windows.Forms.DialogResult.None)
 			{
 				CloseModalIfSettled(form);
-				continue;
 			}
-			if (_forms.ContainsValue(form))
+			else
 			{
-				continue;
-			}
-			if (!_placedWindows.Contains(form))
-			{
-				_placedWindows.Add(form);
-				// One-shot dialog tree (same [Scene]-dump style, modal +
-				// modeless): answers "missing vs unpainted" for dialog
-				// controls (e.g. PDN effect dialogs with no visible
-				// OK/Cancel). First-placement gate: one dump per dialog.
-				Console.WriteLine($"[Dialog] Opened {form.GetType().FullName} modal={wasmShownWindow.IsModal} Bounds={form.Bounds}");
-				DumpControlTree(form, 0);
-				if (form.Width <= 0 || form.Height <= 0)
+				if (_forms.ContainsValue(form))
 				{
-					form.Size = new Size(Math.Max(form.Width, 360), Math.Max(form.Height, 240));
+					continue;
 				}
-				if (form.Location.X == 0 && form.Location.Y == 0)
+				if (!_placedWindows.Contains(form))
 				{
-					form.Location = new Point(Math.Max(0, (ViewWidth - form.Width) / 2), Math.Max(0, (ViewHeight - form.Height - ChromeHeight(form)) / 2));
+					_placedWindows.Add(form);
+					Console.WriteLine($"[Dialog] Opened {form.GetType().FullName} modal={wasmShownWindow.IsModal} Bounds={form.Bounds}");
+					DumpControlTree(form, 0);
+					if (form.Width <= 0 || form.Height <= 0)
+					{
+						form.Size = new Size(Math.Max(form.Width, 360), Math.Max(form.Height, 240));
+					}
+					if (form.Location.X == 0 && form.Location.Y == 0)
+					{
+						form.Location = new Point(Math.Max(0, (ViewWidth - form.Width) / 2), Math.Max(0, (ViewHeight - form.Height - ChromeHeight(form)) / 2));
+					}
+					try
+					{
+						int num2 = 0;
+						int num3 = 0;
+						foreach (System.Windows.Forms.Control control in form.Controls)
+						{
+							if (control.Visible)
+							{
+								num2 = Math.Max(num2, control.Right);
+								num3 = Math.Max(num3, control.Bottom);
+							}
+						}
+						int num4 = Math.Max(form.Width, num2);
+						int num5 = Math.Max(form.Height, num3);
+						if (num4 != form.Width || num5 != form.Height)
+						{
+							form.Size = new Size(num4, num5);
+						}
+						int num6 = form.Location.X;
+						int num7 = form.Location.Y;
+						if (num6 + num4 > ViewWidth)
+						{
+							num6 = Math.Max(0, ViewWidth - num4);
+						}
+						if (num7 + num5 + ChromeHeight(form) > ViewHeight)
+						{
+							num7 = Math.Max(0, ViewHeight - num5 - ChromeHeight(form));
+						}
+						if (num6 != form.Location.X || num7 != form.Location.Y)
+						{
+							form.Location = new Point(num6, num7);
+						}
+					}
+					catch
+					{
+					}
+					Console.WriteLine($"[Host] Dialog placed: {form.GetType().Name} '{form.Text}' at {form.Location} size {form.Size} modal={wasmShownWindow.IsModal}");
 				}
 				try
 				{
-					int num2 = 0;
-					int num3 = 0;
-					foreach (System.Windows.Forms.Control control in form.Controls)
+					if (form.Text == "Layers")
 					{
-						if (control.Visible)
-						{
-							num2 = Math.Max(num2, control.Right);
-							num3 = Math.Max(num3, control.Bottom);
-						}
-					}
-					int num4 = Math.Max(form.Width, num2);
-					int num5 = Math.Max(form.Height, num3);
-					if (num4 != form.Width || num5 != form.Height)
-					{
-						form.Size = new Size(num4, num5);
-					}
-					int num6 = form.Location.X;
-					int num7 = form.Location.Y;
-					if (num6 + num4 > ViewWidth)
-					{
-						num6 = Math.Max(0, ViewWidth - num4);
-					}
-					if (num7 + num5 + ChromeHeight(form) > ViewHeight)
-					{
-						num7 = Math.Max(0, ViewHeight - num5 - ChromeHeight(form));
-					}
-					if (num6 != form.Location.X || num7 != form.Location.Y)
-					{
-						form.Location = new Point(num6, num7);
+						_thumbRefreshTarget = form;
 					}
 				}
 				catch
 				{
 				}
-				Console.WriteLine($"[Host] Dialog placed: {form.GetType().Name} '{form.Text}' at {form.Location} size {form.Size} modal={wasmShownWindow.IsModal}");
+				int x = form.Location.X;
+				int y = form.Location.Y;
+				int width = form.Width;
+				int height = form.Height;
+				int num8 = ChromeHeight(form);
+				canvas.FillRectangle(x + 4, y + 4, width, height + num8, 96u);
+				if (num8 > 0)
+				{
+					canvas.FillGradientVertical(x, y, width, num8, 7919615u, 5938943u);
+					canvas.DrawTextAligned(form.Text ?? "Dialog", x + 10, y + num8 / 2, "bold 13px 'Segoe UI', sans-serif", uint.MaxValue, TextHAlign.Left, TextVAlign.Middle);
+					int num9 = x + width - 28;
+					int num10 = y + 6;
+					canvas.FillRectangle(num9, num10, 18f, 18f, 3893437439u);
+					canvas.DrawTextAligned("x", num9 + 9, num10 + 9, "bold 14px sans-serif", uint.MaxValue, TextHAlign.Center, TextVAlign.Middle);
+				}
+				uint rgba = ToRgba(form.BackColor, 4042322175u);
+				canvas.FillRectangle(x, y + num8, width, height, rgba);
+				RenderControls(canvas, form.Controls, x, y + num8);
 			}
-			// Capture the Layers tool window so a changed doc composite
-			// can re-invalidate its strips.
-			try
-			{
-				if (form.Text == "Layers")
-					_thumbRefreshTarget = form;
-			}
-			catch { }
-			int x = form.Location.X;
-			int y = form.Location.Y;
-			int width = form.Width;
-			int height = form.Height;
-			int chrome = ChromeHeight(form);
-			canvas.FillRectangle(x + 4, y + 4, width, height + chrome, 96u);
-			if (chrome > 0)
-			{
-				canvas.FillGradientVertical(x, y, width, chrome, 7919615u, 5938943u);
-			canvas.DrawTextAligned(form.Text ?? "Dialog", x + 10, y + chrome / 2, "bold 13px 'Segoe UI', sans-serif", uint.MaxValue, TextHAlign.Left, TextVAlign.Middle);
-			int num8 = x + width - 28;
-			int num9 = y + 6;
-			canvas.FillRectangle(num8, num9, 18f, 18f, 3893437439u);
-				canvas.DrawTextAligned("x", num8 + 9, num9 + 9, "bold 14px sans-serif", uint.MaxValue, TextHAlign.Center, TextVAlign.Middle);
-			}
-			uint rgba = ToRgba(form.BackColor, 4042322175u);
-			canvas.FillRectangle(x, y + chrome, width, height, rgba);
-			RenderControls(canvas, form.Controls, x, y + chrome);
 		}
 	}
 
-	private int _lastPopupCount;
-
-	// Top-level popups (Telerik context menus, combo dropdowns) paint above
-	// everything via the same self-painted path as Telerik grid cells; a
-	// count change dirties globally so the newly covered rect repaints.
 	private void RenderTrackedPopups(ICanvas canvas)
 	{
-		System.Windows.Forms.Control[] popups = System.Windows.Forms.WasmPopupHost.Snapshot();
-		if (popups.Length != _lastPopupCount)
+		System.Windows.Forms.Control[] array = WasmPopupHost.Snapshot();
+		if (array.Length != _lastPopupCount)
 		{
-			_lastPopupCount = popups.Length;
-			System.Windows.Forms.WasmRepaintGate.MarkGlobalDirty();
+			_lastPopupCount = array.Length;
+			WasmRepaintGate.MarkGlobalDirty();
 		}
-		foreach (System.Windows.Forms.Control popup in popups)
+		System.Windows.Forms.Control[] array2 = array;
+		foreach (System.Windows.Forms.Control control in array2)
 		{
-			if (!popup.Visible || popup.IsDisposed || popup.Disposing || popup.Width <= 0 || popup.Height <= 0)
+			if (!control.Visible || control.IsDisposed || control.Disposing || control.Width <= 0 || control.Height <= 0)
 			{
 				continue;
 			}
-			int px = popup.Location.X;
-			int py = popup.Location.Y;
-			canvas.FillRectangle(px + 3, py + 3, popup.Width, popup.Height, 96u);
-			if (!TryRenderSelfPainted(canvas, popup, px, py, popup.Width, popup.Height))
+			int x = control.Location.X;
+			int y = control.Location.Y;
+			canvas.FillRectangle(x + 3, y + 3, control.Width, control.Height, 96u);
+			if (!TryRenderSelfPainted(canvas, control, x, y, control.Width, control.Height))
 			{
-				if (!popup.BackColor.IsEmpty && popup.BackColor != Color.Transparent)
+				if (!control.BackColor.IsEmpty && control.BackColor != Color.Transparent)
 				{
-					canvas.FillRectangle(px, py, popup.Width, popup.Height, ToRgba(popup.BackColor, 4042322175u));
+					canvas.FillRectangle(x, y, control.Width, control.Height, ToRgba(control.BackColor, 4042322175u));
 				}
-				TryRenderD2DControl(canvas, popup, px, py, popup.Width, popup.Height);
+				TryRenderD2DControl(canvas, control, x, y, control.Width, control.Height);
 			}
-			if (popup.Controls.Count > 0)
+			if (control.Controls.Count > 0)
 			{
-				RenderControls(canvas, popup.Controls, px, py);
+				RenderControls(canvas, control.Controls, x, y);
 			}
 		}
 	}
@@ -3126,48 +3982,39 @@ public sealed class WinFormsAppHost : IDisposable
 	private bool TopPopupAt(int x, int y, out System.Windows.Forms.Control? popup)
 	{
 		popup = null;
-		System.Windows.Forms.Control[] popups = System.Windows.Forms.WasmPopupHost.Snapshot();
-		for (int i = popups.Length - 1; i >= 0; i--)
+		System.Windows.Forms.Control[] array = WasmPopupHost.Snapshot();
+		for (int num = array.Length - 1; num >= 0; num--)
 		{
-			System.Windows.Forms.Control c = popups[i];
-			if (!c.Visible || c.IsDisposed || c.Disposing)
+			System.Windows.Forms.Control control = array[num];
+			if (control.Visible && !control.IsDisposed && !control.Disposing && x >= control.Location.X && x < control.Location.X + control.Width && y >= control.Location.Y && y < control.Location.Y + control.Height)
 			{
-				continue;
-			}
-			if (x >= c.Location.X && x < c.Location.X + c.Width && y >= c.Location.Y && y < c.Location.Y + c.Height)
-			{
-				popup = c;
+				popup = control;
 				return true;
 			}
 		}
 		return false;
 	}
 
-	// Popup-first down routing: a hit goes to the popup tree (falling back
-	// to the popup itself, whose element tree dispatches internally); an
-	// outside press dismisses through Telerik's own manager and is
-	// swallowed, matching desktop menu behavior. Returns true when a
-	// popup was open (handled either way).
 	private bool RoutePopupMouseDown(int x, int y, System.Windows.Forms.MouseButtons buttons)
 	{
-		if (System.Windows.Forms.WasmPopupHost.Snapshot().Length == 0)
+		if (WasmPopupHost.Snapshot().Length == 0)
 		{
 			return false;
 		}
-		if (TopPopupAt(x, y, out System.Windows.Forms.Control? popup) && popup != null)
+		if (TopPopupAt(x, y, out System.Windows.Forms.Control popup) && popup != null)
 		{
 			Console.WriteLine("[Host] OnMouseDown popup-hit=" + popup.GetType().Name + " '" + popup.Name + "'");
 			RecordInput("down", $"{x},{y} {buttons} popup={popup.Name}");
 			_mouseTarget = HitTestDeep(popup.Controls, popup.Location.X, popup.Location.Y, x, y) ?? popup;
-			System.Windows.Forms.WasmRepaintGate.MarkDirtyChain(_mouseTarget);
+			WasmRepaintGate.MarkDirtyChain(_mouseTarget);
 			NoteFocus(_mouseTarget);
 			RaiseMouseEvent(s_onMouseDownMethod, _mouseTarget, buttons, 1, x, y);
 			return true;
 		}
-		int before = System.Windows.Forms.WasmPopupHost.Snapshot().Length;
+		int num = WasmPopupHost.Snapshot().Length;
 		LogPopupState("miss");
 		DismissPopupsForOutsideDown(x, y);
-		if (System.Windows.Forms.WasmPopupHost.Snapshot().Length < before)
+		if (WasmPopupHost.Snapshot().Length < num)
 		{
 			return true;
 		}
@@ -3176,82 +4023,83 @@ public sealed class WinFormsAppHost : IDisposable
 
 	private bool RoutePopupClick(int x, int y, System.Windows.Forms.MouseButtons clickedButton, int clicks)
 	{
-		if (System.Windows.Forms.WasmPopupHost.Snapshot().Length == 0)
+		if (WasmPopupHost.Snapshot().Length == 0)
 		{
 			return false;
 		}
-		if (TopPopupAt(x, y, out System.Windows.Forms.Control? popup) && popup != null)
+		if (TopPopupAt(x, y, out System.Windows.Forms.Control popup) && popup != null)
 		{
-			System.Windows.Forms.Control target = HitTestDeep(popup.Controls, popup.Location.X, popup.Location.Y, x, y) ?? popup;
+			System.Windows.Forms.Control control = HitTestDeep(popup.Controls, popup.Location.X, popup.Location.Y, x, y) ?? popup;
 			Console.WriteLine("[Host] OnClick popup-hit=" + popup.GetType().Name + " '" + popup.Name + "'");
-			RecordInput("click", $"{x},{y} popup={popup.Name} target={DescribeControl(target)}");
-			System.Windows.Forms.WasmRepaintGate.MarkDirtyChain(target);
-			RaiseMouseEvent(s_onMouseClickMethod, target, clickedButton, clicks, x, y);
+			if (control == popup && TryVendorElementClick(popup, x, y))
+				return true;
+			RecordInput("click", $"{x},{y} popup={popup.Name} target={DescribeControl(control)}");
+			WasmRepaintGate.MarkDirtyChain(control);
+			RaiseMouseEvent(s_onMouseClickMethod, control, clickedButton, clicks, x, y);
 			return true;
 		}
-		int before = System.Windows.Forms.WasmPopupHost.Snapshot().Length;
+		int num = WasmPopupHost.Snapshot().Length;
 		LogPopupState("miss");
 		DismissPopupsForOutsideDown(x, y);
-		if (System.Windows.Forms.WasmPopupHost.Snapshot().Length < before)
+		if (WasmPopupHost.Snapshot().Length < num)
 		{
 			return true;
 		}
 		return false;
 	}
 
-	// Popup-miss diagnostic: which tracked popups were alive when a press
-	// landed outside all of them (type/parent/rect each). Silent unless a
-	// miss happens; failures never break input routing.
 	private static void LogPopupState(string why)
 	{
 		try
 		{
-			System.Windows.Forms.Control[] tracked = System.Windows.Forms.WasmPopupHost.Snapshot();
-			string line = "[POPUP] state " + why + " n=" + tracked.Length;
-			foreach (System.Windows.Forms.Control control in tracked)
+			System.Windows.Forms.Control[] array = WasmPopupHost.Snapshot();
+			string text = "[POPUP] state " + why + " n=" + array.Length;
+			System.Windows.Forms.Control[] array2 = array;
+			foreach (System.Windows.Forms.Control control in array2)
 			{
-				string parent;
+				string text2;
 				try
 				{
-					parent = control.Parent == null ? "null" : control.Parent.GetType().Name;
+					text2 = ((control.Parent == null) ? "null" : control.Parent.GetType().Name);
 				}
 				catch
 				{
-					parent = "THREW";
+					text2 = "THREW";
 				}
-				line += " [" + control.GetType().Name + " par=" + parent + " at=" + control.Location.X + "," + control.Location.Y + " sz=" + control.Width + "x" + control.Height + "]";
+				text = text + " [" + control.GetType().Name + " par=" + text2 + " at=" + control.Location.X + "," + control.Location.Y + " sz=" + control.Width + "x" + control.Height + "]";
 			}
-			Console.WriteLine(line);
+			Console.WriteLine(text);
 		}
 		catch
 		{
 		}
 	}
 
-	// Telerik dismisses popups from RadMessageFilter-fed mouse presses; the
-	// host bypasses the message loop, so drive its public manager entry
-	// directly (reflection: the host must not bind Telerik statically).
 	private static void DismissPopupsForOutsideDown(int x, int y)
 	{
 		try
 		{
-			foreach (System.Reflection.Assembly asm in AppDomain.CurrentDomain.GetAssemblies())
+			Assembly[] assemblies = AppDomain.CurrentDomain.GetAssemblies();
+			foreach (Assembly assembly in assemblies)
 			{
-				if (asm.GetName().Name != "Telerik.WinControls.UI")
+				if (!(assembly.GetName().Name != "Telerik.WinControls.UI"))
 				{
-					continue;
+					Type type = assembly.GetType("Telerik.WinControls.UI.PopupManager");
+					object obj = type?.GetProperty("Default", BindingFlags.Static | BindingFlags.Public)?.GetValue(null);
+					type?.GetMethod("CallOnMouseDown", BindingFlags.Instance | BindingFlags.Public)?.Invoke(obj, new object[1]
+					{
+						new Point(x, y)
+					});
+					break;
 				}
-				Type? pmType = asm.GetType("Telerik.WinControls.UI.PopupManager");
-				object? def = pmType?.GetProperty("Default", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)?.GetValue(null);
-				pmType?.GetMethod("CallOnMouseDown", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)?.Invoke(def, new object[] { new Point(x, y) });
-				break;
 			}
 		}
 		catch
 		{
 		}
-		System.Windows.Forms.WasmRepaintGate.MarkGlobalDirty();
+		WasmRepaintGate.MarkGlobalDirty();
 	}
+
 	private bool TopModalWindow(out System.Windows.Forms.Form? modal)
 	{
 		if (WasmDialogHost.TopModal(out modal) && modal != null)
@@ -3268,15 +4116,37 @@ public sealed class WinFormsAppHost : IDisposable
 		return false;
 	}
 
+	private static bool IsEffectWindow(System.Windows.Forms.Form form)
+	{
+		try
+		{
+			return !form.Modal && form.Owner != null && form.FormBorderStyle == System.Windows.Forms.FormBorderStyle.None && form.Controls.Count == 0;
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
+	private static int s_trackDumpCount;
 	private bool TopTrackedWindowAt(int x, int y, out System.Windows.Forms.Form? win, out bool isModal)
 	{
 		win = null;
 		isModal = false;
 		WasmShownWindow[] array = WasmDialogHost.Snapshot();
+		if (System.Threading.Interlocked.Increment(ref s_trackDumpCount) <= 10)
+		{
+			string ts = "[VAPI] track n=" + array.Length + " pt=" + x + "," + y;
+			foreach (WasmShownWindow w in array)
+			{
+				try { ts += " [" + w.Form.GetType().Name + " at=" + w.Form.Location.X + "," + w.Form.Location.Y + " sz=" + w.Form.Width + "x" + w.Form.Height + " vis=" + w.Form.Visible + " modal=" + w.IsModal + "]"; } catch { }
+			}
+			Console.WriteLine(ts);
+		}
 		for (int num = array.Length - 1; num >= 0; num--)
 		{
 			System.Windows.Forms.Form form = array[num].Form;
-			if (!_forms.ContainsValue(form))
+			if (!IsEffectWindow(form) && !_forms.ContainsValue(form))
 			{
 				int x2 = form.Location.X;
 				int y2 = form.Location.Y;
@@ -3293,7 +4163,10 @@ public sealed class WinFormsAppHost : IDisposable
 
 	private static bool DialogCloseHit(System.Windows.Forms.Form dlg, int x, int y)
 	{
-		if (ChromeHeight(dlg) == 0) return false;
+		if (ChromeHeight(dlg) == 0)
+		{
+			return false;
+		}
 		int x2 = dlg.Location.X;
 		int y2 = dlg.Location.Y;
 		return x >= x2 + dlg.Width - 28 && x <= x2 + dlg.Width - 10 && y >= y2 + 6 && y <= y2 + 24;
@@ -3330,6 +4203,8 @@ public sealed class WinFormsAppHost : IDisposable
 		RecordInput("down", $"{x},{y} {buttons} {tag}={dlg.Name}");
 		_mouseTarget = HitTestDeep(dlg.Controls, dlg.Location.X, dlg.Location.Y + ChromeHeight(dlg), x, y);
 		NoteFocus(_mouseTarget);
+		if (_mouseTarget is not null && TryCommitSfListItem(dlg, _mouseTarget, x, y))
+			return;
 		if (_mouseTarget != null && !(_mouseTarget is System.Windows.Forms.ToolStrip))
 		{
 			RaiseMouseEvent(s_onMouseDownMethod, _mouseTarget, buttons, 1, x, y);
@@ -3345,7 +4220,7 @@ public sealed class WinFormsAppHost : IDisposable
 				return true;
 			}
 			DialogOnDown(win, x, y, buttons, "dock");
-			System.Windows.Forms.WasmRepaintGate.MarkDirtyChain(win);
+			WasmRepaintGate.MarkDirtyChain(win);
 			return true;
 		}
 		return false;
@@ -3364,15 +4239,12 @@ public sealed class WinFormsAppHost : IDisposable
 
 	private static void CloseModalIfSettled(System.Windows.Forms.Form modal)
 	{
-		// Headless pump emulation: on desktop the nested modal loop
-		// exits (closing the dialog) once DialogResult is set. There is
-		// no pump here, so a set result would leave the dialog open
-		// forever (BookShelf's offline MessageBox survived every OK).
 		try
 		{
-			if (modal.Modal && modal.Visible && !modal.IsDisposed && !modal.Disposing
-				&& modal.DialogResult != System.Windows.Forms.DialogResult.None)
+			if (modal.Modal && modal.Visible && !modal.IsDisposed && !modal.Disposing && modal.DialogResult != System.Windows.Forms.DialogResult.None)
+			{
 				modal.Close();
+			}
 		}
 		catch (Exception ex)
 		{
@@ -3380,6 +4252,112 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 	}
 
+	private bool TryCommitSfListItem(System.Windows.Forms.Form win, System.Windows.Forms.Control? control, int x, int y)
+	{
+		// Syncfusion combo-popup commit: the popup hosts an SfListView
+		// whose mouse handling does not select headless. Map the point to
+		// a row via live ItemHeight and drive SelectedIndex (the same
+		// event the mouse would raise). True = consumed exactly once.
+		try
+		{
+			if (!win.GetType().Name.Contains("Popup", StringComparison.Ordinal))
+				return false;
+			System.Windows.Forms.Control? list = FindControlByNamePart(win.Controls, "SfListView");
+			if (list is null || control != list)
+				return false;
+			if (list is null)
+				return false;
+			int lx = win.Location.X;
+			int ly = win.Location.Y + ChromeHeight(win);
+			for (System.Windows.Forms.Control? c = list; c is not null && c != win; c = c.Parent)
+			{
+				lx += c.Left;
+				ly += c.Top;
+			}
+			double ih = 0;
+			try
+			{
+				object? v = list.GetType().GetProperty("ItemHeight")?.GetValue(list);
+				if (v is not null)
+					ih = System.Convert.ToDouble(v);
+			}
+			catch { }
+			if (ih <= 0)
+				return false;
+			int index = (int)System.Math.Floor((y - ly) / ih);
+			int count = -1;
+			try
+			{
+				object? ds = list.GetType().GetProperty("DataSource")?.GetValue(list);
+				if (ds is System.Collections.ICollection col)
+					count = col.Count;
+			}
+			catch { }
+			Console.WriteLine("[VAPI] sflist pt=" + (x - lx) + "," + (y - ly) + " ih=" + ih + " idx=" + index + " count=" + count);
+			if (index < 0 || (count >= 0 && index >= count))
+				return false;
+			System.Reflection.PropertyInfo? sel = list.GetType().GetProperty("SelectedIndex");
+			if (sel is null || !sel.CanWrite || sel.PropertyType != typeof(int))
+				return false;
+			sel.SetValue(list, index);
+			try
+			{
+				System.Windows.Forms.Control? pop = FindControlByNamePart(win.Controls, "ComboBoxPopup");
+				object? combo = null;
+				try { combo = pop?.GetType().GetProperty("ComboBox", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic)?.GetValue(pop); } catch { }
+				object? item = null;
+				try
+				{
+					object? ds = list.GetType().GetProperty("DataSource")?.GetValue(list);
+					if (ds is System.Collections.IList il && index >= 0 && index < il.Count)
+						item = il[index];
+				}
+				catch { }
+				Console.WriteLine("[VAPI] sfcombo owner=" + (combo?.GetType().Name ?? "?") + " item=" + (item?.ToString() ?? "?"));
+				if (combo is not null && item is not null)
+				{
+					System.Reflection.PropertyInfo? csi = combo.GetType().GetProperty("SelectedItem");
+					if (csi is not null && csi.CanWrite)
+						csi.SetValue(combo, item);
+					foreach (System.Reflection.MethodInfo hm in combo.GetType().GetMethods(
+						System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+					{
+						if (hm.Name == "HideDropDown" && !hm.ContainsGenericParameters && hm.GetParameters().Length == 0)
+						{
+							hm.Invoke(combo, null);
+							Console.WriteLine("[VAPI] sfcombo-hide");
+							break;
+						}
+					}
+				}
+			}
+			catch (Exception ex2) { Console.WriteLine("[VAPI] sfcombo-throw " + ex2.GetType().Name); }
+			RecordInput("vendor", $"sflist-select {list.GetType().Name} {win.Name} {x},{y} idx={index}");
+			Console.WriteLine("[VAPI] sflist-selected idx=" + index);
+			DumpPageState();
+			try { WasmRepaintGate.MarkGlobalDirty(); } catch { }
+			try { win.Invalidate(); } catch { }
+			return true;
+		}
+		catch (Exception ex) { Console.WriteLine("[VAPI] sflist-throw " + ex.GetType().Name); return false; }
+	}
+	private static System.Windows.Forms.Control? FindControlByNamePart(System.Windows.Forms.Control.ControlCollection cs, string part)
+	{
+		foreach (System.Windows.Forms.Control c in cs)
+		{
+			try
+			{
+				if (c.GetType().Name.Contains(part, StringComparison.Ordinal))
+					return c;
+			}
+			catch { }
+			System.Windows.Forms.Control? r = FindControlByNamePart(c.Controls, part);
+			if (r is not null)
+				return r;
+		}
+		return null;
+	}
+	
 	private void ModalOnClick(System.Windows.Forms.Form modal, int x, int y, string tag = "modal", System.Windows.Forms.MouseButtons clickedButton = System.Windows.Forms.MouseButtons.Left, int clicks = 1)
 	{
 		int x2 = modal.Location.X;
@@ -3389,12 +4367,10 @@ public sealed class WinFormsAppHost : IDisposable
 			RecordInput("click", $"{x},{y} {tag}-close dlg={modal.Name}");
 			try
 			{
-				// A user close always carries OK/Cancel at entry (desktop X
-				// travels WM_CLOSE, not bare Close): None-at-entry is the
-				// fork's abort signature (WasmDialogHost.DeferAbortClose)
-				// and would be skipped, leaving the dialog open forever.
 				if (modal.Modal && modal.DialogResult == System.Windows.Forms.DialogResult.None)
+				{
 					modal.DialogResult = System.Windows.Forms.DialogResult.Cancel;
+				}
 				modal.Close();
 				return;
 			}
@@ -3408,18 +4384,27 @@ public sealed class WinFormsAppHost : IDisposable
 		Console.WriteLine("[Host] OnClick modal hit=" + ((control == null) ? "null" : (control.GetType().Name + " '" + control.Name + "'")));
 		if (control == null)
 		{
+			try
+			{
+				System.Windows.Forms.Form activeForm = _activeForm;
+				Console.WriteLine("[Host] NULLHIT form=" + ((activeForm == null) ? "null" : (activeForm.GetType().Name + " loc=" + activeForm.Location.ToString() + " cli=" + activeForm.ClientSize)) + " n=" + (activeForm?.Controls.Count ?? (-1)));
+			}
+			catch
+			{
+			}
+		}
+		if (control == null)
+		{
 			RecordInput("click", $"{x},{y} {tag}-swallow dlg={modal.Name}");
 			return;
 		}
+		if (TryCommitSfListItem(modal, control, x, y))
+			return;
 		if (control is System.Windows.Forms.Button button)
 		{
 			RecordInput("click", $"{x},{y} {tag}-button={button.Name}");
 			try
 			{
-				// Desktop order: the press moves focus before the button
-				// activates, so edits commit (Leave/validation) before the
-				// click observes them (Levels output-low: typed 100,
-				// applied 0 without this).
 				NoteFocus(button);
 				button.PerformClick();
 				RaiseMouseEvent(s_onMouseClickMethod, button, clickedButton, clicks, x, y);
@@ -3433,26 +4418,21 @@ public sealed class WinFormsAppHost : IDisposable
 				return;
 			}
 		}
-		if (control is System.Windows.Forms.IButtonControl pushed)
+		if (control is System.Windows.Forms.IButtonControl buttonControl)
 		{
-			// Custom dialog buttons (PDN PdnPushButton family derives from
-			// GdiBufferedAnimationControl, not Button): activate through the
-			// interface and settle like a Button click so a chosen
-			// OK/Cancel result closes the modal headless (no pump).
 			RecordInput("click", $"{x},{y} {tag}-pushbutton={control.Name}");
 			try
 			{
-				// Same focus-first order as real buttons above.
 				NoteFocus(control);
-				pushed.PerformClick();
+				buttonControl.PerformClick();
 				RaiseMouseEvent(s_onMouseClickMethod, control, clickedButton, clicks, x, y);
 				CloseModalIfSettled(modal);
 				return;
 			}
-			catch (Exception exPush)
+			catch (Exception ex3)
 			{
-				Console.WriteLine($"[WinFormsAppHost] Modal pushbutton click error: {exPush.GetType().Name}: {exPush.Message.Split('\n')[0]} site={SiteOf(exPush)}");
-				BrowserErrorReporter.Report("button-click", exPush);
+				Console.WriteLine($"[WinFormsAppHost] Modal pushbutton click error: {ex3.GetType().Name}: {ex3.Message.Split('\n')[0]} site={SiteOf(ex3)}");
+				BrowserErrorReporter.Report("button-click", ex3);
 				return;
 			}
 		}
@@ -3477,13 +4457,17 @@ public sealed class WinFormsAppHost : IDisposable
 		RecordInput("click", $"{x},{y} {tag}-control={DescribeControl(control)}");
 		try
 		{
+			// Real click semantics are down-then-click: custom-painted dock
+			// controls (PDN LayersStrip checkboxes) hit-test on mouse-down, so
+			// an OnClick-raise alone is a no-op for them. Raise down first.
+			RaiseMouseEvent(s_onMouseDownMethod, control, clickedButton, clicks, x, y);
 			s_onClickMethod?.Invoke(control, new object[1] { EventArgs.Empty });
 			RaiseMouseEvent(s_onMouseClickMethod, control, clickedButton, clicks, x, y);
 		}
-		catch (Exception ex3)
+		catch (Exception ex4)
 		{
-			Console.WriteLine("[WinFormsAppHost] Modal control click error: " + ex3.GetType().Name + ": " + ex3.Message.Split('\n')[0]);
-			BrowserErrorReporter.Report("control-click", ex3);
+			Console.WriteLine("[WinFormsAppHost] Modal control click error: " + ex4.GetType().Name + ": " + ex4.Message.Split('\n')[0]);
+			BrowserErrorReporter.Report("control-click", ex4);
 		}
 	}
 
@@ -3515,12 +4499,6 @@ public sealed class WinFormsAppHost : IDisposable
 			int num2 = parentAbsY + control.Top;
 			int width = control.Width;
 			int height = control.Height;
-			// Self-painted Button subclasses (SfButton: overrides OnPaint
-			// and carries its images in the vendor style, not
-			// ButtonBase.Image) fall through to the managed-paint path
-			// below; the flat fast-path is only for exact Button and
-			// non-overriding subclasses, which have no managed image
-			// source to lose.
 			if (control is System.Windows.Forms.Button button && !ButtonPaintsItself(control.GetType()))
 			{
 				uint rgba = ((button == _pressedButton) ? 3437557759u : ToRgba(button.BackColor, 3789677055u));
@@ -3557,15 +4535,11 @@ public sealed class WinFormsAppHost : IDisposable
 				}
 				if (textBox.Multiline)
 				{
-					// Native multiline EDIT stacks lines from the top;
-					// the single centered run washed content to the
-					// middle (spellcheck boxes: browser mid-box vs
-					// native top-left). One Top-anchored run per line.
-					float lineH = System.Math.Max(1f, textBox.Font.GetHeight());
-					string[] lines = text.Split(new[] { "\r\n", "\n" }, System.StringSplitOptions.None);
-					for (int li = 0; li < lines.Length; li++)
+					float num3 = Math.Max(1f, textBox.Font.GetHeight());
+					string[] array = text.Split(new string[2] { "\r\n", "\n" }, StringSplitOptions.None);
+					for (int j = 0; j < array.Length; j++)
 					{
-						canvas.DrawTextAligned(lines[li], num + 5, num2 + 2 + (li * lineH), fontCss2, rgba5, TextHAlign.Left, TextVAlign.Top);
+						canvas.DrawTextAligned(array[j], num + 5, (float)(num2 + 2) + (float)j * num3, fontCss2, rgba5, TextHAlign.Left, TextVAlign.Top);
 					}
 				}
 				else
@@ -3590,51 +4564,47 @@ public sealed class WinFormsAppHost : IDisposable
 				canvas.DrawLine(num, num2 + height, num + width, num2 + height, 1f, 2141043199u);
 				canvas.DrawLine(num, num2, num, num2 + height, 1f, 2141043199u);
 				canvas.DrawLine(num + width, num2, num + width, num2 + height, 1f, 2141043199u);
-				int num3 = 24;
-				canvas.FillRectangle(num, num2, width, num3, 4008636159u);
-				canvas.DrawLine(num, num2 + num3, num + width, num2 + num3, 1f, 3435973887u);
-				int num4 = num + 6;
-				for (int j = 0; j < listView.Columns.Count; j++)
+				int num4 = 24;
+				canvas.FillRectangle(num, num2, width, num4, 4008636159u);
+				canvas.DrawLine(num, num2 + num4, num + width, num2 + num4, 1f, 3435973887u);
+				int num5 = num + 6;
+				for (int k = 0; k < listView.Columns.Count; k++)
 				{
-					System.Windows.Forms.ColumnHeader columnHeader = listView.Columns[j];
-					canvas.DrawTextAligned(columnHeader.Text, num4, (float)num2 + (float)num3 / 2f, "bold 12px sans-serif", 858993663u, TextHAlign.Left, TextVAlign.Middle);
-					num4 += columnHeader.Width;
+					System.Windows.Forms.ColumnHeader columnHeader = listView.Columns[k];
+					canvas.DrawTextAligned(columnHeader.Text, num5, (float)num2 + (float)num4 / 2f, "bold 12px sans-serif", 858993663u, TextHAlign.Left, TextVAlign.Middle);
+					num5 += columnHeader.Width;
 				}
-				int num5 = num2 + num3 + 2;
-				int num6 = 22;
-				// Windowed paint: rows [top, top+cap) map to the visible slots
-				// so overflow scrolls (native parity) instead of dropping
-				// silently. Geometry for top=0 is unchanged (oracles pin it).
-				int cap = ListViewCapacity(listView.Height);
-				int top = ResolveListViewTop(listView);
+				int num6 = num2 + num4 + 2;
+				int num7 = 22;
+				int num8 = ListViewCapacity(listView.Height);
+				int num9 = ResolveListViewTop(listView);
 				int count = listView.Items.Count;
-				bool scroll = count > cap;
-				int rowW = scroll ? width - ListViewScrollW : width;
-				for (int k = top; k < count && k - top < cap; k++)
+				bool flag2 = count > num8;
+				int num10 = (flag2 ? (width - 14) : width);
+				for (int l = num9; l < count && l - num9 < num8; l++)
 				{
-					int ry = num5 + (k - top) * num6;
-					System.Windows.Forms.ListViewItem listViewItem = listView.Items[k];
+					int num11 = num6 + (l - num9) * num7;
+					System.Windows.Forms.ListViewItem listViewItem = listView.Items[l];
 					if (listViewItem.Selected)
 					{
-						canvas.FillRectangle(num + 1, ry, rowW - 2, num6, 865730559u);
-						canvas.DrawTextAligned(listViewItem.Text, num + 6, (float)ry + (float)num6 / 2f, "12px sans-serif", uint.MaxValue, TextHAlign.Left, TextVAlign.Middle);
+						canvas.FillRectangle(num + 1, num11, num10 - 2, num7, 865730559u);
+						canvas.DrawTextAligned(listViewItem.Text, num + 6, (float)num11 + (float)num7 / 2f, "12px sans-serif", uint.MaxValue, TextHAlign.Left, TextVAlign.Middle);
 					}
 					else
 					{
-						canvas.DrawTextAligned(listViewItem.Text, num + 6, (float)ry + (float)num6 / 2f, "12px sans-serif", 286331391u, TextHAlign.Left, TextVAlign.Middle);
+						canvas.DrawTextAligned(listViewItem.Text, num + 6, (float)num11 + (float)num7 / 2f, "12px sans-serif", 286331391u, TextHAlign.Left, TextVAlign.Middle);
 					}
 				}
-				if (scroll)
+				if (flag2)
 				{
-					// Native-style scrollbar: track + proportional thumb.
-					int trackX = num + width - ListViewScrollW;
-					int trackY = num2 + num3;
-					int trackH = height - num3;
-					canvas.FillRectangle(trackX, trackY, ListViewScrollW, trackH, 0xE4E4E4FFu);
-					canvas.DrawLine(trackX, trackY, trackX, trackY + trackH, 1f, 0xBDBDBDFFu);
-					int thumbH = Math.Max(20, trackH * cap / count);
-					int thumbY = trackY + (count - cap <= 0 ? 0 : (trackH - thumbH) * top / (count - cap));
-					canvas.FillRectangle(trackX + 2, thumbY, ListViewScrollW - 4, thumbH, 0x9E9E9EFFu);
+					int num12 = num + width - 14;
+					int num13 = num2 + num4;
+					int num14 = height - num4;
+					canvas.FillRectangle(num12, num13, 14f, num14, 3840206079u);
+					canvas.DrawLine(num12, num13, num12, num13 + num14, 1f, 3183328767u);
+					int num15 = Math.Max(20, num14 * num8 / count);
+					int num16 = num13 + ((count - num8 > 0) ? ((num14 - num15) * num9 / (count - num8)) : 0);
+					canvas.FillRectangle(num12 + 2, num16, 10f, num15, 2661195519u);
 				}
 			}
 			else if (control is System.Windows.Forms.ToolStrip toolStrip)
@@ -3642,90 +4612,90 @@ public sealed class WinFormsAppHost : IDisposable
 				uint rgba7 = ToRgba(toolStrip.BackColor, 4126603263u);
 				canvas.FillRectangle(num, num2, width, height, rgba7);
 				canvas.DrawLine(num, num2 + height, num + width, num2 + height, 1f, 3755991039u);
-				for (int l = 0; l < toolStrip.Items.Count; l++)
+				for (int m = 0; m < toolStrip.Items.Count; m++)
 				{
-					System.Windows.Forms.ToolStripItem toolStripItem = toolStrip.Items[l];
+					System.Windows.Forms.ToolStripItem toolStripItem = toolStrip.Items[m];
 					if (!toolStripItem.Visible || toolStripItem.Width <= 0 || toolStripItem.Height <= 0 || toolStripItem.IsOnOverflow || toolStripItem.Bounds.Y >= toolStrip.Height || toolStripItem.Bounds.X >= toolStrip.Width)
 					{
 						continue;
 					}
-					int num7 = num + toolStripItem.Bounds.X;
-					int num8 = num2 + toolStripItem.Bounds.Y;
+					int num17 = num + toolStripItem.Bounds.X;
+					int num18 = num2 + toolStripItem.Bounds.Y;
 					int width3 = toolStripItem.Width;
 					int height2 = toolStripItem.Height;
 					if (toolStripItem is System.Windows.Forms.ToolStripSeparator)
 					{
-						canvas.DrawLine(num7 + width3 / 2, num8 + 3, num7 + width3 / 2, num8 + height2 - 3, 1f, 3503345919u);
+						canvas.DrawLine(num17 + width3 / 2, num18 + 3, num17 + width3 / 2, num18 + height2 - 3, 1f, 3503345919u);
 						continue;
 					}
-					bool flag2 = toolStripItem is System.Windows.Forms.ToolStripButton toolStripButton && toolStripButton.Checked;
-					if (toolStripItem.Selected || toolStripItem.Pressed || flag2)
+					bool flag3 = toolStripItem is System.Windows.Forms.ToolStripButton toolStripButton && toolStripButton.Checked;
+					if ((toolStripItem.Selected || toolStripItem.Pressed) | flag3)
 					{
-						uint rgba8 = ((toolStripItem.Pressed || flag2) ? 3151557375u : 3437557759u);
-						canvas.FillRoundedRectangle(num7, num8, width3, height2, 2f, rgba8);
-						canvas.DrawLine(num7, num8, num7 + width3, num8, 1f, 7919615u);
-						canvas.DrawLine(num7, num8 + height2, num7 + width3, num8 + height2, 1f, 7919615u);
-						canvas.DrawLine(num7, num8, num7, num8 + height2, 1f, 7919615u);
-						canvas.DrawLine(num7 + width3, num8, num7 + width3, num8 + height2, 1f, 7919615u);
+						uint rgba8 = ((toolStripItem.Pressed | flag3) ? 3151557375u : 3437557759u);
+						canvas.FillRoundedRectangle(num17, num18, width3, height2, 2f, rgba8);
+						canvas.DrawLine(num17, num18, num17 + width3, num18, 1f, 7919615u);
+						canvas.DrawLine(num17, num18 + height2, num17 + width3, num18 + height2, 1f, 7919615u);
+						canvas.DrawLine(num17, num18, num17, num18 + height2, 1f, 7919615u);
+						canvas.DrawLine(num17 + width3, num18, num17 + width3, num18 + height2, 1f, 7919615u);
 					}
-					int num9 = width3;
+					int num19 = width3;
 					if (toolStripItem is System.Windows.Forms.ToolStripSplitButton || toolStripItem is System.Windows.Forms.ToolStripDropDownButton)
 					{
-						num9 = Math.Max(16, width3 - 12);
-						canvas.DrawLine(num7 + num9, num8 + 3, num7 + num9, num8 + height2 - 3, 1f, 3503345919u);
-						canvas.DrawTextAligned("\u25be", num7 + width3 - 6, (float)num8 + (float)height2 / 2f, "9px sans-serif", 1145324799u, TextHAlign.Center, TextVAlign.Middle);
+						num19 = Math.Max(16, width3 - 12);
+						canvas.DrawLine(num17 + num19, num18 + 3, num17 + num19, num18 + height2 - 3, 1f, 3503345919u);
+						canvas.DrawTextAligned("\u25be", num17 + width3 - 6, (float)num18 + (float)height2 / 2f, "9px sans-serif", 1145324799u, TextHAlign.Center, TextVAlign.Middle);
 					}
 					System.Windows.Forms.ToolStripItemDisplayStyle displayStyle = toolStripItem.DisplayStyle;
-					bool flag3 = toolStripItem.Image is Bitmap { Width: >0 } bitmap && bitmap.Height > 0;
+					bool flag4 = toolStripItem.Image is Bitmap { Width: >0 } bitmap && bitmap.Height > 0;
 					string text2 = CleanItemText(toolStripItem.Text);
-					bool flag4 = !string.IsNullOrEmpty(text2);
+					bool flag5 = !string.IsNullOrEmpty(text2);
 					switch (displayStyle)
 					{
 					case System.Windows.Forms.ToolStripItemDisplayStyle.Image:
 					{
-						if (flag3)
+						if (flag4)
 						{
-							PaintCenteredBitmap(canvas, (Bitmap)toolStripItem.Image, num7, num8, num9, height2, toolStrip);
+							PaintCenteredBitmap(canvas, (Bitmap)toolStripItem.Image, num17, num18, num19, height2, toolStrip);
 							break;
 						}
-						string itemGlyph = GetItemGlyph(toolStripItem.Name, l);
-						canvas.DrawTextAligned(itemGlyph, (float)num7 + (float)num9 / 2f, (float)num8 + (float)height2 / 2f, "11px sans-serif", 1145324799u, TextHAlign.Center, TextVAlign.Middle);
+						string itemGlyph = GetItemGlyph(toolStripItem.Name, m);
+						canvas.DrawTextAligned(itemGlyph, (float)num17 + (float)num19 / 2f, (float)num18 + (float)height2 / 2f, "11px sans-serif", 1145324799u, TextHAlign.Center, TextVAlign.Middle);
 						break;
 					}
 					case System.Windows.Forms.ToolStripItemDisplayStyle.Text:
-						if (flag4)
+						if (flag5)
 						{
 							uint rgba12 = ToRgba(toolStripItem.ForeColor, 572662527u);
-							canvas.DrawTextAligned(text2, (float)num7 + (float)num9 / 2f, (float)num8 + (float)height2 / 2f, "12px 'Segoe UI', sans-serif", rgba12, TextHAlign.Center, TextVAlign.Middle);
+							canvas.DrawTextAligned(text2, (float)num17 + (float)num19 / 2f, (float)num18 + (float)height2 / 2f, "12px 'Segoe UI', sans-serif", rgba12, TextHAlign.Center, TextVAlign.Middle);
 						}
 						break;
 					case System.Windows.Forms.ToolStripItemDisplayStyle.ImageAndText:
-						if (flag3 && flag4 && num9 >= ((Bitmap)toolStripItem.Image).Width + 24)
+						if ((flag4 & flag5) && num19 >= ((Bitmap)toolStripItem.Image).Width + 24)
 						{
 							Bitmap bitmap2 = (Bitmap)toolStripItem.Image;
-							PaintCenteredBitmap(canvas, bitmap2, num7 + 2, num8, bitmap2.Width, height2, toolStrip);
+							PaintCenteredBitmap(canvas, bitmap2, num17 + 2, num18, bitmap2.Width, height2, toolStrip);
 							uint rgba10 = ToRgba(toolStripItem.ForeColor, 572662527u);
-							canvas.DrawTextAligned(text2, num7 + bitmap2.Width + 4, (float)num8 + (float)height2 / 2f, "12px 'Segoe UI', sans-serif", rgba10, TextHAlign.Left, TextVAlign.Middle);
-						}
-						else if (flag3)
-						{
-							PaintCenteredBitmap(canvas, (Bitmap)toolStripItem.Image, num7, num8, num9, height2, toolStrip);
+							canvas.DrawTextAligned(text2, num17 + bitmap2.Width + 4, (float)num18 + (float)height2 / 2f, "12px 'Segoe UI', sans-serif", rgba10, TextHAlign.Left, TextVAlign.Middle);
 						}
 						else if (flag4)
 						{
+							PaintCenteredBitmap(canvas, (Bitmap)toolStripItem.Image, num17, num18, num19, height2, toolStrip);
+						}
+						else if (flag5)
+						{
 							uint rgba11 = ToRgba(toolStripItem.ForeColor, 572662527u);
-							canvas.DrawTextAligned(text2, (float)num7 + (float)num9 / 2f, (float)num8 + (float)height2 / 2f, "12px 'Segoe UI', sans-serif", rgba11, TextHAlign.Center, TextVAlign.Middle);
+							canvas.DrawTextAligned(text2, (float)num17 + (float)num19 / 2f, (float)num18 + (float)height2 / 2f, "12px 'Segoe UI', sans-serif", rgba11, TextHAlign.Center, TextVAlign.Middle);
 						}
 						break;
 					default:
-						if (flag3)
+						if (flag4)
 						{
-							PaintCenteredBitmap(canvas, (Bitmap)toolStripItem.Image, num7, num8, num9, height2, toolStrip);
+							PaintCenteredBitmap(canvas, (Bitmap)toolStripItem.Image, num17, num18, num19, height2, toolStrip);
 						}
-						else if (flag4)
+						else if (flag5)
 						{
 							uint rgba9 = ToRgba(toolStripItem.ForeColor, 572662527u);
-							canvas.DrawTextAligned(text2, (float)num7 + (float)num9 / 2f, (float)num8 + (float)height2 / 2f, "12px 'Segoe UI', sans-serif", rgba9, TextHAlign.Center, TextVAlign.Middle);
+							canvas.DrawTextAligned(text2, (float)num17 + (float)num19 / 2f, (float)num18 + (float)height2 / 2f, "12px 'Segoe UI', sans-serif", rgba9, TextHAlign.Center, TextVAlign.Middle);
 						}
 						break;
 					case System.Windows.Forms.ToolStripItemDisplayStyle.None:
@@ -3741,9 +4711,7 @@ public sealed class WinFormsAppHost : IDisposable
 			{
 				canvas.FillRectangle(num, num2, width, height, 1852731135u);
 				object activeDocumentWorkspace = GetActiveDocumentWorkspace(control);
-				int docW;
-				int docH;
-				object activeDocumentSurface = GetActiveDocumentSurface(activeDocumentWorkspace, out docW, out docH);
+				object activeDocumentSurface = GetActiveDocumentSurface(activeDocumentWorkspace, out var docW, out var docH);
 				if (docW <= 0)
 				{
 					docW = 800;
@@ -3768,74 +4736,79 @@ public sealed class WinFormsAppHost : IDisposable
 					canvas.FillRectangle(destX, destY, destW, destH, uint.MaxValue);
 					if (activeDocumentSurface != null)
 					{
-						// Live tool previews (brush dabs) render into a
-						// layer OVERLAY that the raw surface below does
-						// not contain: mid-drag reads came back blank and
-						// the stroke only appeared at commit. While a
-						// stroke is in flight, read the vendor compositor
-						// (layers + overlays) instead. Any failure falls
-						// back to the raw read; the working path is never
-						// at risk. (Per-frame cost only during drags.)
-						byte[]? array = null;
-						// The raw read below returns the ACTIVE layer surface
-						// only: with 2+ layers it shows just the active one,
-						// so a fresh transparent layer (Ctrl+Shift+N) blanks
-						// the canvas and hides the stroke underneath. Prefer
-						// the vendor composite whenever the document has more
-						// than one layer; single-layer reads stay on the
-						// cheap raw path. Any composite failure falls back
-						// to the raw read (working path never at risk).
+						byte[] array2 = null;
 						if (_isDrawingOnDocument || GetDocumentLayerCount(activeDocumentWorkspace) > 1)
 						{
-							array = ExtractCompositedRgba(activeDocumentWorkspace, docW, docH);
+							array2 = ExtractCompositedRgba(activeDocumentWorkspace, docW, docH);
 						}
 						int blankKind = 0;
-						array = array ?? ExtractSurfaceRgba(activeDocumentSurface, docW, docH, out blankKind);
-						// Undo-to-blank reads null; feed an explicit blank
-						// so thumbs clear, then invalidate.
-						if ((array == null || array.Length == 0) && blankKind > 0 && !_isDrawingOnDocument)
+						array2 = array2 ?? ExtractSurfaceRgba(activeDocumentSurface, docW, docH, out blankKind);
+						if ((array2 == null || array2.Length == 0) && blankKind > 0 && !_isDrawingOnDocument)
 						{
-							bool blankChanged = false;
-							try { blankChanged = CpuPaint.NoteDocBlank(docW, docH, blankKind == 1); } catch { }
-							if (blankChanged)
+							bool flag6 = false;
+							try
+							{
+								flag6 = CpuPaint.NoteDocBlank(docW, docH, blankKind == 1);
+							}
+							catch
+							{
+							}
+							if (flag6)
 							{
 								try
 								{
-									var tw0 = _thumbRefreshTarget;
-									if (tw0 is not null && !tw0.IsDisposed && !tw0.Disposing)
-										tw0.Invalidate();
+									System.Windows.Forms.Control thumbRefreshTarget = _thumbRefreshTarget;
+									if (thumbRefreshTarget != null && !thumbRefreshTarget.IsDisposed && !thumbRefreshTarget.Disposing)
+									{
+										// Subtree: the Layers strip self-paints (PDN GdiControl
+										// OnPaint override) and reuses its retained layer while
+										// clean, so the form alone is not enough to refresh rows.
+										thumbRefreshTarget.Invalidate(true);
+									}
 									else
+									{
 										_thumbRefreshTarget = null;
+									}
 								}
-								catch { }
+								catch
+								{
+								}
 							}
 						}
-						if (array != null && array.Length != 0)
+						if (array2 != null && array2.Length != 0)
 						{
-							// Feed the live doc composite to the thumb stash
-							// (full-doc dims, pre-crop); on change,
-							// re-invalidate the Layers window so strips
-							// repaint from the fresh stash (retained
-							// surfaces would otherwise lag one commit).
-							bool thumbChanged = false;
-							try { thumbChanged = CpuPaint.NoteDocComposite(array, docW, docH); } catch { }
-							if (thumbChanged)
+							bool flag7 = false;
+							try
+							{
+								flag7 = CpuPaint.NoteDocComposite(array2, docW, docH);
+							}
+							catch
+							{
+							}
+							if (flag7)
 							{
 								try
 								{
-									var tw = _thumbRefreshTarget;
-									if (tw is not null && !tw.IsDisposed && !tw.Disposing)
-										tw.Invalidate();
+									System.Windows.Forms.Control thumbRefreshTarget2 = _thumbRefreshTarget;
+									if (thumbRefreshTarget2 != null && !thumbRefreshTarget2.IsDisposed && !thumbRefreshTarget2.Disposing)
+									{
+										// Subtree: see above (strip rows reuse retained layers).
+										thumbRefreshTarget2.Invalidate(true);
+									}
 									else
+									{
 										_thumbRefreshTarget = null;
+									}
 								}
-								catch { }
+								catch
+								{
+								}
 							}
 							if (zoomedBlit.SrcX != 0 || zoomedBlit.SrcY != 0 || zoomedBlit.SrcW != docW || zoomedBlit.SrcH != docH)
 							{
-								array = DocumentZoom.CropRgba(array, docW, docH, zoomedBlit.SrcX, zoomedBlit.SrcY, zoomedBlit.SrcW, zoomedBlit.SrcH);
+								array2 = DocumentZoom.CropRgba(array2, docW, docH, zoomedBlit.SrcX, zoomedBlit.SrcY, zoomedBlit.SrcW, zoomedBlit.SrcH);
 							}
-							RecordBitmap(s_docLayerKey, canvas, array, zoomedBlit.SrcW, zoomedBlit.SrcH, destX, destY, destW, destH);
+							RecordBitmap(s_docLayerKey, canvas, array2, zoomedBlit.SrcW, zoomedBlit.SrcH, destX, destY, destW, destH);
 						}
 					}
 					canvas.DrawLine(destX, destY, (float)destX + destW, destY, 1f, 2576980479u);
@@ -3860,11 +4833,11 @@ public sealed class WinFormsAppHost : IDisposable
 			}
 			else if (control.GetType().Name.Contains("SliderImpl"))
 			{
-				int num10 = num2 + height / 2;
-				int num11 = Math.Max(20, width - 45);
-				canvas.DrawLine(num, num10, num + num11, num10, 2f, 2576980479u);
-				canvas.DrawEllipse(num + num11 / 2 - 4, num10 - 4, 8f, 8f, 1f, 7919615u, 7919615u);
-				canvas.DrawTextAligned("100%", num + num11 + 6, num10, "11px 'Segoe UI', sans-serif", 572662527u, TextHAlign.Left, TextVAlign.Middle);
+				int num20 = num2 + height / 2;
+				int num21 = Math.Max(20, width - 45);
+				canvas.DrawLine(num, num20, num + num21, num20, 2f, 2576980479u);
+				canvas.DrawEllipse(num + num21 / 2 - 4, num20 - 4, 8f, 8f, 1f, 7919615u, 7919615u);
+				canvas.DrawTextAligned("100%", num + num21 + 6, num20, "11px 'Segoe UI', sans-serif", 572662527u, TextHAlign.Left, TextVAlign.Middle);
 			}
 			else if (control.GetType().Name.Contains("CaptionControl") || control.GetType().Name.Contains("DocumentWorkspace") || control.GetType().Name.Contains("ScrollableCanvasControl") || control.GetType().Name.Contains("CanvasControl"))
 			{
@@ -3875,31 +4848,16 @@ public sealed class WinFormsAppHost : IDisposable
 			}
 			else
 			{
-				// D2D controls own their pixels through the CPU Direct2D
-			// bridge: GDI self-paint only runs GdiControl.OnPaint
-			// (background fill), which then shadows the D2D render
-			// below and leaves e.g. the color wheel permanently white.
-			// Route them straight to the D2D path; its failures stay
-			// contained and logged there, and the BackColor fill below
-			// still lays a base under the composited D2D output.
-			// (Former ColorWheelControl name blocklist in
-			// TryRenderD2DControl is already removed; this ordering is
-			// what actually reaches it.)
-			// Perf note: skipping the GDI bitmap round-trip for D2D
-			// controls also saves one alloc+invoke per paint.
-			bool flag5 = IsD2DControl(control) ? false : TryRenderSelfPainted(canvas, control, num, num2, width, height);
-				if (!flag5 && !control.BackColor.IsEmpty && control.BackColor != Color.Transparent)
+				bool flag8 = !IsD2DControl(control) && TryRenderSelfPainted(canvas, control, num, num2, width, height);
+				if (!flag8 && !control.BackColor.IsEmpty && control.BackColor != Color.Transparent)
 				{
 					canvas.FillRectangle(num, num2, width, height, ToRgba(control.BackColor, 4042322175u));
 				}
-				// D2D surfaces own every pixel (swapchain on desktop): GDI
-			// never paints their Text (e.g. designer leftover Text on
-			// palette controls). Skip it like self-paint above.
-			if (!flag5 && !IsD2DControl(control) && !string.IsNullOrEmpty(control.Text) && control.Controls.Count == 0)
+				if (!flag8 && !IsD2DControl(control) && !string.IsNullOrEmpty(control.Text) && control.Controls.Count == 0)
 				{
 					canvas.DrawTextAligned(control.Text, num + 4, num2 + 12, GetFontCss(control.Font), ToRgba(control.ForeColor, 255u), TextHAlign.Left, TextVAlign.Middle);
 				}
-				if (!flag5)
+				if (!flag8)
 				{
 					TryRenderD2DControl(canvas, control, num, num2, width, height);
 				}
@@ -3917,12 +4875,16 @@ public sealed class WinFormsAppHost : IDisposable
 		try
 		{
 			if (IsFrameDirty(control))
-			System.Windows.Forms.NativeWindow.WasmNotifyPaint(control.Handle);
-			if (System.Windows.Forms.WasmOverlayBridge.TryGetOverlay(control.Handle, control.ClientSize, out Bitmap? overlay) && overlay != null)
 			{
-				byte[]? rgba = ExtractBitmapRgba(overlay);
-				if (rgba != null)
-					canvas.DrawImage(rgba, overlay.Width, overlay.Height, absX, absY, overlay.Width, overlay.Height);
+				System.Windows.Forms.NativeWindow.WasmNotifyPaint(control.Handle);
+			}
+			if (WasmOverlayBridge.TryGetOverlay(control.Handle, control.ClientSize, out Bitmap bitmap) && bitmap != null)
+			{
+				byte[] array = ExtractBitmapRgba(bitmap);
+				if (array != null)
+				{
+					canvas.DrawImage(array, bitmap.Width, bitmap.Height, absX, absY, bitmap.Width, bitmap.Height);
+				}
 			}
 		}
 		catch
@@ -3934,14 +4896,13 @@ public sealed class WinFormsAppHost : IDisposable
 	{
 		WasmDialogHost.AdvanceTurn();
 		Console.WriteLine($"[Host] OnMouseDown(x={x}, y={y}, buttons={buttons} mod={ToKeys(shift, ctrl, alt)})");
-        FeedInput(x, y, _mouseButtons | buttons, ToKeys(shift, ctrl, alt));
+		FeedInput(x, y, _mouseButtons | buttons, ToKeys(shift, ctrl, alt));
 		if (_activeForm == null)
 		{
 			return;
 		}
-		// Chorded presses accumulate (desktop MouseButtons flags); release clears.
 		_mouseButtons |= buttons;
-		System.Windows.Forms.WasmMouseState.SetModifiers(ToKeys(shift, ctrl, alt));
+		WasmMouseState.SetModifiers(ToKeys(shift, ctrl, alt));
 		FeedInput(x, y, _mouseButtons, ToKeys(shift, ctrl, alt));
 		NotePress(x, y, buttons);
 		if (RoutePopupMouseDown(x, y, buttons))
@@ -3954,7 +4915,7 @@ public sealed class WinFormsAppHost : IDisposable
 			{
 				RecordInput("down", $"{x},{y} {buttons} modal={modal.Name}");
 				_mouseTarget = HitTestDeep(modal.Controls, modal.Location.X, modal.Location.Y + ChromeHeight(modal), x, y);
-				System.Windows.Forms.WasmRepaintGate.MarkDirtyChain(_mouseTarget);
+				WasmRepaintGate.MarkDirtyChain(_mouseTarget);
 				NoteFocus(_mouseTarget);
 				if (_mouseTarget != null && !(_mouseTarget is System.Windows.Forms.ToolStrip))
 				{
@@ -3975,7 +4936,7 @@ public sealed class WinFormsAppHost : IDisposable
 				Console.WriteLine($"[Host] OnMouseDown hit document canvas: {_documentPageBounds}");
 				RecordInput("down", $"{x},{y} {buttons} doc tool={GetActiveDocToolName()}");
 				_isDrawingOnDocument = true;
-				System.Windows.Forms.WasmRepaintGate.MarkGlobalDirty();
+				WasmRepaintGate.MarkGlobalDirty();
 				Console.WriteLine("[Host] OnMouseDown doc tool=" + GetActiveDocToolName());
 				ForwardDocumentPointer(x, y, buttons, PointerEventKind.Pressed);
 			}
@@ -4000,26 +4961,50 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 		int parentAbsY = y2 + num;
 		System.Windows.Forms.Control control = HitTestDeep(_activeForm.Controls, x2, parentAbsY, x, y);
-		if (!DownTrackedDock(x, y, buttons))
+		if (DownTrackedDock(x, y, buttons))
 		{
-			Console.WriteLine("[Host] OnMouseDown hit=" + ((control == null) ? "null" : (control.GetType().Name + " '" + control.Name + "'")));
-			Console.WriteLine($"[Host] form loc={_activeForm.Location} size={_activeForm.Width}x{_activeForm.Height} kids={_activeForm.Controls.Count} chrome={ChromeHeight(_activeForm)} view={ViewWidth}x{ViewHeight}");
-			Console.WriteLine("[Host] kids=" + DescribeKids(_activeForm.Controls, 0));
-			if (control is System.Windows.Forms.Button pressedButton)
+			return;
+		}
+		Console.WriteLine("[Host] OnMouseDown hit=" + ((control == null) ? "null" : (control.GetType().Name + " '" + control.Name + "'")));
+		if (control == null)
+		{
+			try
 			{
-				_pressedButton = pressedButton;
+				System.Windows.Forms.Form activeForm = _activeForm;
+				Console.WriteLine("[Host] NULLHIT form=" + ((activeForm == null) ? "null" : (activeForm.GetType().Name + " loc=" + activeForm.Location.ToString() + " cli=" + activeForm.ClientSize)) + " n=" + (activeForm?.Controls.Count ?? (-1)));
 			}
-			NoteFocus(control);
-			_mouseTarget = control;
-			if (_mouseTarget is not null)
-				MarkCursorNeighborhood(_mouseTarget, x, y, 128);
-			RecordInput("down", $"{x},{y} {buttons} target={DescribeControl(control)}");
-			if (control != null && !(control is System.Windows.Forms.ToolStrip))
+			catch
 			{
-				Console.WriteLine("[Host] Invoking RaiseMouseEvent OnMouseDown on " + control.Name);
-				RaiseMouseEvent(s_onMouseDownMethod, control, buttons, 1, x, y);
-				Console.WriteLine("[Host] RaiseMouseEvent OnMouseDown done");
 			}
+		}
+		Console.WriteLine($"[Host] form loc={_activeForm.Location} size={_activeForm.Width}x{_activeForm.Height} kids={_activeForm.Controls.Count} chrome={ChromeHeight(_activeForm)} view={ViewWidth}x{ViewHeight}");
+		Console.WriteLine("[Host] kids=" + DescribeKids(_activeForm.Controls, 0));
+		if (control is System.Windows.Forms.Button pressedButton)
+		{
+			_pressedButton = pressedButton;
+		}
+		NoteFocus(control);
+		if (control != null)
+		{
+			try
+			{
+				control.Focus();
+			}
+			catch
+			{
+			}
+		}
+		_mouseTarget = control;
+		if (_mouseTarget != null)
+		{
+			MarkCursorNeighborhood(_mouseTarget, x, y, 128);
+		}
+		RecordInput("down", $"{x},{y} {buttons} target={DescribeControl(control)}");
+		if (control != null && !(control is System.Windows.Forms.ToolStrip))
+		{
+			Console.WriteLine("[Host] Invoking RaiseMouseEvent OnMouseDown on " + control.Name);
+			RaiseMouseEvent(s_onMouseDownMethod, control, buttons, 1, x, y);
+			Console.WriteLine("[Host] RaiseMouseEvent OnMouseDown done");
 		}
 	}
 
@@ -4032,36 +5017,38 @@ public sealed class WinFormsAppHost : IDisposable
 		if (_isDrawingOnDocument)
 		{
 			ForwardDocumentPointer(x, y, buttons, PointerEventKind.Released);
-			System.Windows.Forms.WasmRepaintGate.MarkGlobalDirty();
+			WasmRepaintGate.MarkGlobalDirty();
 			_isDrawingOnDocument = false;
 			Console.WriteLine("[Host] PostStroke surface=" + DescribeActiveDocSurface());
 		}
 		_isDraggingTitle = false;
 		_pressedButton = null;
 		_mouseButtons &= ~buttons;
-		System.Windows.Forms.WasmMouseState.SetModifiers(ToKeys(shift, ctrl, alt));
+		WasmMouseState.SetModifiers(ToKeys(shift, ctrl, alt));
 		if (_mouseTarget != null)
 		{
-			System.Windows.Forms.WasmRepaintGate.MarkDirtyChain(_mouseTarget);
-			RaiseMouseEvent(s_onMouseUpMethod, _mouseTarget, buttons, 1, x, y);
+			WasmRepaintGate.MarkDirtyChain(_mouseTarget);
+			ResetButtonPress(_mouseTarget);
+			if (!SkipButtonMouseUp(_mouseTarget))
+				RaiseMouseEvent(s_onMouseUpMethod, _mouseTarget, buttons, 1, x, y);
 			_mouseTarget = null;
 		}
 		FeedInput(x, y, _mouseButtons, ToKeys(shift, ctrl, alt));
 		PairClick(x, y, buttons);
-        RecordInput("up", isDrawingOnDocument ? $"{x},{y} {buttons} doc" : $"{x},{y} {buttons}");
+		RecordInput("up", isDrawingOnDocument ? $"{x},{y} {buttons} doc" : $"{x},{y} {buttons}");
 		UpdateHover(x, y);
 	}
 
 	public void OnMouseMove(int x, int y, bool shift = false, bool ctrl = false, bool alt = false)
 	{
 		WasmDialogHost.AdvanceTurn();
-		System.Windows.Forms.WasmMouseState.SetModifiers(ToKeys(shift, ctrl, alt));
+		WasmMouseState.SetModifiers(ToKeys(shift, ctrl, alt));
 		NoteMoveForHover(x, y);
 		if (_isDrawingOnDocument)
 		{
 			FeedInput(x, y, _mouseButtons, ToKeys(shift, ctrl, alt));
-            ForwardDocumentPointer(x, y, _mouseButtons, PointerEventKind.Moved);
-            System.Windows.Forms.WasmRepaintGate.MarkGlobalDirty();
+			ForwardDocumentPointer(x, y, _mouseButtons, PointerEventKind.Moved);
+			WasmRepaintGate.MarkGlobalDirty();
 			long tickCount = Environment.TickCount64;
 			if (tickCount - _lastDocMoveMs >= 100)
 			{
@@ -4072,14 +5059,14 @@ public sealed class WinFormsAppHost : IDisposable
 		else
 		{
 			FeedInput(x, y, _mouseButtons, ToKeys(shift, ctrl, alt));
-            System.Windows.Forms.Form form = _dragForm ?? _activeForm;
+			System.Windows.Forms.Form form = _dragForm ?? _activeForm;
 			if (_isDraggingTitle && form != null)
 			{
 				int num = x - _dragStartX;
 				int num2 = y - _dragStartY;
 				form.Location = new Point(_dragInitialFormX + num, _dragInitialFormY + num2);
 				_userPlaced.Add(form);
-				System.Windows.Forms.WasmRepaintGate.MarkDirtyChain(form);
+				WasmRepaintGate.MarkDirtyChain(form);
 			}
 			else if (_mouseTarget != null)
 			{
@@ -4092,30 +5079,26 @@ public sealed class WinFormsAppHost : IDisposable
 			}
 		}
 	}
-	// Cursor-neighborhood backstop mark (press + drag moves): the app invalidates
-	// its own drag damage (tight rects); the host only needs a cursor-neighborhood backstop
-	// for visuals no app Invalidate covers (press/hover state). Small
-	// targets keep the full chain mark (cheap); large self-painted
-	// targets get a cursor rect so region repaint stays engaged. A
-	// cursor outside the target falls back to the full chain (rare,
-	// and a superset is always safe).
+
 	private void MarkCursorNeighborhood(System.Windows.Forms.Control target, int x, int y, int half = 48)
 	{
-		if (_activeForm is null || (long)target.Width * target.Height <= 65536)
+		if (_activeForm == null || (long)target.Width * (long)target.Height <= 65536)
 		{
-			System.Windows.Forms.WasmRepaintGate.MarkDirtyChain(target);
+			WasmRepaintGate.MarkDirtyChain(target);
 			return;
 		}
-		int ax = GetControlAbsX(target, _activeForm.Location.X);
-		int ay = GetControlAbsY(target, _activeForm.Location.Y + ChromeHeight(_activeForm));
-		var rc = new Rectangle(x - ax - half, y - ay - half, half * 2, half * 2);
-		rc = Rectangle.Intersect(rc, new Rectangle(0, 0, target.Width, target.Height));
-		if (rc.Width <= 0 || rc.Height <= 0)
+		int controlAbsX = GetControlAbsX(target, _activeForm.Location.X);
+		int controlAbsY = GetControlAbsY(target, _activeForm.Location.Y + ChromeHeight(_activeForm));
+		Rectangle a = new Rectangle(x - controlAbsX - half, y - controlAbsY - half, half * 2, half * 2);
+		a = Rectangle.Intersect(a, new Rectangle(0, 0, target.Width, target.Height));
+		if (a.Width <= 0 || a.Height <= 0)
 		{
-			System.Windows.Forms.WasmRepaintGate.MarkDirtyChain(target);
-			return;
+			WasmRepaintGate.MarkDirtyChain(target);
 		}
-		System.Windows.Forms.WasmRepaintGate.MarkDirtyChainRect(target, rc);
+		else
+		{
+			WasmRepaintGate.MarkDirtyChainRect(target, a);
+		}
 	}
 
 	private void UpdateHover(int x, int y)
@@ -4127,11 +5110,11 @@ public sealed class WinFormsAppHost : IDisposable
 		int x2 = _activeForm.Location.X;
 		int y2 = _activeForm.Location.Y;
 		int num = y2 + ChromeHeight(_activeForm);
-		if (TopPopupAt(x, y, out System.Windows.Forms.Control? popupHover) && popupHover != null)
+		if (TopPopupAt(x, y, out System.Windows.Forms.Control popup) && popup != null)
 		{
-			System.Windows.Forms.Control hoverTarget = HitTestDeep(popupHover.Controls, popupHover.Location.X, popupHover.Location.Y, x, y) ?? popupHover;
-			SetHoverControl(hoverTarget);
-			RaiseMouseEvent(s_onMouseMoveMethod, hoverTarget, _mouseButtons, 0, x, y);
+			System.Windows.Forms.Control control = HitTestDeep(popup.Controls, popup.Location.X, popup.Location.Y, x, y) ?? popup;
+			SetHoverControl(control);
+			RaiseMouseEvent(s_onMouseMoveMethod, control, _mouseButtons, 0, x, y);
 			return;
 		}
 		if (TryHitDropdown(x, y, out System.Windows.Forms.ToolStripDropDown drop, out System.Windows.Forms.ToolStripItem item, out int dx, out int dy))
@@ -4148,8 +5131,8 @@ public sealed class WinFormsAppHost : IDisposable
 		SetHoverItem(null);
 		if (TopTrackedWindowAt(x, y, out System.Windows.Forms.Form win, out bool isModal) && win != null && !isModal)
 		{
-			System.Windows.Forms.Control control = HitTestDeep(win.Controls, win.Location.X, win.Location.Y + ChromeHeight(win), x, y);
-			if (control is System.Windows.Forms.ToolStrip toolStrip)
+			System.Windows.Forms.Control control2 = HitTestDeep(win.Controls, win.Location.X, win.Location.Y + ChromeHeight(win), x, y);
+			if (control2 is System.Windows.Forms.ToolStrip toolStrip)
 			{
 				int controlAbsX = GetControlAbsX(toolStrip, win.Location.X);
 				int controlAbsY = GetControlAbsY(toolStrip, win.Location.Y + ChromeHeight(win));
@@ -4163,18 +5146,18 @@ public sealed class WinFormsAppHost : IDisposable
 			}
 			else
 			{
-				SetHoverControl(control);
-				if (control != null)
+				SetHoverControl(control2);
+				if (control2 != null)
 				{
-					RaiseMouseEvent(s_onMouseMoveMethod, control, _mouseButtons, 0, x, y);
+					RaiseMouseEvent(s_onMouseMoveMethod, control2, _mouseButtons, 0, x, y);
 				}
 			}
 			return;
 		}
 		if (TopModalWindow(out System.Windows.Forms.Form modal) && modal != null)
 		{
-			System.Windows.Forms.Control control2 = HitTestDeep(modal.Controls, modal.Location.X, modal.Location.Y + ChromeHeight(modal), x, y);
-			if (control2 is System.Windows.Forms.ToolStrip toolStrip2)
+			System.Windows.Forms.Control control3 = HitTestDeep(modal.Controls, modal.Location.X, modal.Location.Y + ChromeHeight(modal), x, y);
+			if (control3 is System.Windows.Forms.ToolStrip toolStrip2)
 			{
 				int controlAbsX2 = GetControlAbsX(toolStrip2, modal.Location.X);
 				int controlAbsY2 = GetControlAbsY(toolStrip2, modal.Location.Y + ChromeHeight(modal));
@@ -4188,10 +5171,10 @@ public sealed class WinFormsAppHost : IDisposable
 			}
 			else
 			{
-				SetHoverControl(control2);
-				if (control2 != null)
+				SetHoverControl(control3);
+				if (control3 != null)
 				{
-					RaiseMouseEvent(s_onMouseMoveMethod, control2, _mouseButtons, 0, x, y);
+					RaiseMouseEvent(s_onMouseMoveMethod, control3, _mouseButtons, 0, x, y);
 				}
 			}
 			return;
@@ -4201,8 +5184,8 @@ public sealed class WinFormsAppHost : IDisposable
 			SetHoverControl(null);
 			return;
 		}
-		System.Windows.Forms.Control control3 = HitTestDeep(_activeForm.Controls, x2, num, x, y);
-		if (control3 is System.Windows.Forms.ToolStrip toolStrip3)
+		System.Windows.Forms.Control control4 = HitTestDeep(_activeForm.Controls, x2, num, x, y);
+		if (control4 is System.Windows.Forms.ToolStrip toolStrip3)
 		{
 			int controlAbsX3 = GetControlAbsX(toolStrip3, x2);
 			int controlAbsY3 = GetControlAbsY(toolStrip3, num);
@@ -4217,18 +5200,14 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 		else
 		{
-			SetHoverControl(control3);
-			if (control3 != null)
+			SetHoverControl(control4);
+			if (control4 != null)
 			{
-				RaiseMouseEvent(s_onMouseMoveMethod, control3, _mouseButtons, 0, x, y);
+				RaiseMouseEvent(s_onMouseMoveMethod, control4, _mouseButtons, 0, x, y);
 			}
 		}
 	}
 
-	/// <summary>Host-side focus: last control the user pressed. The fork
-	/// has no HWND focus to read, so clicks are the focus signal; key
-	/// delivery follows it (FIX2). ActiveControl is kept in sync so app
-	/// code reading it sees the same control.</summary>
 	private void NoteFocus(System.Windows.Forms.Control? control)
 	{
 		_focusedControl = control;
@@ -4239,9 +5218,9 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 		try
 		{
-			for (System.Windows.Forms.Control? current = control; current != null; current = current.Parent)
+			for (System.Windows.Forms.Control control2 = control; control2 != null; control2 = control2.Parent)
 			{
-				if (current is System.Windows.Forms.Form form)
+				if (control2 is System.Windows.Forms.Form form)
 				{
 					form.ActiveControl = control;
 					break;
@@ -4252,40 +5231,38 @@ public sealed class WinFormsAppHost : IDisposable
 		{
 		}
 	}
-	// The fork reads Form.ActiveForm / GetForegroundWindow from the OS
-	// foreground window, which never updates headless (see WasmForeground);
-	// publish the host's active form there on every switch/teardown.
-	// Never throws: foreground state must not break scene select.
+
 	private static void SyncForkForeground(System.Windows.Forms.Form? form)
 	{
 		try
 		{
 			if (form == null || form.IsDisposed)
 			{
-				System.Windows.Forms.WasmForeground.Clear();
+				WasmForeground.Clear();
 				return;
 			}
 			try
 			{
-				System.Windows.Forms.WasmForeground.Set((nint)form.Handle);
+				WasmForeground.Set(form.Handle);
 			}
 			catch
 			{
-				System.Windows.Forms.WasmForeground.Clear();
+				WasmForeground.Clear();
 			}
 		}
 		catch
 		{
 		}
 	}
+
 	private void SetHoverControl(System.Windows.Forms.Control? next)
 	{
 		if (_hoverControl != next)
 		{
 			System.Windows.Forms.Control hoverControl = _hoverControl;
 			_hoverControl = next;
-			System.Windows.Forms.WasmRepaintGate.MarkDirtyChain(next);
-			System.Windows.Forms.WasmRepaintGate.MarkDirtyChain(hoverControl);
+			WasmRepaintGate.MarkDirtyChain(next);
+			WasmRepaintGate.MarkDirtyChain(hoverControl);
 			if (hoverControl != null)
 			{
 				RaiseSimpleEvent(s_onMouseLeaveMethod, hoverControl);
@@ -4309,8 +5286,8 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 		System.Windows.Forms.ToolStripItem hoverItem = _hoverItem;
 		_hoverItem = next;
-		System.Windows.Forms.WasmRepaintGate.MarkDirtyChain(next?.Owner);
-		System.Windows.Forms.WasmRepaintGate.MarkDirtyChain(hoverItem?.Owner);
+		WasmRepaintGate.MarkDirtyChain(next?.Owner);
+		WasmRepaintGate.MarkDirtyChain(hoverItem?.Owner);
 		if (hoverItem != null)
 		{
 			try
@@ -4342,14 +5319,7 @@ public sealed class WinFormsAppHost : IDisposable
 
 	private void RaiseSimpleEvent(MethodInfo? method, System.Windows.Forms.Control target)
 	{
-		if (method == null || _activeForm == null)
-		{
-			return;
-		}
-		// FIX3/G6: entering/leaving a disposed control raises into torn-down
-		// state (Telerik RadControl.OnMouseLeave NRE); desktop never delivers
-		// events to disposed controls, so skip.
-		if (target.IsDisposed)
+		if (method == null || _activeForm == null || target.IsDisposed)
 		{
 			return;
 		}
@@ -4361,7 +5331,14 @@ public sealed class WinFormsAppHost : IDisposable
 		{
 			Console.WriteLine("[WinFormsAppHost] Mouse enter/leave error: " + ex.GetType().Name + ": " + ex.Message.Split('\n')[0]);
 			Console.WriteLine("[WinFormsAppHost] Mouse enter/leave error: root=" + RootCause(ex).GetType().Name + " site=" + SiteOf(RootCause(ex)) + " msg=" + (RootCause(ex).Message ?? "").Split('\n')[0]);
-			try { Console.WriteLine("[diagstack] " + string.Join(" <- ", new System.Diagnostics.StackTrace(RootCause(ex), false).GetFrames().Take(12).Select(f => f.GetMethod()))); } catch { }
+			try
+			{
+				Console.WriteLine("[diagstack] " + string.Join(" <- ", from f in new StackTrace(RootCause(ex), fNeedFileInfo: false).GetFrames().Take(12)
+					select f.GetMethod()));
+			}
+			catch
+			{
+			}
 			BrowserErrorReporter.Report("hover", ex, SiteOf(RootCause(ex)));
 		}
 	}
@@ -4387,16 +5364,15 @@ public sealed class WinFormsAppHost : IDisposable
 			return;
 		}
 		List<(System.Windows.Forms.ToolStripDropDown, int, int)> openDropdowns = GetOpenDropdowns();
-		if (openDropdowns.Count == 0 || openDropdowns.Any<(System.Windows.Forms.ToolStripDropDown, int, int)>(((System.Windows.Forms.ToolStripDropDown Drop, int Ox, int Oy) d) => d.Drop == mi.DropDown))
+		if (openDropdowns.Count == 0 || openDropdowns.Any(((System.Windows.Forms.ToolStripDropDown Drop, int Ox, int Oy) d) => d.Drop == mi.DropDown))
 		{
 			return;
 		}
-		foreach (var item3 in openDropdowns.ToList())
+		foreach (var (toolStripDropDown, _, _) in openDropdowns.ToList())
 		{
-			System.Windows.Forms.ToolStripDropDown item2 = item3.Item1;
 			try
 			{
-				item2.Visible = false;
+				toolStripDropDown.Visible = false;
 			}
 			catch
 			{
@@ -4408,14 +5384,13 @@ public sealed class WinFormsAppHost : IDisposable
 
 	private void MaybeSweepDropMenu(System.Windows.Forms.ToolStripDropDown parentDrop, System.Windows.Forms.ToolStripItem item, int dx, int dy)
 	{
-		foreach (var item3 in GetOpenDropdowns().ToList())
+		foreach (var (toolStripDropDown, _, _) in GetOpenDropdowns().ToList())
 		{
-			System.Windows.Forms.ToolStripDropDown item2 = item3.Drop;
-			if (item2 != parentDrop && IsOwnedBy(item2, parentDrop) && (!(item is System.Windows.Forms.ToolStripMenuItem { HasDropDownItems: not false } toolStripMenuItem) || item2 != toolStripMenuItem.DropDown))
+			if (toolStripDropDown != parentDrop && IsOwnedBy(toolStripDropDown, parentDrop) && (!(item is System.Windows.Forms.ToolStripMenuItem { HasDropDownItems: not false } toolStripMenuItem) || toolStripDropDown != toolStripMenuItem.DropDown))
 			{
 				try
 				{
-					item2.Visible = false;
+					toolStripDropDown.Visible = false;
 				}
 				catch
 				{
@@ -4423,7 +5398,7 @@ public sealed class WinFormsAppHost : IDisposable
 			}
 		}
 		System.Windows.Forms.ToolStripMenuItem mi = item as System.Windows.Forms.ToolStripMenuItem;
-		if (mi != null && mi.HasDropDownItems && !GetOpenDropdowns().Any<(System.Windows.Forms.ToolStripDropDown, int, int)>(((System.Windows.Forms.ToolStripDropDown Drop, int Ox, int Oy) d) => d.Drop == mi.DropDown))
+		if (mi != null && mi.HasDropDownItems && !GetOpenDropdowns().Any(((System.Windows.Forms.ToolStripDropDown Drop, int Ox, int Oy) d) => d.Drop == mi.DropDown))
 		{
 			try
 			{
@@ -4468,172 +5443,280 @@ public sealed class WinFormsAppHost : IDisposable
 		{
 			return;
 		}
-		// Upstream WmMouseDown/WmMouseUp own the capture transitions around
-		// the handlers (Capture=true before OnMouseDown, released exiting
-		// MouseUp); the host bypasses WndProc, so it performs them here.
-		// ToolStrip maintains its own capture mode upstream: leave it alone.
-		bool isDown = method == s_onMouseDownMethod;
-		bool isUp = method == s_onMouseUpMethod;
-		if (isDown && !(target is System.Windows.Forms.ToolStrip))
+		bool flag = method == s_onMouseDownMethod;
+		bool flag2 = method == s_onMouseUpMethod;
+		if (flag && !(target is System.Windows.Forms.ToolStrip))
 		{
-			try { target.Capture = true; } catch { }
+			try
+			{
+				target.Capture = true;
+			}
+			catch
+			{
+			}
 		}
 		try
 		{
-			// Anchor to the target's own top-level window: modal/dock
-			// windows sit at different origins than _activeForm, and the
-			// old anchor shifted every delivered Location by the
-			// inter-form delta (ColorGrid cell clicks indexed outside the
-			// grid and died as swallowed IOOREs). Nested (MDI-child)
-			// targets keep the legacy anchor.
-			int baseX = _activeForm.Location.X;
-			int baseY = _activeForm.Location.Y + ChromeHeight(_activeForm);
-			System.Windows.Forms.Form? ownerForm = target as System.Windows.Forms.Form;
-			for (System.Windows.Forms.Control? c = target.Parent; c != null && ownerForm == null; c = c.Parent)
-				if (c is System.Windows.Forms.Form f) ownerForm = f;
-			if (ownerForm is not null && ownerForm.Parent is null)
+			int x2 = _activeForm.Location.X;
+			int formClientY = _activeForm.Location.Y + ChromeHeight(_activeForm);
+			System.Windows.Forms.Form form = target as System.Windows.Forms.Form;
+			System.Windows.Forms.Control parent = target.Parent;
+			while (parent != null && form == null)
 			{
-				baseX = ownerForm.Location.X;
-				baseY = ownerForm.Location.Y + ChromeHeight(ownerForm);
+				if (parent is System.Windows.Forms.Form form2)
+				{
+					form = form2;
+				}
+				parent = parent.Parent;
 			}
-			int controlAbsX = GetControlAbsX(target, baseX);
-			int controlAbsY = GetControlAbsY(target, baseY);
+			if (form != null && form.Parent == null)
+			{
+				x2 = form.Location.X;
+				formClientY = form.Location.Y + ChromeHeight(form);
+			}
+			int controlAbsX = GetControlAbsX(target, x2);
+			int controlAbsY = GetControlAbsY(target, formClientY);
 			System.Windows.Forms.MouseEventArgs e = new System.Windows.Forms.MouseEventArgs(buttons, clicks, x - controlAbsX, y - controlAbsY, delta);
 			method.Invoke(target, new object[1] { e });
 		}
 		catch (Exception ex)
 		{
 			Console.WriteLine("[WinFormsAppHost] Mouse event error: " + ex.GetType().Name + ": " + (ex.Message ?? "").Split('\n')[0] + " site=" + SiteOf(ex));
-			Console.WriteLine("[WinFormsAppHost] Mouse event error: root=" + RootCause(ex).GetType().Name + " site=" + SiteOf(RootCause(ex)) + " msg=" + ((RootCause(ex).Message ?? "").Split('\n')[0]));
-			try { Console.WriteLine("[diagstack] " + string.Join(" <- ", new System.Diagnostics.StackTrace(RootCause(ex), false).GetFrames().Take(12).Select(f => f.GetMethod()))); } catch { }
-		}
-		if (isUp)
-		{
-			// Only the holder releases (host hit-tests per event; desktop
-			// delivers the up to the captor, which is the same guard).
+			Console.WriteLine("[WinFormsAppHost] Mouse event error: root=" + RootCause(ex).GetType().Name + " site=" + SiteOf(RootCause(ex)) + " msg=" + (RootCause(ex).Message ?? "").Split('\n')[0]);
 			try
 			{
-				if (target.Capture)
-				{
-					target.Capture = false;
-				}
+				Console.WriteLine("[diagstack] " + string.Join(" <- ", from f in new StackTrace(RootCause(ex), fNeedFileInfo: false).GetFrames().Take(12)
+					select f.GetMethod()));
 			}
-			catch { }
+			catch
+			{
+			}
+		}
+		if (!flag2)
+		{
+			return;
+		}
+		try
+		{
+			if (target.Capture)
+			{
+				target.Capture = false;
+			}
+		}
+		catch
+		{
 		}
 	}
 
-	// Activation runs on a qualified release (see PairClick), never on press:
-	// drags must not click, and the second press of a double-click must not
-	// re-activate (it raises DoubleClick instead).
-	// Click/hover/wheel state machine (desktop parity). Tokens identify the
-	// pressed/released target by reference across the modal/dropdown/doc/
-	// title/client dispatch branches.
-	private sealed class ClickToken : IEquatable<ClickToken>
+	internal static System.Windows.Forms.MouseButtons MapDomButton(long button)
 	{
-		public ClickToken(string kind, object? target) { Kind = kind; Target = target; }
-		public string Kind { get; }
-		public object? Target { get; }
-		public bool Equals(ClickToken? other) => other is not null && Kind == other.Kind && ReferenceEquals(Target, other.Target);
-		public override bool Equals(object? obj) => Equals(obj as ClickToken);
-		public override int GetHashCode() => HashCode.Combine(Kind, System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Target));
+		if (1 == 0)
+		{
+		}
+		long num = button - 1;
+		if ((ulong)num > 3uL)
+		{
+			goto IL_0048;
+		}
+		switch ((int)num)
+		{
+		case 0:
+			break;
+		case 1:
+			goto IL_0030;
+		case 2:
+			goto IL_0038;
+		case 3:
+			goto IL_0040;
+		default:
+			goto IL_0048;
+		}
+		System.Windows.Forms.MouseButtons result = System.Windows.Forms.MouseButtons.Middle;
+		goto IL_0050;
+		IL_0040:
+		result = System.Windows.Forms.MouseButtons.XButton2;
+		goto IL_0050;
+		IL_0048:
+		result = System.Windows.Forms.MouseButtons.Left;
+		goto IL_0050;
+		IL_0050:
+		if (1 == 0)
+		{
+		}
+		return result;
+		IL_0030:
+		result = System.Windows.Forms.MouseButtons.Right;
+		goto IL_0050;
+		IL_0038:
+		result = System.Windows.Forms.MouseButtons.XButton1;
+		goto IL_0050;
 	}
 
-	internal static System.Windows.Forms.MouseButtons MapDomButton(long button) => button switch
+	private static System.Windows.Forms.Keys ToKeys(bool shift, bool ctrl, bool alt)
 	{
-		1 => System.Windows.Forms.MouseButtons.Middle,
-		2 => System.Windows.Forms.MouseButtons.Right,
-		3 => System.Windows.Forms.MouseButtons.XButton1,
-		4 => System.Windows.Forms.MouseButtons.XButton2,
-		_ => System.Windows.Forms.MouseButtons.Left,
-	};
+		return (System.Windows.Forms.Keys)((shift ? 65536 : 0) | (ctrl ? 131072 : 0) | (alt ? 262144 : 0));
+	}
 
-	private static System.Windows.Forms.Keys ToKeys(bool shift, bool ctrl, bool alt) =>
-		(shift ? System.Windows.Forms.Keys.Shift : 0) | (ctrl ? System.Windows.Forms.Keys.Control : 0) | (alt ? System.Windows.Forms.Keys.Alt : 0);
-
-	// Feeds every headless input static from one call site: the fork mouse
-	// state (WasmMouseState, read by GetCursorPos/GetKeyState stubs) and the
-	// Control statics read it back through the stubs (no setters upstream).
 	private static void FeedInput(int x, int y, System.Windows.Forms.MouseButtons buttons, System.Windows.Forms.Keys modifiers)
 	{
-		// Single source: the fork statics (Control.ModifierKeys/MouseButtons/
-		// MousePosition) read the GetCursorPos/GetKeyState stubs, which read this.
-		System.Windows.Forms.WasmMouseState.Update(x, y, buttons, modifiers);
+		WasmMouseState.Update(x, y, buttons, modifiers);
 	}
 
-	// Side-effect-free twin of the down/up dispatch branches: resolves which
-	// target a press/release belongs to. Keep the branch order in sync with
-	// OnMouseDown/OnClick (modal, dropdown, document, title bar, client).
 	private ClickToken ResolveClickToken(int x, int y)
 	{
 		if (_activeForm == null)
+		{
 			return new ClickToken("none", null);
+		}
 		if (TopModalWindow(out System.Windows.Forms.Form modal) && modal != null)
+		{
 			return new ClickToken("modal", HitTestDeep(modal.Controls, modal.Location.X, modal.Location.Y + ChromeHeight(modal), x, y));
-		if (TryHitDropdown(x, y, out System.Windows.Forms.ToolStripDropDown _, out System.Windows.Forms.ToolStripItem? item, out int _, out int _))
+		}
+		if (TryHitDropdown(x, y, out System.Windows.Forms.ToolStripDropDown _, out System.Windows.Forms.ToolStripItem item, out int _, out int _))
+		{
 			return new ClickToken("dropdown", item);
+		}
 		if (_documentPageBounds.Width > 0 && _documentPageBounds.Contains(x, y))
+		{
 			return new ClickToken("doc", null);
-		int fx = _activeForm.Location.X;
-		int fy = _activeForm.Location.Y;
-		int ch = ChromeHeight(_activeForm);
-		if (x >= fx && x <= fx + _activeForm.Width && y >= fy && y < fy + ch)
+		}
+		int x2 = _activeForm.Location.X;
+		int y2 = _activeForm.Location.Y;
+		int num = ChromeHeight(_activeForm);
+		if (x >= x2 && x <= x2 + _activeForm.Width && y >= y2 && y < y2 + num)
+		{
 			return new ClickToken("title", null);
-		return new ClickToken("client", HitTestDeep(_activeForm.Controls, fx, fy + ch, x, y));
+		}
+		return new ClickToken("client", HitTestDeep(_activeForm.Controls, x2, y2 + num, x, y));
 	}
 
 	private void NotePress(int x, int y, System.Windows.Forms.MouseButtons buttons)
 	{
 		_downToken = ResolveClickToken(x, y);
+		Console.WriteLine("[Host] Press tok=" + _downToken.Kind + "/" + ((_downToken.Target == null) ? "null" : _downToken.Target.GetType().Name) + " at=" + x + "," + y);
 		_downX = x;
+		_pressTarget = _downToken.Target as System.Windows.Forms.Control;
+		_pairedPress = false;
 		_downY = y;
 		_downMs = TickNow();
 		_downButton = buttons;
 	}
 
-	// Release pairing: a Click needs the same target + button as the press
-	// with no drag past DragSize in between. A second qualifying Click
-	// inside the double-click window/rect becomes a DoubleClick (no second
-	// activation); anything else resets the chain.
+	private static bool SkipButtonMouseUp(System.Windows.Forms.Control? target)
+	{
+		// Single-dispatch guard: the click-side PerformClick is the single
+		// authority for RadButton activation. Letting the up-dispatch reach
+		// the ButtonElement fires Click a second time for buttons whose
+		// element geometry aligns (search toggles back to Main). Buttons
+		// whose element misses (showAll) never fired on up anyway.
+		try
+		{
+			if (target is null || !IsVendorControl(target))
+				return false;
+			if (!target.GetType().Name.Contains("RadButton", StringComparison.Ordinal))
+				return false;
+			Console.WriteLine("[VAPI] button-up-skipped " + target.Name);
+			return true;
+		}
+		catch { return false; }
+	}
+	
+	private static void ResetButtonPress(System.Windows.Forms.Control? target)
+	{
+		// Single-dispatch guard: a Release-mode RadButton whose element
+		// geometry aligns would fire its Click on mouse-up AND again via
+		// the click-side PerformClick (toggle buttons visibly double-fire).
+		// Clearing the pressed state before up-dispatch makes the click
+		// side the single authority. Buttons whose element misses (showAll)
+		// never fired on up anyway.
+		try
+		{
+			if (target is null || !IsVendorControl(target))
+				return;
+			if (!target.GetType().Name.Contains("RadButton", StringComparison.Ordinal))
+				return;
+			object? btnEl = target.GetType().GetProperty("ButtonElement")?.GetValue(target);
+			System.Reflection.PropertyInfo? pressed = btnEl?.GetType().GetProperty("IsPressed");
+			if (pressed is not null && pressed.CanWrite && pressed.PropertyType == typeof(bool))
+			{
+				pressed.SetValue(btnEl, false);
+				Console.WriteLine("[VAPI] button-press-reset " + target.Name);
+			}
+			else
+				Console.WriteLine("[VAPI] button-press-noreset " + target.Name);
+		}
+		catch (Exception ex) { Console.WriteLine("[VAPI] button-press-throw " + ex.GetType().Name); }
+	}
+	
+	private static bool PressTargetContains(ClickToken? up, ClickToken? down)
+	{
+		// Capture semantics: a press whose own mouse-down handling
+		// transiently unresolves its button (Telerik press visuals) still
+		// completes when released over the button's parent. Same gesture
+		// kind only; popups/modals keep their own priority upstream.
+		try
+		{
+			if (up is null || down is null || up.Target is null || down.Target is null)
+				return false;
+			if (!string.Equals(up.Kind, down.Kind, StringComparison.Ordinal))
+				return false;
+			System.Windows.Forms.Control? u = up.Target as System.Windows.Forms.Control;
+			System.Windows.Forms.Control? d = down.Target as System.Windows.Forms.Control;
+			if (u is null || d is null || u == d)
+				return false;
+			for (System.Windows.Forms.Control? c = d.Parent; c is not null; c = c.Parent)
+			{
+				if (c == u)
+					return true;
+			}
+			for (System.Windows.Forms.Control? c2 = u.Parent; c2 is not null; c2 = c2.Parent)
+			{
+				if (c2 == d)
+					return true;
+			}
+		}
+		catch { }
+		return false;
+	}
+	
 	private void PairClick(int x, int y, System.Windows.Forms.MouseButtons buttons)
 	{
 		if (_activeForm == null || _downToken == null)
-			return;
-		ClickToken up = ResolveClickToken(x, y);
-		System.Drawing.Size drag = System.Windows.Forms.SystemInformation.DragSize;
-		bool sameTarget = up.Equals(_downToken);
-		bool sameButton = buttons == _downButton;
-		bool noDrag = Math.Abs(x - _downX) <= drag.Width && Math.Abs(y - _downY) <= drag.Height;
-		_downToken = null;
-		if (!sameTarget || !sameButton || !noDrag)
-			return;
-		long now = TickNow();
-		System.Drawing.Size spread = System.Windows.Forms.SystemInformation.DoubleClickSize;
-		bool isDouble = _lastClickToken is not null && up.Equals(_lastClickToken)
-			&& buttons == _lastClickButton
-			&& now - _lastClickMs <= System.Windows.Forms.SystemInformation.DoubleClickTime
-			&& Math.Abs(x - _lastClickX) <= spread.Width && Math.Abs(y - _lastClickY) <= spread.Height;
-		if (isDouble)
 		{
-			_lastClickToken = null;
-			OnDoubleClickAt(up, buttons, x, y);
 			return;
 		}
-		_lastClickToken = up;
-		_lastClickX = x;
-		_lastClickY = y;
-		_lastClickMs = now;
-		_lastClickButton = buttons;
-		Console.WriteLine($"[Host] OnClick(x={x}, y={y}) paired button={buttons}");
-		OnClick(x, y, buttons, 1);
+		ClickToken clickToken = ResolveClickToken(x, y);
+		Size dragSize = System.Windows.Forms.SystemInformation.DragSize;
+		bool flag = clickToken.Equals(_downToken) || PressTargetContains(clickToken, _downToken);
+		bool flag2 = buttons == _downButton;
+		bool flag3 = Math.Abs(x - _downX) <= dragSize.Width && Math.Abs(y - _downY) <= dragSize.Height;
+		_downToken = null;
+		if (flag && flag2 && flag3)
+		{
+			Console.WriteLine("[Host] Pair up=" + x + "," + y + " b=" + buttons + " tok=" + clickToken.Kind + "/" + ((clickToken.Target == null) ? "null" : clickToken.Target.GetType().Name) + " down=" + _downX + "," + _downY + " db=" + _downButton + " f=" + flag + " b2=" + flag2 + " d=" + flag3);
+			long num = TickNow();
+			_pairedPress = true;
+			Size doubleClickSize = System.Windows.Forms.SystemInformation.DoubleClickSize;
+			if (_lastClickToken != null && clickToken.Equals(_lastClickToken) && buttons == _lastClickButton && num - _lastClickMs <= System.Windows.Forms.SystemInformation.DoubleClickTime && Math.Abs(x - _lastClickX) <= doubleClickSize.Width && Math.Abs(y - _lastClickY) <= doubleClickSize.Height)
+			{
+				_lastClickToken = null;
+				OnDoubleClickAt(clickToken, buttons, x, y);
+				return;
+			}
+			_lastClickToken = clickToken;
+			_lastClickX = x;
+			_lastClickY = y;
+			_lastClickMs = num;
+			_lastClickButton = buttons;
+			Console.WriteLine($"[Host] OnClick(x={x}, y={y}) paired button={buttons}");
+			OnClick(x, y, buttons);
+		}
 	}
 
-	// Double-click: control targets raise DoubleClick/MouseDoubleClick with
-		// no second activation; chrome tokens (dropdown/title/doc) repeat the
-		// normal activation (menus re-resolve, title/doc dispatch no-ops).
 	private void OnDoubleClickAt(ClickToken token, System.Windows.Forms.MouseButtons buttons, int x, int y)
 	{
 		WasmDialogHost.AdvanceTurn();
-		System.Windows.Forms.WasmRepaintGate.MarkGlobalDirty();
+		WasmRepaintGate.MarkGlobalDirty();
 		if (token.Target is System.Windows.Forms.Control control)
 		{
 			Console.WriteLine($"[Host] OnDoubleClick target={control.GetType().Name} button={buttons}");
@@ -4643,97 +5726,235 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 		else
 		{
-			Console.WriteLine($"[Host] OnDoubleClick chrome token={token.Kind}, repeated activation");
-			OnClick(x, y, buttons, 1);
+			Console.WriteLine("[Host] OnDoubleClick chrome token=" + token.Kind + ", repeated activation");
+			OnClick(x, y, buttons);
 		}
 	}
 
-	// Raw DOM wheel (pixels/lines per deltaMode): accumulate fractional
-		// notches (trackpads) and emit whole 120-unit steps, sign-flipped
-		// (DOM down-positive, WinForms down-negative). DeltaX has no WinForms
-		// event (HWHEEL is WndProc-only upstream) and stays ignored.
+	internal static bool GridScrollDegenerate(int minimum, int maximum, int largeChange)
+	{
+		return maximum - largeChange + 1 <= minimum;
+	}
+
+	private sealed class GridScrollWatch
+	{
+		public GridScrollWatch(object vsb, int last) { Vsb = vsb; Last = last; }
+		public object Vsb;
+		public int Last;
+	}
+
+	private static readonly ConditionalWeakTable<System.Windows.Forms.Control, GridScrollWatch> s_gridScrollWatches = new();
+
+	private static readonly RichTextScrollWatch s_rteScrollWatch = new();
+
+	// Subscribes a grid's smooth pixel scrollbar for displacement polling:
+	// the pump diffs VScrollBar.Value per frame and notes exact pixel
+	// movement, whatever moved it (wheel timer, thumb drag, keyboard).
+	// Smooth mode is required: only there is Value in pixels. Entries die
+	// with their grid (no leak); dead reads are skipped per frame.
+	private static void EnsureGridScrollWatch(System.Windows.Forms.Control? target)
+	{
+		if (target == null)
+			return;
+		System.Windows.Forms.Control? grid = target;
+		while (grid != null && grid.GetType().FullName != "Telerik.WinControls.UI.RadGridView")
+			grid = grid.Parent;
+		if (grid == null || s_gridScrollWatches.TryGetValue(grid, out _))
+			return;
+		try
+		{
+			object? gv = grid.GetType().GetProperty("GridViewElement")?.GetValue(grid);
+			object? table = gv?.GetType().GetProperty("TableElement")?.GetValue(gv);
+			object? scroller = table?.GetType().GetProperty("RowScroller")?.GetValue(table);
+			object? vsb = table?.GetType().GetProperty("VScrollBar")?.GetValue(table);
+			if (scroller == null || vsb == null)
+				return;
+			if ((scroller.GetType().GetProperty("ScrollMode")?.GetValue(scroller)?.ToString()) != "Smooth")
+				return;
+			int v = (int)(vsb.GetType().GetProperty("Value")?.GetValue(vsb) ?? 0);
+			s_gridScrollWatches.Add(grid, new GridScrollWatch(vsb, v));
+		}
+		catch
+		{
+		}
+	}
+
+	private static void PollGridScrollWatches()
+	{
+		foreach (var kv in s_gridScrollWatches)
+		{
+			try
+			{
+				int v = (int)(kv.Value.Vsb.GetType().GetProperty("Value")?.GetValue(kv.Value.Vsb) ?? kv.Value.Last);
+				if (v != kv.Value.Last && WasmFrameCounters.PerfEnabled)
+					Console.WriteLine($"[Host] WatchDiff control='{kv.Key.GetType().FullName}' {kv.Value.Last} -> {v}");
+				if (v != kv.Value.Last)
+				{
+					WasmRepaintGate.NoteScroll(kv.Key, 0, -(v - kv.Value.Last));
+					kv.Value.Last = v;
+				}
+			}
+			catch
+			{
+			}
+		}
+	}
+
+	// Metric repair for Telerik RadGridView grids whose headless scrollbar
+	// metrics degenerate (Maximum - LargeChange + 1 <= Minimum while rows
+	// overflow: the realized-only view-state total never covers unrealized
+	// rows, so the vendor's own wheel path no-ops and the grid can never
+	// scroll). The host recomputes the range through the vendor's own
+	// public updater from row count x row height; the vendor then owns
+	// scrolling and painting natively (genuine invalidation, smooth
+	// timer). Healthy metrics are never touched.
+	private static void TryRepairVendorGridMetrics(System.Windows.Forms.Control? target)
+	{
+		if (target == null)
+			return;
+		System.Windows.Forms.Control? grid = target;
+		while (grid != null && grid.GetType().FullName != "Telerik.WinControls.UI.RadGridView")
+			grid = grid.Parent;
+		if (grid == null)
+			return;
+		try
+		{
+			object? gv = grid.GetType().GetProperty("GridViewElement")?.GetValue(grid);
+			if ((bool?)gv?.GetType().GetProperty("IsInEditMode")?.GetValue(gv) == true)
+				return;
+			object? table = gv?.GetType().GetProperty("TableElement")?.GetValue(gv);
+			object? scroller = table?.GetType().GetProperty("RowScroller")?.GetValue(table);
+			object? vsb = table?.GetType().GetProperty("VScrollBar")?.GetValue(table);
+			if (scroller == null || vsb == null)
+				return;
+			var vsbType = vsb.GetType();
+			int min = (int)(vsbType.GetProperty("Minimum")?.GetValue(vsb) ?? 0);
+			int max = (int)(vsbType.GetProperty("Maximum")?.GetValue(vsb) ?? 0);
+			int large = (int)(vsbType.GetProperty("LargeChange")?.GetValue(vsb) ?? 0);
+			int small = (int)(vsbType.GetProperty("SmallChange")?.GetValue(vsb) ?? 0);
+			int rowH = (int)(table?.GetType().GetProperty("RowHeight")?.GetValue(table) ?? 0);
+			object? rows = grid.GetType().GetProperty("Rows")?.GetValue(grid);
+			int count = (int)(rows?.GetType().GetProperty("Count")?.GetValue(rows) ?? 0);
+			if (!GridScrollDegenerate(min, max, large))
+				return;
+			int unit = Math.Max(rowH, small);
+			long total = (long)count * unit;
+			if (count <= 0 || unit <= 0 || total <= large || total > int.MaxValue)
+				return;
+			Console.WriteLine($"[Host] GridWheelRepair grid='{grid.Name}' rows={count} rowH={rowH} max {max} -> {total}");
+			scroller.GetType().GetMethod("UpdateScrollRange", new[] { typeof(int), typeof(bool) })?.Invoke(scroller, new object[] { (int)total, true });
+		}
+		catch
+		{
+		}
+	}
+
 	public void OnMouseWheelRaw(int x, int y, double deltaX, double deltaY, int deltaMode, bool shift = false, bool ctrl = false, bool alt = false)
 	{
-		_ = deltaX;
 		FeedInput(x, y, _mouseButtons, ToKeys(shift, ctrl, alt));
 		if (_activeForm == null)
-			return;
-		double notches = deltaMode == 1 ? deltaY / 3.0 : deltaY / 100.0;
-		_wheelRemainder += notches;
-		int units = 0;
-		while (_wheelRemainder >= 1.0) { units++; _wheelRemainder -= 1.0; }
-		while (_wheelRemainder <= -1.0) { units--; _wheelRemainder += 1.0; }
-		if (units == 0)
-			return;
-		int delta120 = -units * 120;
-		System.Windows.Forms.Control? target = _hoverControl;
-		target ??= HitTestDeep(_activeForm.Controls, _activeForm.Location.X, _activeForm.Location.Y + ChromeHeight(_activeForm), x, y);
-		target ??= _activeForm;
-		Console.WriteLine($"[Host] OnMouseWheel(x={x}, y={y}, delta={delta120})");
-		RecordInput("wheel", $"{x},{y} delta={delta120}");
-		// Native ListViews consume the wheel for scrolling (SystemInformation
-		// MouseWheelScrollLines per notch); the scrolled rows repaint.
-		// Win10+ parity (inactive scroll): the wheel scrolls the scrollable
-		// control UNDER THE CURSOR, so hit-test the fresh position instead
-		// of the stale hover/focus target.
-		System.Windows.Forms.Control? wheelHit = HitTestDeep(_activeForm.Controls, _activeForm.Location.X, _activeForm.Location.Y + ChromeHeight(_activeForm), x, y);
-		if (wheelHit is System.Windows.Forms.ListView wheelList && units != 0)
 		{
-			if (ScrollListView(wheelList, units * System.Windows.Forms.SystemInformation.MouseWheelScrollLines))
-				System.Windows.Forms.WasmRepaintGate.MarkGlobalDirty();
+			return;
 		}
-		RaiseMouseEvent(s_onMouseWheelMethod, target, _mouseButtons, 0, x, y, delta120);
+		double num = ((deltaMode == 1) ? (deltaY / 3.0) : (deltaY / 100.0));
+		_wheelRemainder += num;
+		int num2 = 0;
+		while (_wheelRemainder >= 1.0)
+		{
+			num2++;
+			_wheelRemainder--;
+		}
+		while (_wheelRemainder <= -1.0)
+		{
+			num2--;
+			_wheelRemainder++;
+		}
+		if (num2 != 0)
+		{
+			int num3 = -num2 * 120;
+			System.Windows.Forms.Control control = _hoverControl;
+			if (control == null)
+			{
+				control = HitTestDeep(_activeForm.Controls, _activeForm.Location.X, _activeForm.Location.Y + ChromeHeight(_activeForm), x, y);
+			}
+			if (control == null)
+			{
+				control = _activeForm;
+			}
+			Console.WriteLine($"[Host] OnMouseWheel(x={x}, y={y}, delta={num3})");
+			RecordInput("wheel", $"{x},{y} delta={num3}");
+			System.Windows.Forms.Control control2 = HitTestDeep(_activeForm.Controls, _activeForm.Location.X, _activeForm.Location.Y + ChromeHeight(_activeForm), x, y);
+			if (control2 is System.Windows.Forms.ListView lv && num2 != 0 && ScrollListView(lv, num2 * System.Windows.Forms.SystemInformation.MouseWheelScrollLines))
+			{
+				WasmRepaintGate.MarkGlobalDirty();
+			}
+			if (control2 != null)
+			{
+				TryRepairVendorGridMetrics(control2);
+				EnsureGridScrollWatch(control2);
+				s_rteScrollWatch.Ensure(control2);
+			}
+			RaiseMouseEvent(s_onMouseWheelMethod, control, _mouseButtons, 0, x, y, num3);
+		}
 	}
 
-	// Hover stillness tracking: any move outside the hover rect restarts the
-		// clock; target swaps restart via SetHoverControl. The timer below
-		// fires the event; tests drive CheckHover directly (deterministic).
 	private void NoteMoveForHover(int x, int y)
 	{
-		System.Drawing.Size hover = System.Windows.Forms.SystemInformation.MouseHoverSize;
-		if (Math.Abs(x - _hoverX) > hover.Width || Math.Abs(y - _hoverY) > hover.Height)
+		Size mouseHoverSize = System.Windows.Forms.SystemInformation.MouseHoverSize;
+		if (Math.Abs(x - _hoverX) > mouseHoverSize.Width || Math.Abs(y - _hoverY) > mouseHoverSize.Height)
 		{
 			_hoverX = x;
 			_hoverY = y;
 			_hoverMs = TickNow();
 			_hoverFired = false;
 		}
-		if (_hoverTimer == null)
+		if (_hoverTimer != null)
 		{
-			try { _hoverTimer = new System.Threading.Timer(static state => ((WinFormsAppHost)state!).FireHoverIfStill(), this, 100, 100); }
-			catch { }
+			return;
+		}
+		try
+		{
+			_hoverTimer = new System.Threading.Timer((object? state) =>
+			{
+				((WinFormsAppHost)state).FireHoverIfStill();
+			}, this, 100, 100);
+		}
+		catch
+		{
 		}
 	}
 
 	private void FireHoverIfStill()
 	{
-		try { WinFormsExecution.Run(() => CheckHover(TickNow())); }
-		catch { }
+		try
+		{
+			WinFormsExecution.Run(() =>
+			{
+				CheckHover(TickNow());
+			});
+		}
+		catch
+		{
+		}
 	}
 
-	// Fires OnMouseHover once per rest (no buttons held, still inside the
-		// hover rect past MouseHoverTime). Internal for deterministic tests.
 	internal void CheckHover(long nowMs)
 	{
-		System.Windows.Forms.Control? hovered = _hoverControl;
-		if (_hoverFired || _mouseButtons != System.Windows.Forms.MouseButtons.None || hovered == null)
-			return;
-		if (nowMs - _hoverMs < System.Windows.Forms.SystemInformation.MouseHoverTime)
-			return;
-		_hoverFired = true;
-		Console.WriteLine($"[Host] OnMouseHover control={DescribeControl(hovered)}");
-		RaiseSimpleEvent(s_onMouseHoverMethod, hovered);
+		System.Windows.Forms.Control hoverControl = _hoverControl;
+		if (!_hoverFired && _mouseButtons == System.Windows.Forms.MouseButtons.None && hoverControl != null && nowMs - _hoverMs >= System.Windows.Forms.SystemInformation.MouseHoverTime)
+		{
+			_hoverFired = true;
+			Console.WriteLine("[Host] OnMouseHover control=" + DescribeControl(hoverControl));
+			RaiseSimpleEvent(s_onMouseHoverMethod, hoverControl);
+		}
 	}
+
 	public void OnClick(int x, int y, System.Windows.Forms.MouseButtons clickedButton = System.Windows.Forms.MouseButtons.Left, int clicks = 1)
 	{
 		WasmDialogHost.AdvanceTurn();
 		Console.WriteLine($"[Host] OnClick(x={x}, y={y})");
-		System.Windows.Forms.WasmRepaintGate.MarkGlobalDirty();
-		if (_activeForm == null || ClickOpenDropdown(x, y))
-		{
-			return;
-		}
-		if (RoutePopupClick(x, y, clickedButton, clicks))
+		WasmRepaintGate.MarkGlobalDirty();
+		if (_activeForm == null || ClickOpenDropdown(x, y) || RoutePopupClick(x, y, clickedButton, clicks))
 		{
 			return;
 		}
@@ -4763,8 +5984,784 @@ public sealed class WinFormsAppHost : IDisposable
 		Console.WriteLine("[Host] OnClick hit=" + ((control == null) ? "null" : (control.GetType().Name + " '" + control.Name + "'")));
 		if (control == null)
 		{
-			return;
+			try
+			{
+				System.Windows.Forms.Form activeForm = _activeForm;
+				Console.WriteLine("[Host] NULLHIT form=" + ((activeForm == null) ? "null" : (activeForm.GetType().Name + " loc=" + activeForm.Location.ToString() + " cli=" + activeForm.ClientSize)) + " n=" + (activeForm?.Controls.Count ?? (-1)));
+			}
+			catch
+			{
+			}
 		}
+		if (control != null)
+		{
+			bool usePress = _pairedPress;
+		_pairedPress = false;
+		System.Windows.Forms.Control? pressTarget = usePress ? _pressTarget : null;
+		_pressTarget = null;
+		if (pressTarget is not null && !pressTarget.IsDisposed && !pressTarget.Disposing && pressTarget.Enabled && pressTarget != control)
+		{
+			Console.WriteLine("[Host] OnClick press-target " + pressTarget.GetType().Name + " '" + pressTarget.Name + "' over " + ((control == null) ? "null" : (control.GetType().Name + " '" + control.Name + "'")));
+			control = pressTarget;
+		}
+		DispatchControlClick(control, x, y, clickedButton, clicks, x2, num2);
+		}
+	}
+
+	private static int s_pageDumpCount;
+
+	private void DumpPageState()
+	{
+		try
+		{
+			if (System.Threading.Interlocked.Increment(ref s_pageDumpCount) > 60)
+				return;
+			System.Windows.Forms.Form f = _activeForm;
+			if (f is null)
+				return;
+			foreach (System.Windows.Forms.Control c in f.Controls)
+				Console.WriteLine("[VAPI] page c=" + c.GetType().Name + " '" + c.Name + "' b=" + c.Bounds.ToString() + " vis=" + c.Visible);
+			System.Windows.Forms.Control? sb = FindByName(f.Controls, "showAllItemsButton");
+			try
+			{
+				System.Windows.Forms.Control? dd = FindVendorDropDown(f.Controls);
+				string dt = "?";
+				if (dd is not null)
+				{
+					try
+					{
+						object? si = dd.GetType().GetProperty("SelectedItem")?.GetValue(dd);
+						object? tx = si?.GetType().GetProperty("Text")?.GetValue(si);
+						if (tx is not null)
+							dt = tx.ToString() ?? "?";
+					}
+					catch { }
+				}
+				Console.WriteLine("[VAPI] page dropdown=" + (dd is null ? "null" : (dd.GetType().Name + " '" + dd.Name + "'")) + " sel='" + dt + "'");
+			try
+			{
+				System.Windows.Forms.Control? dp = FindByName(f.Controls, "dropDownPosition");
+				string dpt = "?";
+				if (dp is not null)
+				{
+					try { object? v = dp.GetType().GetProperty("Text")?.GetValue(dp); if (v is not null) dpt = v.ToString() ?? "?"; } catch { }
+				}
+				Console.WriteLine("[VAPI] page sfcombo text='" + dpt + "'");
+			}
+			catch { }
+			}
+			catch { }
+			Console.WriteLine("[VAPI] page showAll=" + (sb is null ? "null" : ("b=" + sb.Bounds.ToString() + " vis=" + sb.Visible + " en=" + sb.Enabled)));
+		}
+		catch { }
+	}
+
+	private static System.Windows.Forms.Control? FindVendorDropDown(System.Windows.Forms.Control.ControlCollection cs)
+	{
+		foreach (System.Windows.Forms.Control c in cs)
+		{
+			try
+			{
+				if (IsVendorControl(c) && c.GetType().Name.Contains("DropDown", StringComparison.Ordinal)
+					&& !c.GetType().Name.Contains("ToolStrip", StringComparison.Ordinal))
+					return c;
+			}
+			catch { }
+			System.Windows.Forms.Control? r = FindVendorDropDown(c.Controls);
+			if (r is not null)
+				return r;
+		}
+		return null;
+	}
+	
+	private static System.Windows.Forms.Control? FindByName(System.Windows.Forms.Control.ControlCollection cs, string name)
+	{
+		foreach (System.Windows.Forms.Control c in cs)
+		{
+			if (c.Name == name)
+				return c;
+			System.Windows.Forms.Control? r = FindByName(c.Controls, name);
+			if (r is not null)
+				return r;
+		}
+		return null;
+	}
+
+	private void DumpVendorApi(System.Windows.Forms.Control control, int x, int y, int formX, int formClientY)
+	{
+		try
+		{
+			string text = control.GetType().FullName ?? "?";
+			if (!text.Contains("Telerik", StringComparison.Ordinal) && !text.Contains("Syncfusion", StringComparison.Ordinal))
+			{
+				return;
+			}
+			lock (s_vendorDumpDone)
+			{
+				DumpPageState();
+				if (text.Contains("RadGridView", StringComparison.Ordinal))
+				{
+					try
+					{
+						object? rows = control.GetType().GetProperty("SelectedRows")?.GetValue(control);
+						int rc = -1;
+						if (rows is System.Collections.ICollection rcol)
+							rc = rcol.Count;
+						object? cur = control.GetType().GetProperty("CurrentRow")?.GetValue(control);
+						object? idx = cur?.GetType().GetProperty("Index")?.GetValue(cur);
+						Console.WriteLine("[VAPI] grid selcount=" + rc + " currow=" + (idx?.ToString() ?? "?"));
+					}
+					catch (Exception exg) { Console.WriteLine("[VAPI] grid-throw " + exg.GetType().Name); }
+				}
+				if (s_vendorDumpDone.Count > 200 || !s_vendorDumpDone.Add(text))
+				{
+					return;
+				}
+			}
+			int controlAbsX = GetControlAbsX(control, formX);
+			int controlAbsY = GetControlAbsY(control, formClientY);
+			Console.WriteLine("[VAPI] control=" + text + " clientPt=" + (x - controlAbsX) + "," + (y - controlAbsY) + " bounds=" + control.Bounds.ToString() + " visible=" + control.Visible + " enabled=" + control.Enabled);
+			try
+			{
+				System.Windows.Forms.Control parent = control.Parent;
+				string text2 = ((parent == null) ? "null" : (parent.GetType().Name + " vis=" + parent.Visible));
+				Console.WriteLine("[VAPI] parent=" + text2);
+			}
+			catch
+			{
+			}
+			MethodInfo[] methods = control.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+			foreach (MethodInfo methodInfo in methods)
+			{
+				string name = methodInfo.Name;
+				if (!name.Contains("Click", StringComparison.OrdinalIgnoreCase) && !name.Contains("Press", StringComparison.OrdinalIgnoreCase) && !name.Contains("Popup", StringComparison.OrdinalIgnoreCase) && !name.Contains("Perform", StringComparison.OrdinalIgnoreCase) && !name.Contains("Show", StringComparison.OrdinalIgnoreCase) && !name.Contains("Toggle", StringComparison.OrdinalIgnoreCase) && !name.Contains("DropDown", StringComparison.OrdinalIgnoreCase))
+				{
+					continue;
+				}
+				string text3 = "";
+				try
+				{
+					ParameterInfo[] parameters = methodInfo.GetParameters();
+					foreach (ParameterInfo parameterInfo in parameters)
+					{
+						text3 = text3 + parameterInfo.ParameterType.Name + ",";
+					}
+				}
+				catch
+				{
+				}
+				Console.WriteLine("[VAPI] ctl.m " + (methodInfo.DeclaringType?.Name ?? "?") + "." + name + "(" + text3 + ")");
+			}
+			object obj3 = SafeGetObj(control, "ElementTree");
+			if (obj3 == null)
+			{
+				object obj4 = SafeGetObj(control, "RootElement");
+				Console.WriteLine("[VAPI] ElementTree=null RootElement=" + ((obj4 == null) ? "null" : obj4.GetType().FullName));
+				return;
+			}
+			Console.WriteLine("[VAPI] tree=" + (obj3.GetType().FullName ?? "?"));
+			MethodInfo[] methods2 = obj3.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+			foreach (MethodInfo methodInfo2 in methods2)
+			{
+				string name2 = methodInfo2.Name;
+				if (!name2.Contains("ElementAtPoint", StringComparison.Ordinal) && !name2.Contains("Dispatch", StringComparison.Ordinal) && !name2.Contains("Mouse", StringComparison.Ordinal) && !name2.Contains("Click", StringComparison.Ordinal))
+				{
+					continue;
+				}
+				string text4 = "";
+				try
+				{
+					ParameterInfo[] parameters2 = methodInfo2.GetParameters();
+					foreach (ParameterInfo parameterInfo2 in parameters2)
+					{
+						text4 = text4 + parameterInfo2.ParameterType.Name + ",";
+					}
+				}
+				catch
+				{
+				}
+				Console.WriteLine("[VAPI] tree.m " + name2 + "(" + text4 + ")");
+			}
+			object obj6 = null;
+			try
+			{
+				MethodInfo method = ResolvePointOverload(obj3);
+				if ((object)method != null)
+				{
+					obj6 = method.Invoke(obj3, new object[1]
+					{
+						new Point(x - controlAbsX, y - controlAbsY)
+					});
+				}
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine("[VAPI] at-throw " + ex.ToString().Substring(0, System.Math.Min(600, ex.ToString().Length)));
+			}
+			Console.WriteLine("[VAPI] at=" + ((obj6 == null) ? "null" : obj6.GetType().FullName));
+		}
+		catch (Exception ex2)
+		{
+			try
+			{
+				Console.WriteLine("[VAPI] dump-throw " + ex2.GetType().Name);
+			}
+			catch
+			{
+			}
+		}
+	}
+
+	private static System.Reflection.MethodInfo? ResolvePointOverload(object tree)
+	{
+		// GetElementAtPoint has several overloads (Point / Point+predicate /
+		// subtree walkers, some open-generic); GetMethod(name) throws
+		// AmbiguousMatchException. Prefer the closed single-Point overload
+		// declared on the tree type itself, else any closed single-Point one.
+		System.Reflection.MethodInfo? any = null;
+		try
+		{
+			foreach (System.Reflection.MethodInfo m in tree.GetType().GetMethods(
+				System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic))
+			{
+				if (m.Name != "GetElementAtPoint" || m.ContainsGenericParameters)
+					continue;
+				System.Reflection.ParameterInfo[] ps = m.GetParameters();
+				if (ps.Length != 1 || ps[0].ParameterType.FullName != "System.Drawing.Point")
+					continue;
+				if (m.DeclaringType == tree.GetType())
+					return m;
+				any ??= m;
+			}
+		}
+		catch { }
+		return any;
+	}
+
+	private static bool IsVendorControl(System.Windows.Forms.Control control)
+	{
+		try
+		{
+			string full = control.GetType().FullName ?? "";
+			return full.Contains("Telerik", System.StringComparison.Ordinal)
+				|| full.Contains("Syncfusion", System.StringComparison.Ordinal);
+		}
+		catch { return false; }
+	}
+
+	private bool TrySelectGridRow(System.Windows.Forms.Control control, int x, int y, int formX, int formClientY)
+	{
+		// Telerik grid row select through the vendor element tree: map the
+		// point to the row element, resolve its row info, drive CurrentRow.
+		// Synthetic mouse reaches edit mode but does not move selection.
+		try
+		{
+			try { EnsureElementLayout(control); } catch { }
+			object? tree = control.GetType().GetProperty("ElementTree")?.GetValue(control);
+			if (tree is null)
+				return false;
+			System.Reflection.MethodInfo? gap = null;
+			foreach (System.Reflection.MethodInfo m in tree.GetType().GetMethods(
+				System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+			{
+				if (m.Name == "GetElementAtPoint" && !m.ContainsGenericParameters && m.GetParameters().Length == 1
+					&& m.GetParameters()[0].ParameterType.FullName == "System.Drawing.Point")
+				{
+					gap = m;
+					break;
+				}
+			}
+			if (gap is null)
+				return false;
+			int cx = x - GetControlAbsX(control, formX);
+			int cy = y - GetControlAbsY(control, formClientY);
+			object? el = null;
+			try { el = gap.Invoke(tree, new object[] { new Point(cx, cy) }); } catch { }
+			if (el is null)
+				return false;
+			string chain = "";
+			object? rowEl = null;
+			object? cur = el;
+			for (int i = 0; i < 10 && cur is not null; i++)
+			{
+				string tn = cur.GetType().Name;
+				chain += (i == 0 ? "" : "<") + tn;
+				if (rowEl is null && tn.Contains("Row", StringComparison.Ordinal)
+					&& !tn.Contains("Header", StringComparison.Ordinal) && !tn.Contains("Table", StringComparison.Ordinal)
+					&& !tn.Contains("Summary", StringComparison.Ordinal))
+					rowEl = cur;
+				try { cur = cur.GetType().GetProperty("Parent")?.GetValue(cur); } catch { cur = null; }
+			}
+			Console.WriteLine("[VAPI] gridrow chain=" + chain);
+			if (rowEl is null)
+				return false;
+			object? rowInfo = null;
+			foreach (string pn in new string[] { "RowInfo", "Data", "Row" })
+			{
+				try { rowInfo = rowEl.GetType().GetProperty(pn)?.GetValue(rowEl); } catch { }
+				if (rowInfo is not null)
+					break;
+			}
+			Console.WriteLine("[VAPI] gridrow info=" + (rowInfo?.GetType().Name ?? "?"));
+			if (rowInfo is null)
+				return false;
+			System.Reflection.PropertyInfo? curProp = control.GetType().GetProperty("CurrentRow");
+			if (curProp is not null && curProp.CanWrite && curProp.PropertyType.IsInstanceOfType(rowInfo))
+			{
+				curProp.SetValue(control, rowInfo);
+				RecordInput("vendor", $"gridrow current {control.Name} {x},{y}");
+				Console.WriteLine("[VAPI] gridrow-selected current");
+			try
+			{
+				object? post = control.GetType().GetProperty("CurrentRow")?.GetValue(control);
+				object? pidx = post?.GetType().GetProperty("Index")?.GetValue(post);
+				Console.WriteLine("[VAPI] gridrow-post idx=" + (pidx?.ToString() ?? "?"));
+			}
+			catch { }
+				DumpPageState();
+				control.Invalidate();
+				return true;
+			}
+			return false;
+		}
+		catch (Exception ex) { Console.WriteLine("[VAPI] gridrow-throw " + ex.GetType().Name); return false; }
+	}
+	private bool TryActivatePanoramaTile(System.Windows.Forms.Control control, int x, int y, int formX, int formClientY)
+	{
+		// Panorama tiles carry the book commands but synthetic Control
+		// mouse events never reach the tile element (vendor hit-testing
+		// uses its own cursor state). Resolve the tile at the point
+		// through the vendor tree and activate it once.
+		try
+		{
+			try { EnsureElementLayout(control); } catch { }
+			object? tree = control.GetType().GetProperty("ElementTree")?.GetValue(control);
+			if (tree is null)
+				return false;
+			System.Reflection.MethodInfo? gap = null;
+			foreach (System.Reflection.MethodInfo m in tree.GetType().GetMethods(
+				System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+			{
+				if (m.Name == "GetElementAtPoint" && !m.ContainsGenericParameters && m.GetParameters().Length == 1
+					&& m.GetParameters()[0].ParameterType.FullName == "System.Drawing.Point")
+				{
+					gap = m;
+					break;
+				}
+			}
+			if (gap is null)
+				return false;
+			Point pt = new Point(x - GetControlAbsX(control, formX), y - GetControlAbsY(control, formClientY));
+			object? el = null;
+			try { el = gap.Invoke(tree, new object[] { pt }); } catch { }
+			Console.WriteLine("[VAPI] tile-el=" + (el is null ? "null" : el.GetType().Name) + " pt=" + pt);
+			if (el is null || !IsActionableElement(el.GetType().Name))
+				return false;
+			System.Reflection.MethodInfo? click = null;
+			foreach (System.Reflection.MethodInfo m in el.GetType().GetMethods(
+				System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+			{
+				if (m.Name == "PerformClick" && !m.ContainsGenericParameters && m.GetParameters().Length == 0)
+				{
+					click = m;
+					break;
+				}
+			}
+			if (click is null)
+				return false;
+			try { click.Invoke(el, null); }
+			catch (Exception ex) { Console.WriteLine("[VAPI] tile-invoke-throw " + ex.GetType().Name); return false; }
+			RecordInput("vendor", $"tile-click {el.GetType().Name} {control.Name} {x},{y}");
+			Console.WriteLine("[VAPI] tile-clicked " + el.GetType().Name);
+			DumpPageState();
+			control.Invalidate();
+			return true;
+		}
+		catch (Exception ex) { Console.WriteLine("[VAPI] tile-throw " + ex.GetType().Name); return false; }
+	}
+	
+	private bool TryVendorActivate(System.Windows.Forms.Control control, int x, int y, int formX, int formClientY)
+	{
+		// Explicit vendor input adapter: route clicks that the generic
+		// synthetic path cannot serve through the vendor's own activation,
+		// exactly once (true = consumed, skip the synthetic dispatch).
+		// Proven-preserved paths stay untouched: panorama tiles by
+		// container element dispatch (details navigate). Standalone
+		// RadButtons route through the vendor PerformClick: synthesizing
+		// Control.OnClick on the button bypasses its ButtonElement click
+		// path, so the wired Click handler never runs (SHOW ALL dead).
+		try
+		{
+			if (!IsVendorControl(control) || !control.Visible || !control.Enabled)
+				return false;
+			string name = control.GetType().Name;
+			if (name.Contains("DropDown", System.StringComparison.Ordinal)
+				&& !(control.GetType().Name.Contains("ToolStrip", System.StringComparison.Ordinal)))
+			{
+				System.Reflection.MethodInfo? show = null;
+				System.Reflection.MethodInfo? hide = null;
+				foreach (System.Reflection.MethodInfo m in control.GetType().GetMethods(
+					System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+				{
+					if (m.ContainsGenericParameters)
+						continue;
+					if (m.Name == "ShowDropDown" && m.GetParameters().Length == 0)
+						show = m;
+					if ((m.Name == "HidePopup" || m.Name == "ClosePopup") && m.GetParameters().Length == 0)
+						hide = m;
+				}
+				if (show is not null)
+				{
+					bool isOpen = false;
+					try
+					{
+						object? pv = control.GetType().GetProperty("IsPopupVisible")?.GetValue(control);
+						if (pv is bool b)
+							isOpen = b;
+					}
+					catch { }
+					try
+					{
+						if (isOpen && hide is not null)
+							hide.Invoke(control, null);
+						else if (!isOpen)
+							show.Invoke(control, null);
+						// Popup already open and no closer available: consume
+						// the click so the synthetic Control.Click fallback
+						// cannot toggle the popup shut; item clicks route
+						// through the popup path before reaching dispatch.
+					}
+					catch { return false; }
+					RecordInput("vendor", $"dropdown {(isOpen ? (hide is not null ? "hide" : "keep-open") : "show")} {control.Name} {x},{y}");
+					control.Invalidate();
+					return true;
+				}
+			}
+			if (name.Contains("Panorama", System.StringComparison.Ordinal))
+			{
+				if (TryActivatePanoramaTile(control, x, y, formX, formClientY))
+					return true;
+			}
+			if (name.Contains("RadGridView", System.StringComparison.Ordinal))
+			{
+				if (TrySelectGridRow(control, x, y, formX, formClientY))
+					return true;
+			}
+			if (name.Contains("RadButton", System.StringComparison.Ordinal))
+			{
+				System.Reflection.MethodInfo? perform = null;
+				foreach (System.Reflection.MethodInfo m in control.GetType().GetMethods(
+					System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+				{
+					if (m.Name == "PerformClick" && !m.ContainsGenericParameters && m.GetParameters().Length == 0)
+					{
+						perform = m;
+						break;
+					}
+				}
+				if (perform is not null)
+				{
+					if (ReadClickMode(control) == "Press")
+					{
+						RecordInput("vendor", $"button press-mode consumed {control.Name} {x},{y}");
+						control.Invalidate();
+						return true;
+					}
+					try
+					{
+						perform.Invoke(control, null);
+					}
+					catch { return false; }
+					RecordInput("vendor", $"button perform-click {control.Name} {x},{y}");
+					DumpPageState();
+					control.Invalidate();
+					return true;
+				}
+			}
+		}
+		catch { }
+		return false;
+	}
+
+	private static string ReadClickMode(System.Windows.Forms.Control control)
+	{
+		// ClickMode decides press-vs-release firing.
+		try
+		{
+			object? btnEl = control.GetType().GetProperty("ButtonElement")?.GetValue(control);
+			object? mode = btnEl?.GetType().GetProperty("ClickMode")?.GetValue(btnEl);
+			return mode?.ToString() ?? "?";
+		}
+		catch { return "?"; }
+	}
+	
+	private void FireOuterKeyDown(System.Windows.Forms.Control outer, System.Windows.Forms.Keys keyData)
+	{
+		// Subscriber-direct KeyDown: the vendor OnKeyDown override may not
+		// raise subscriber KeyDown (no search on Return). Fire the Control
+		// event list directly, once.
+		try
+		{
+			System.Reflection.FieldInfo? keyField = typeof(System.Windows.Forms.Control).GetField("s_keyDownEvent",
+				System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+			if (keyField is null)
+				return;
+			object? key = keyField.GetValue(null);
+			if (key is null)
+				return;
+			System.Reflection.PropertyInfo? evProp = typeof(System.Windows.Forms.Control).GetProperty("Events",
+				System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
+			System.ComponentModel.EventHandlerList? list = evProp?.GetValue(outer) as System.ComponentModel.EventHandlerList;
+			System.Delegate? d = list?[key];
+			if (d is System.Windows.Forms.KeyEventHandler keh)
+			{
+				keh.Invoke(outer, new System.Windows.Forms.KeyEventArgs(keyData));
+			}
+		}
+		catch (Exception ex) { Console.WriteLine("[VAPI] keysub-throw " + ex.GetType().Name); }
+	}
+	
+	private static System.Windows.Forms.Control OuterKeyControl(System.Windows.Forms.Control c)
+	{
+		// Hosted editors (Telerik HostedTextBoxBase): focus sits on the
+		// inner box but the app wires KeyDown on the outer vendor control.
+		// Desktop routes hosted keys to the owner; climb to it.
+		try
+		{
+			while (c.Parent is not null && c.GetType().Name.Contains("Hosted", StringComparison.Ordinal) && IsVendorControl(c.Parent))
+				c = c.Parent;
+		}
+		catch { }
+		return c;
+	}
+	
+	private static bool IsActionableElement(string typeName)
+	{
+		if (typeName.Contains("ScrollBar", System.StringComparison.Ordinal)
+			|| typeName.Contains("Primitive", System.StringComparison.Ordinal)
+			|| typeName.Contains("Grip", System.StringComparison.Ordinal)
+			|| typeName.Contains("Container", System.StringComparison.Ordinal))
+			return false;
+		return typeName.Contains("Item", System.StringComparison.Ordinal)
+			|| typeName.Contains("Button", System.StringComparison.Ordinal)
+			|| typeName.Contains("Tile", System.StringComparison.Ordinal)
+			|| typeName.Contains("Tab", System.StringComparison.Ordinal);
+	}
+
+	private static object? WalkElementAt(object? root, int px, int py)
+	{
+		// Manual deepest-child hit test in tree space (CBRs are parent-
+		// relative): the vendor GetElementAtPoint answers null headless,
+		// but laid-out CBRs are truthful. Later siblings win (paint order).
+		object? best = null;
+		try
+		{
+			WalkElementKids(root, 0, 0, px, py, ref best);
+		}
+		catch { }
+		return best;
+	}
+
+	private static void WalkElementKids(object? el, int ox, int oy, int px, int py, ref object? best)
+	{
+		System.Collections.IEnumerable? kids = null;
+		try { kids = el?.GetType().GetProperty("Children")?.GetValue(el) as System.Collections.IEnumerable; } catch { }
+		if (kids is null)
+			return;
+		try
+		{
+		foreach (object? k in kids)
+		{
+			try
+			{
+			if (k is null)
+				continue;
+			int kx = 0, ky = 0, kw = 0, kh = 0;
+			try
+			{
+				object? r = k.GetType().GetProperty("ControlBoundingRectangle")?.GetValue(k);
+				if (r is null)
+					continue;
+				kx = System.Convert.ToInt32(r.GetType().GetProperty("X")?.GetValue(r));
+				ky = System.Convert.ToInt32(r.GetType().GetProperty("Y")?.GetValue(r));
+				kw = System.Convert.ToInt32(r.GetType().GetProperty("Width")?.GetValue(r));
+				kh = System.Convert.ToInt32(r.GetType().GetProperty("Height")?.GetValue(r));
+			}
+			catch { continue; }
+			if (kw <= 0 || kh <= 0)
+				continue;
+			int ax = ox + kx, ay = oy + ky;
+			if (px < ax || px >= ax + kw || py < ay || py >= ay + kh)
+				continue;
+			if (IsActionableElement(k.GetType().Name))
+				best = k;
+			WalkElementKids(k, ax, ay, px, py, ref best);
+			}
+			catch { continue; }
+		}
+		}
+		catch { }
+	}
+
+	private bool TryCommitListDataItem(object el)
+	{
+		// List-item commit through the DATA item: the application listens
+		// to SelectedIndexChanged on the owning dropdown, which the data
+		// item's Selected setter drives (the app's own
+		// UpdateDropDownListSelectedItem does exactly this). The visual
+		// item's Selected is read-only; its PerformClick only raises the
+		// base element Click event, which commits nothing visible.
+		try
+		{
+			string tn = el.GetType().Name;
+			if (!tn.Contains("ListVisualItem", StringComparison.Ordinal)
+				&& !tn.Contains("ListItem", StringComparison.Ordinal))
+				return false;
+			object? data = null;
+			try { data = el.GetType().GetProperty("Data")?.GetValue(el); } catch { }
+			if (data is null)
+				return false;
+			System.Reflection.PropertyInfo? sel = data.GetType().GetProperty("Selected");
+			if (sel is null || !sel.CanWrite || sel.PropertyType != typeof(bool))
+				return false;
+			sel.SetValue(data, true);
+			Console.WriteLine("[VAPI] item-data-selected " + data.GetType().Name);
+			return true;
+		}
+		catch (Exception ex) { Console.WriteLine("[VAPI] item-data-throw " + ex.GetType().Name); return false; }
+	}
+	private void CloseOwnerDropdown()
+	{
+		// Dismiss the open vendor dropdown popup after a committed
+		// selection (desktop mouse handling closes it; programmatic
+		// selection does not).
+		try
+		{
+			System.Windows.Forms.Form? f = _activeForm;
+			if (f is null)
+				return;
+			System.Collections.Generic.List<System.Windows.Forms.Control> stack = new() { f };
+			while (stack.Count > 0)
+			{
+				System.Windows.Forms.Control c = stack[stack.Count - 1];
+				stack.RemoveAt(stack.Count - 1);
+				try
+				{
+					if (IsVendorControl(c) && c.GetType().Name.Contains("DropDown", StringComparison.Ordinal))
+					{
+						object? pv = c.GetType().GetProperty("IsPopupVisible")?.GetValue(c);
+						if (pv is bool b && b)
+						{
+							foreach (System.Reflection.MethodInfo m in c.GetType().GetMethods(
+								System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+							{
+								if ((m.Name == "HidePopup" || m.Name == "ClosePopup") && !m.ContainsGenericParameters && m.GetParameters().Length == 0)
+								{
+									m.Invoke(c, null);
+									Console.WriteLine("[VAPI] owner-dropdown-closed " + c.Name);
+									break;
+								}
+							}
+						}
+					}
+				}
+				catch { }
+				foreach (System.Windows.Forms.Control k in c.Controls)
+					stack.Add(k);
+			}
+		}
+		catch { }
+	}
+	
+	private bool TryVendorElementClick(System.Windows.Forms.Control popup, int x, int y)
+	{
+		// Popup item activation: the popup hosts pure elements (no child
+		// controls), so synthetic Control dispatch cannot serve item clicks.
+		// Resolve the element under the point and activate it through the
+		// vendor path (PerformClick). True = consumed exactly once.
+		try
+		{
+			if (!IsVendorControl(popup))
+				return false;
+			object? tree = null;
+			try { tree = popup.GetType().GetProperty("ElementTree")?.GetValue(popup); } catch { }
+			if (tree is null)
+				return false;
+			try { EnsureElementLayout(popup); } catch { }
+			// Popups are canvas-positioned: TopPopupAt matches Location
+			// directly against page coordinates, so the client point is
+			// Location-relative. GetControlAbsX(popup, popup.Location.X)
+			// double-counts popup.Left and every lookup misses.
+			int ax = popup.Location.X;
+			int ay = popup.Location.Y;
+			Point pt = new Point(x - ax, y - ay);
+			Console.WriteLine("[VAPI] item-pt=" + pt + " popup-loc=" + popup.Location + " popup-sz=" + popup.Width + "x" + popup.Height);
+			object? el = null;
+			try
+			{
+				System.Reflection.MethodInfo? gap = ResolvePointOverload(tree);
+				if (gap is not null)
+					el = gap.Invoke(tree, new object[] { pt });
+			}
+			catch { }
+			if (el is null)
+			{
+				object? root = null;
+				try { root = tree.GetType().GetProperty("RootElement")?.GetValue(tree); } catch { }
+				el = WalkElementAt(root, pt.X, pt.Y);
+			}
+			Console.WriteLine("[VAPI] item-el=" + (el is null ? "null" : el.GetType().FullName));
+			if (el is null || !IsActionableElement(el.GetType().Name))
+				return false;
+			System.Reflection.MethodInfo? click = null;
+			try
+			{
+				foreach (System.Reflection.MethodInfo m in el.GetType().GetMethods(
+					System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+				{
+					if (m.Name == "PerformClick" && !m.ContainsGenericParameters && m.GetParameters().Length == 0)
+					{
+						click = m;
+						break;
+					}
+				}
+			}
+			catch { }
+			if (click is null)
+			{
+				Console.WriteLine("[VAPI] item-no-click");
+				return false;
+			}
+			try
+			{
+				if (TryCommitListDataItem(el))
+			{
+				CloseOwnerDropdown();
+				RecordInput("vendor", $"element-select {el.GetType().Name} {popup.Name} {x},{y}");
+				Console.WriteLine("[VAPI] element-selected " + el.GetType().Name);
+				DumpPageState();
+				try { WasmRepaintGate.MarkGlobalDirty(); } catch { }
+				try { popup.Invalidate(); } catch { }
+				return true;
+			}
+			click.Invoke(el, null);
+			}
+			catch (Exception ex2) { Console.WriteLine("[VAPI] item-invoke-throw " + ex2.GetType().Name); return false; }
+			RecordInput("vendor", $"element-click {el.GetType().Name} {popup.Name} {x},{y}");
+			Console.WriteLine("[VAPI] element-clicked " + el.GetType().Name);
+			try { WasmRepaintGate.MarkDirtyChain(popup); } catch { }
+			try { popup.Invalidate(); } catch { }
+			return true;
+		}
+		catch { }
+		return false;
+	}
+
+	private void DispatchControlClick(System.Windows.Forms.Control control, int x, int y, System.Windows.Forms.MouseButtons clickedButton, int clicks, int formX, int formClientY)
+	{
+		DumpVendorApi(control, x, y, formX, formClientY);
+		if (TryVendorActivate(control, x, y, formX, formClientY))
+			return;
 		if (control is System.Windows.Forms.Button button)
 		{
 			RecordInput("click", $"{x},{y} button={button.Name}");
@@ -4783,30 +6780,29 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 		if (control is System.Windows.Forms.ListView listView)
 		{
-			int num3 = 24;
-			int num4 = 22;
-			int cap = ListViewCapacity(listView.Height);
-			int top = ResolveListViewTop(listView);
+			int num = 24;
+			int num2 = 22;
+			int num3 = ListViewCapacity(listView.Height);
+			int num4 = ResolveListViewTop(listView);
 			int count = listView.Items.Count;
-			// Scrollbar strip: page up/down like the native control.
-			if (count > cap && x - GetControlAbsX(listView, x2) >= listView.Width - ListViewScrollW)
+			if (count > num3 && x - GetControlAbsX(listView, formX) >= listView.Width - 14)
 			{
-				int dir = (y - GetControlAbsY(listView, num2)) < listView.Height / 2 ? -cap : cap;
-				if (ScrollListView(listView, dir))
+				int num5 = ((y - GetControlAbsY(listView, formClientY) < listView.Height / 2) ? (-num3) : num3);
+				if (ScrollListView(listView, num5))
 				{
-					RecordInput("click", $"{x},{y} listview={listView.Name} page={dir}");
-					System.Windows.Forms.WasmRepaintGate.MarkGlobalDirty();
+					RecordInput("click", $"{x},{y} listview={listView.Name} page={num5}");
+					WasmRepaintGate.MarkGlobalDirty();
 				}
 				return;
 			}
-			int num5 = y - (GetControlAbsY(listView, num2) + num3);
-			if (num5 >= 0)
+			int num6 = y - (GetControlAbsY(listView, formClientY) + num);
+			if (num6 >= 0)
 			{
-				int num6 = num5 / num4 + top;
-				if (num6 >= top && num6 < count)
+				int num7 = num6 / num2 + num4;
+				if (num7 >= num4 && num7 < count)
 				{
-					System.Windows.Forms.ListViewItem listViewItem = listView.Items[num6];
-					RecordInput("click", $"{x},{y} listview={listView.Name} row={num6}");
+					System.Windows.Forms.ListViewItem listViewItem = listView.Items[num7];
+					RecordInput("click", $"{x},{y} listview={listView.Name} row={num7}");
 					listViewItem.Selected = !listViewItem.Selected;
 					RaiseMouseEvent(s_onMouseClickMethod, listView, clickedButton, clicks, x, y);
 				}
@@ -4815,8 +6811,8 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 		if (control is System.Windows.Forms.ToolStrip toolStrip)
 		{
-			int controlAbsX = GetControlAbsX(toolStrip, x2);
-			int controlAbsY = GetControlAbsY(toolStrip, num2);
+			int controlAbsX = GetControlAbsX(toolStrip, formX);
+			int controlAbsY = GetControlAbsY(toolStrip, formClientY);
 			System.Windows.Forms.ToolStripItem itemAt = toolStrip.GetItemAt(x - controlAbsX, y - controlAbsY);
 			Console.WriteLine("[Host] OnClick ToolStrip item=" + ((itemAt == null) ? "null" : (itemAt.GetType().Name + " '" + itemAt.Name + "'")));
 			if (itemAt != null)
@@ -4829,20 +6825,23 @@ public sealed class WinFormsAppHost : IDisposable
 		RecordInput("click", $"{x},{y} control={DescribeControl(control)}");
 		try
 		{
-			// Desktop delivers the mouse position with Click (ButtonUp forwards
-			// its MouseEventArgs); EventArgs.Empty NREs Telerik click behavior
-			// (MouseButtonEventArgs..ctor reads Button/X/Y) and aborts
-			// selection/caret. Same client-coord math as RaiseMouseEvent.
-			int clickAbsX = GetControlAbsX(control, _activeForm.Location.X);
-			int clickAbsY = GetControlAbsY(control, _activeForm.Location.Y + ChromeHeight(_activeForm));
-			System.Windows.Forms.MouseEventArgs clickArgs = new System.Windows.Forms.MouseEventArgs(clickedButton, clicks, x - clickAbsX, y - clickAbsY, 0);
-			s_onClickMethod?.Invoke(control, new object[1] { clickArgs });
+			int controlAbsX2 = GetControlAbsX(control, formX);
+			int controlAbsY2 = GetControlAbsY(control, formClientY);
+			System.Windows.Forms.MouseEventArgs e = new System.Windows.Forms.MouseEventArgs(clickedButton, clicks, x - controlAbsX2, y - controlAbsY2, 0);
+			s_onClickMethod?.Invoke(control, new object[1] { e });
 			RaiseMouseEvent(s_onMouseClickMethod, control, clickedButton, clicks, x, y);
 		}
 		catch (Exception ex2)
 		{
 			Console.WriteLine("[WinFormsAppHost] Control click error: " + ex2.GetType().Name + ": " + ex2.Message.Split('\n')[0]);
-			try { Console.WriteLine("[diagstack] " + string.Join(" <- ", new System.Diagnostics.StackTrace(RootCause(ex2), false).GetFrames().Take(12).Select(f => f.GetMethod()))); } catch { }
+			try
+			{
+				Console.WriteLine("[diagstack] " + string.Join(" <- ", from f in new StackTrace(RootCause(ex2), fNeedFileInfo: false).GetFrames().Take(12)
+					select f.GetMethod()));
+			}
+			catch
+			{
+			}
 			BrowserErrorReporter.Report("control-click", ex2);
 		}
 	}
@@ -4884,11 +6883,7 @@ public sealed class WinFormsAppHost : IDisposable
 
 	private static void PerformItemClick(System.Windows.Forms.ToolStripItem item)
 	{
-		// Enter/exit timestamps: effect-apply (e.g. PDN Auto-Level)
-		// wedges the page with zero console output; the exit line (in
-		// finally) proves whether PerformClick returns or the hang is
-		// inside it. Covers mouse and keyboard activation paths.
-		Console.WriteLine($"[Host] ItemClick enter: '{item.Name}' at {System.DateTime.UtcNow:HH:mm:ss.fff}");
+		Console.WriteLine($"[Host] ItemClick enter: '{item.Name}' at {DateTime.UtcNow:HH:mm:ss.fff}");
 		try
 		{
 			item.PerformClick();
@@ -4900,69 +6895,68 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 		finally
 		{
-			Console.WriteLine($"[Host] ItemClick exit: '{item.Name}' at {System.DateTime.UtcNow:HH:mm:ss.fff}");
+			Console.WriteLine($"[Host] ItemClick exit: '{item.Name}' at {DateTime.UtcNow:HH:mm:ss.fff}");
 		}
 	}
 
-	// Keyboard menu-loop emulation for host-tracked open dropdowns.
-	// Returns true when the key is a menu-navigation key (handled whether
-	// or not an item ends up selected: an open menu captures these keys).
 	private bool DropdownKeyNav(System.Windows.Forms.Keys keyData)
 	{
-		System.Windows.Forms.Keys code = keyData & System.Windows.Forms.Keys.KeyCode;
-		if (code != System.Windows.Forms.Keys.Down && code != System.Windows.Forms.Keys.Up
-			&& code != System.Windows.Forms.Keys.Enter && code != System.Windows.Forms.Keys.Home
-			&& code != System.Windows.Forms.Keys.End)
+		System.Windows.Forms.Keys keys = keyData & System.Windows.Forms.Keys.KeyCode;
+		if (keys != System.Windows.Forms.Keys.Down && keys != System.Windows.Forms.Keys.Up && keys != System.Windows.Forms.Keys.Return && keys != System.Windows.Forms.Keys.Home && keys != System.Windows.Forms.Keys.End)
 		{
 			return false;
 		}
-		var open = GetOpenDropdowns();
-		if (open.Count == 0)
+		List<(System.Windows.Forms.ToolStripDropDown, int, int)> openDropdowns = GetOpenDropdowns();
+		if (openDropdowns.Count == 0)
 		{
 			return false;
 		}
-		System.Windows.Forms.ToolStripDropDown drop = open[open.Count - 1].Drop;
-		var items = new System.Collections.Generic.List<System.Windows.Forms.ToolStripItem>();
-		foreach (System.Windows.Forms.ToolStripItem candidate in drop.Items)
+		System.Windows.Forms.ToolStripDropDown item = openDropdowns[openDropdowns.Count - 1].Item1;
+		List<System.Windows.Forms.ToolStripItem> list = new List<System.Windows.Forms.ToolStripItem>();
+		foreach (System.Windows.Forms.ToolStripItem item2 in item.Items)
 		{
-			if (candidate.Available && candidate.Enabled && !(candidate is System.Windows.Forms.ToolStripSeparator))
+			if (item2.Available && item2.Enabled && !(item2 is System.Windows.Forms.ToolStripSeparator))
 			{
-				items.Add(candidate);
+				list.Add(item2);
 			}
 		}
-		if (items.Count == 0)
+		if (list.Count == 0)
 		{
 			return true;
 		}
-		int current = items.FindIndex(i => i.Selected);
+		int num = list.FindIndex((System.Windows.Forms.ToolStripItem i) => i.Selected);
 		try
 		{
-			if (code == System.Windows.Forms.Keys.Enter)
+			if (keys == System.Windows.Forms.Keys.Return)
 			{
-				System.Windows.Forms.ToolStripItem active = current >= 0 ? items[current] : items[0];
-				Console.WriteLine($"[Host] Dropdown keyboard activate: '{active.Name}'");
-				// Dismiss first, execute after (desktop + mouse-path
-				// order): running the command with the menu open risks
-				// vendor re-entrancy between teardown and apply.
+				System.Windows.Forms.ToolStripItem toolStripItem2 = ((num >= 0) ? list[num] : list[0]);
+				Console.WriteLine("[Host] Dropdown keyboard activate: '" + toolStripItem2.Name + "'");
 				CloseOpenDropdowns();
-				PerformItemClick(active);
+				PerformItemClick(toolStripItem2);
 			}
 			else
 			{
-				int next = code switch
+				if (1 == 0)
 				{
-					System.Windows.Forms.Keys.Home => 0,
-					System.Windows.Forms.Keys.End => items.Count - 1,
-					System.Windows.Forms.Keys.Up => current <= 0 ? items.Count - 1 : current - 1,
-					_ => current < 0 || current >= items.Count - 1 ? 0 : current + 1,
+				}
+				int num2 = keys switch
+				{
+					System.Windows.Forms.Keys.Home => 0, 
+					System.Windows.Forms.Keys.End => list.Count - 1, 
+					System.Windows.Forms.Keys.Up => (num <= 0) ? (list.Count - 1) : (num - 1), 
+					_ => (num >= 0 && num < list.Count - 1) ? (num + 1) : 0, 
 				};
-				items[next].Select();
-				Console.WriteLine($"[Host] Dropdown keyboard select: '{items[next].Name}' ({next + 1}/{items.Count})");
+				if (1 == 0)
+				{
+				}
+				int num3 = num2;
+				list[num3].Select();
+				Console.WriteLine($"[Host] Dropdown keyboard select: '{list[num3].Name}' ({num3 + 1}/{list.Count})");
 			}
 		}
 		catch (Exception ex)
 		{
-			Console.WriteLine($"[WinFormsAppHost] Dropdown key error: {ex.GetType().Name}: {(ex.Message ?? "").Split('\n')[0]}");
+			Console.WriteLine("[WinFormsAppHost] Dropdown key error: " + ex.GetType().Name + ": " + (ex.Message ?? "").Split('\n')[0]);
 			BrowserErrorReporter.Report("dropdown-key", ex);
 		}
 		return true;
@@ -5048,29 +7042,24 @@ public sealed class WinFormsAppHost : IDisposable
 
 	private void CloseOpenDropdowns()
 	{
-		// Snapshot both collections: unselecting/hiding re-enters tracking
-		// and item mutation (PDN menu teardown mutates live collections),
-		// which threw "Collection was modified" out of Escape and killed
-		// the Blazor session (paint Adjustments host-fatal, stack-proven).
-		foreach (var openDropdown in GetOpenDropdowns().ToList())
+		foreach (var (toolStripDropDown, _, _) in GetOpenDropdowns().ToList())
 		{
-			System.Windows.Forms.ToolStripDropDown item = openDropdown.Drop;
 			try
 			{
-				foreach (System.Windows.Forms.ToolStripItem item2 in item.Items.OfType<System.Windows.Forms.ToolStripItem>().ToList())
+				foreach (System.Windows.Forms.ToolStripItem item in toolStripDropDown.Items.OfType<System.Windows.Forms.ToolStripItem>().ToList())
 				{
 					try
 					{
-						if (item2.Selected)
+						if (item.Selected)
 						{
-							s_itemUnselectMethod?.Invoke(item2, Array.Empty<object>());
+							s_itemUnselectMethod?.Invoke(item, Array.Empty<object>());
 						}
 					}
 					catch
 					{
 					}
 				}
-				item.Visible = false;
+				toolStripDropDown.Visible = false;
 			}
 			catch
 			{
@@ -5080,132 +7069,193 @@ public sealed class WinFormsAppHost : IDisposable
 		SetHoverItem(null);
 	}
 
+	private static bool TryCloseVendorPopupForEscape()
+	{
+		// Combo-Escape wedge (WF-R-070): a tracked open vendor popup
+		// (Syncfusion PopupHost) wedges the renderer inside its own Escape
+		// handling, so the host must close it instead of raising Escape into
+		// the vendor. Mirror the ShowDropDown/HidePopup/ClosePopup reflection
+		// pattern: vendor close first, Hide() fallback. Never throws.
+		try
+		{
+			System.Windows.Forms.Control[] popups;
+			try { popups = System.Windows.Forms.WasmPopupHost.Snapshot(); }
+			catch { popups = System.Array.Empty<System.Windows.Forms.Control>(); }
+			for (int i = popups.Length - 1; i >= 0; i--)
+			{
+				if (ClosePopupControlForEscape(popups[i])) return true;
+			}
+			System.Windows.Forms.WasmShownWindow[] wins;
+			try { wins = System.Windows.Forms.WasmDialogHost.Snapshot(); }
+			catch { return false; }
+			for (int i = wins.Length - 1; i >= 0; i--)
+			{
+				System.Windows.Forms.Form f;
+				try { f = wins[i].Form; if (f == null || f.IsDisposed || f.Disposing || !f.Visible) continue; }
+				catch { continue; }
+				if (!f.GetType().Name.Contains("Popup", System.StringComparison.Ordinal)) continue;
+				if (ClosePopupControlForEscape(f)) return true;
+			}
+		}
+		catch { }
+		return false;
+	}
+
+	private static bool ClosePopupControlForEscape(System.Windows.Forms.Control popup)
+	{
+		string typeName;
+		try
+		{
+			if (popup.IsDisposed || popup.Disposing || !popup.Visible) return false;
+			typeName = popup.GetType().Name ?? string.Empty;
+		}
+		catch { return false; }
+		if (!typeName.Contains("Popup", System.StringComparison.Ordinal)
+			&& !typeName.Contains("DropDown", System.StringComparison.Ordinal)) return false;
+		System.Reflection.MethodInfo? hide = null;
+		try
+		{
+			foreach (System.Reflection.MethodInfo m in popup.GetType().GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+			{
+				if (m.ContainsGenericParameters || m.GetParameters().Length != 0) continue;
+				if (m.Name == "HidePopup" || m.Name == "ClosePopup") { hide = m; break; }
+			}
+		}
+		catch { }
+		try
+		{
+			if (hide != null) hide.Invoke(popup, null);
+			else popup.Hide();
+		}
+		catch { }
+		try { Console.WriteLine("[Host] Escape closed vendor popup " + popup.GetType().FullName); } catch { }
+		return true;
+	}
+
 	public void OnKeyDown(string key, bool shift = false, bool ctrl = false, bool alt = false)
 	{
 		WasmDialogHost.AdvanceTurn();
-		System.Windows.Forms.WasmRepaintGate.MarkGlobalDirty();
-		var (keyData, keyChar) = MapKey(key, shift, ctrl, alt);
-		System.Windows.Forms.Control? target = KeyTarget();
-		RecordInput("key", key + Mods(shift, ctrl, alt) + " target=" + DescribeControl(target));
-		Console.WriteLine("[Host] OnKeyDown(key=" + key + Mods(shift, ctrl, alt) + " target=" + DescribeControl(target) + ")");
-		if (target == null)
+		WasmRepaintGate.MarkGlobalDirty();
+		(System.Windows.Forms.Keys KeyData, char? KeyChar) tuple = MapKey(key, shift, ctrl, alt);
+		System.Windows.Forms.Keys item = tuple.KeyData;
+		char? item2 = tuple.KeyChar;
+		System.Windows.Forms.Control control = KeyTarget();
+		RecordInput("key", key + Mods(shift, ctrl, alt) + " target=" + DescribeControl(control));
+		Console.WriteLine("[Host] OnKeyDown(key=" + key + Mods(shift, ctrl, alt) + " target=" + DescribeControl(control) + ")");
+		if (control == null)
 		{
 			return;
 		}
-		var args = new System.Windows.Forms.KeyEventArgs(keyData);
-		System.Windows.Forms.WasmMouseState.SetModifiers(ToKeys(shift, ctrl, alt));
-		// Open-menu navigation runs BEFORE message filters (desktop modal
-		// menu loop preempts them): with a dropdown open, arrows/Enter
-		// belong to the menu even if a filter (including a vendor menu
-		// filter left over from an earlier menu) claims the keystroke.
-		if (GetOpenDropdowns().Count > 0 && DropdownKeyNav(keyData))
-		{
-			// An open menu captures navigation keys (desktop menu loop):
-			// arrows move selection, Enter activates. The fork runs no
-			// modal menu loop headless, so the host drives vendor
-			// selection (painted highlight reads item.Selected) and
-			// PerformClick directly. Left/Right menu-bar travel is open.
-			return;
-		}
-		bool filtered = PumpKeyFilters(target, alt ? WM_SYSKEYDOWN : WM_KEYDOWN, VkForPump(keyData, shift, ctrl, alt), alt ? 0x20000000 : 1);
-		if (filtered)
-		{
-			// A message filter (menu/shortcut manager) consumed the keystroke;
-			// desktop never delivers it to the control.
-			args.Handled = true;
-			args.SuppressKeyPress = true;
-		}
-		if (!filtered && (ctrl || alt) && PumpCommandKey(target, keyData, alt, shift, ctrl))
-		{
-			// A command key (menu shortcut) consumed the chord; desktop
-			// never delivers KeyDown/KeyPress for it.
-			return;
-		}
-		if (!filtered && (keyData & ~System.Windows.Forms.Keys.Shift) == (System.Windows.Forms.Keys.Control | System.Windows.Forms.Keys.A)
-			&& target is System.Windows.Forms.TextBoxBase textBox)
-		{
-			// The fork has no native edit control to select all (the real
-			// TextBox relies on its native window for this); the host owns
-			// textbox edit emulation (Backspace/Return/append below), so it
-			// selects before vendor handlers run (desktop order: the native
-			// control updates first, handlers observe the selection).
-			// KeyPress is still suppressed below like desktop.
-			textBox.SelectAll();
-			args.SuppressKeyPress = true;
-		}
-		System.Windows.Forms.Keys keyCodeOnly = keyData & System.Windows.Forms.Keys.KeyCode;
-		bool isDialogKey = !filtered && (keyCodeOnly == System.Windows.Forms.Keys.Escape || keyCodeOnly == System.Windows.Forms.Keys.Return);
-		if (isDialogKey && TopModalWindow(out System.Windows.Forms.Form? dkModal) && dkModal != null)
-		{
-			// Focus-first like a real activation: the Accept/Cancel button
-			// takes focus before ProcessDialogKey clicks it, so edits
-			// commit (Leave) before the result is observed (Levels
-			// output-low: Enter-OK applied the pre-edit value).
-			System.Windows.Forms.Control? dkBtn =
-				(keyCodeOnly == System.Windows.Forms.Keys.Escape ? dkModal.CancelButton : dkModal.AcceptButton)
-				as System.Windows.Forms.Control;
-			if (dkBtn != null)
-				NoteFocus(dkBtn);
-		}
-		if (isDialogKey
-			&& EmulateProcessDialogKey(target, keyData))
-		{
-			// Desktop PreProcessMessage order: dialog keys (Accept/Cancel
-			// buttons) preempt control KeyDown delivery. Without this, a
-			// focused slider swallows Escape and modal effect dialogs
-			// never dismiss (Paint.NET Highlights/Shadows repro). The
-			// existing post-delivery fallbacks below stay untouched for
-			// dialogs without Accept/Cancel buttons.
-			// Headless has no nested modal loop to observe a freshly set
-			// DialogResult, so settle it like ModalOnClick does.
-			if (TopModalWindow(out System.Windows.Forms.Form? escModal) && escModal != null)
-				CloseModalIfSettled(escModal);
-			args.Handled = true;
-			args.SuppressKeyPress = true;
-			return;
-		}
-		RaiseKey(s_onKeyDownMethod, target, args, "down");
-		if (args.Handled || args.SuppressKeyPress)
+		System.Windows.Forms.KeyEventArgs e = new System.Windows.Forms.KeyEventArgs(item);
+		WasmMouseState.SetModifiers(ToKeys(shift, ctrl, alt));
+		if (GetOpenDropdowns().Count > 0 && DropdownKeyNav(item))
 		{
 			return;
 		}
-		switch (keyData & System.Windows.Forms.Keys.KeyCode)
+		bool flag = PumpKeyFilters(control, alt ? 260 : 256, VkForPump(item, shift, ctrl, alt), (!alt) ? 1 : 536870912);
+		if (flag)
+		{
+			e.Handled = true;
+			e.SuppressKeyPress = true;
+		}
+		if (!flag && (ctrl | alt) && PumpCommandKey(control, item, alt, shift, ctrl))
+		{
+			return;
+		}
+		if (!flag && (item & ~System.Windows.Forms.Keys.Shift) == (System.Windows.Forms.Keys.A | System.Windows.Forms.Keys.Control) && control is System.Windows.Forms.TextBoxBase textBoxBase)
+		{
+			textBoxBase.SelectAll();
+			e.SuppressKeyPress = true;
+		}
+		System.Windows.Forms.Keys keys = item & System.Windows.Forms.Keys.KeyCode;
+		bool flag2 = !flag && (keys == System.Windows.Forms.Keys.Escape || keys == System.Windows.Forms.Keys.Return);
+		if (flag2 && TopModalWindow(out System.Windows.Forms.Form modal) && modal != null && ((keys == System.Windows.Forms.Keys.Escape) ? modal.CancelButton : modal.AcceptButton) is System.Windows.Forms.Control control2)
+		{
+			NoteFocus(control2);
+		}
+		if (flag2 && EmulateProcessDialogKey(control, item))
+		{
+			if (TopModalWindow(out System.Windows.Forms.Form modal2) && modal2 != null)
+			{
+				CloseModalIfSettled(modal2);
+			}
+			e.Handled = true;
+			e.SuppressKeyPress = true;
+			return;
+		}
+		if (!flag && (item & System.Windows.Forms.Keys.KeyCode) == System.Windows.Forms.Keys.Escape && TryCloseVendorPopupForEscape())
+		{
+			e.Handled = true;
+			e.SuppressKeyPress = true;
+			return;
+		}
+		RaiseKey(s_onKeyDownMethod, control, e, "down");
+		if (e.Handled || e.SuppressKeyPress)
+		{
+			return;
+		}
+		switch (item & System.Windows.Forms.Keys.KeyCode)
 		{
 		case System.Windows.Forms.Keys.Escape:
 			if (GetOpenDropdowns().Count > 0)
 			{
 				CloseOpenDropdowns();
-				return;
 			}
-			if (TopModalWindow(out System.Windows.Forms.Form modal2) && modal2 != null)
+			else
 			{
+				if (!TopModalWindow(out System.Windows.Forms.Form modal4) || modal4 == null)
+				{
+					return;
+				}
 				try
 				{
-					// Same user-close contract as the X box above: carry
-					// Cancel so the fork does not read this as PDN's posted
-					// abort-Close (None-at-entry stays open by design).
-					if (modal2.Modal && modal2.DialogResult == System.Windows.Forms.DialogResult.None)
-						modal2.DialogResult = System.Windows.Forms.DialogResult.Cancel;
-					modal2.Close();
+					if (modal4.Modal && modal4.DialogResult == System.Windows.Forms.DialogResult.None)
+					{
+						modal4.DialogResult = System.Windows.Forms.DialogResult.Cancel;
+					}
+					modal4.Close();
+					return;
 				}
 				catch (Exception ex)
 				{
 					BrowserErrorReporter.Report("dialog-close", ex);
+					return;
 				}
 			}
 			return;
 		case System.Windows.Forms.Keys.Return:
-			if (_focusedTextBox is { Multiline: true, AcceptsReturn: true })
+		{
+			System.Windows.Forms.Control outer = OuterKeyControl(control);
+			FireOuterKeyDown(outer, item);
+			Console.WriteLine("[VAPI] return-route inner=" + control.GetType().Name + " par=" + ((control.Parent is null) ? "null" : control.Parent.GetType().Name) + " outer=" + outer.GetType().Name);
+			try
+			{
+				object? ot = outer.GetType().GetProperty("Text")?.GetValue(outer);
+				Console.WriteLine("[VAPI] return-outer-text='" + (ot?.ToString() ?? "?") + "'");
+			}
+			catch { }
+			try
+			{
+				System.Reflection.MethodInfo? od = outer.GetType().GetMethod("OnKeyDown", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
+				Console.WriteLine("[VAPI] return-override OnKeyDown decl=" + (od?.DeclaringType?.Name ?? "?") + " keycode=" + item);
+			}
+			catch { }
+			if (outer != control)
+				RaiseKey(s_onKeyDownMethod, outer, new System.Windows.Forms.KeyEventArgs(item), "down");
+		}
+		{
+			System.Windows.Forms.TextBox focusedTextBox = _focusedTextBox;
+			System.Windows.Forms.Form modal3;
+			if (focusedTextBox != null && focusedTextBox.Multiline && focusedTextBox.AcceptsReturn)
 			{
 				_focusedTextBox.Text += "\r\n";
-				return;
 			}
-			if (TopModalWindow(out System.Windows.Forms.Form modal) && modal != null)
+			else if (TopModalWindow(out modal3) && modal3 != null)
 			{
-				if (modal.AcceptButton is System.Windows.Forms.Button button)
+				if (modal3.AcceptButton is System.Windows.Forms.Button button)
 				{
 					button.PerformClick();
-					CloseModalIfSettled(modal);
+					CloseModalIfSettled(modal3);
 				}
 			}
 			else if (_activeForm?.AcceptButton is System.Windows.Forms.Button button2)
@@ -5213,104 +7263,92 @@ public sealed class WinFormsAppHost : IDisposable
 				button2.PerformClick();
 			}
 			return;
+		}
 		case System.Windows.Forms.Keys.Back:
 			if (_focusedTextBox != null && _focusedTextBox.Text.Length > 0)
 			{
-				System.Windows.Forms.TextBox? focusedTextBox = _focusedTextBox;
+				System.Windows.Forms.TextBox focusedTextBox2 = _focusedTextBox;
 				string text = _focusedTextBox.Text;
-				int bsStart = System.Math.Max(0, System.Math.Min(focusedTextBox.SelectionStart, text.Length));
-				int bsLen = System.Math.Max(0, System.Math.Min(focusedTextBox.SelectionLength, text.Length - bsStart));
-				if (bsLen > 0)
+				int num = Math.Max(0, Math.Min(focusedTextBox2.SelectionStart, text.Length));
+				int num2 = Math.Max(0, Math.Min(focusedTextBox2.SelectionLength, text.Length - num));
+				if (num2 > 0)
 				{
-					focusedTextBox.Text = text.Substring(0, bsStart) + text.Substring(bsStart + bsLen);
-					focusedTextBox.SelectionStart = bsStart;
+					focusedTextBox2.Text = text.Substring(0, num) + text.Substring(num + num2);
+					focusedTextBox2.SelectionStart = num;
 				}
-				else if (bsStart > 0)
+				else if (num > 0)
 				{
-					focusedTextBox.Text = text.Substring(0, bsStart - 1) + text.Substring(bsStart);
-					focusedTextBox.SelectionStart = bsStart - 1;
+					focusedTextBox2.Text = text.Substring(0, num - 1) + text.Substring(num);
+					focusedTextBox2.SelectionStart = num - 1;
 				}
 				else
 				{
-					focusedTextBox.Text = text.Substring(0, text.Length - 1);
+					focusedTextBox2.Text = text.Substring(0, text.Length - 1);
 				}
 			}
 			return;
 		}
-		if (alt && keyChar is null && key.Length == 1)
+		if ((alt && !item2.HasValue && key.Length == 1 && (PumpKeyFilters(control, 262, key[0], 536870912) || PumpMenuMnemonic(key[0]))) || !item2.HasValue)
 		{
-			// Desktop still posts WM_SYSCHAR for Alt+letter (menu mnemonics
-			// consume it there); no KeyPress event follows, but filters run.
-			bool sysFiltered = PumpKeyFilters(target, WM_SYSCHAR, key[0], 0x20000000);
-			if (sysFiltered)
-			{
-				return;
-			}
-			if (PumpMenuMnemonic(key[0]))
-			{
-				return;
-			}
-		}		if (keyChar is char c)
+			return;
+		}
+		char valueOrDefault = item2.GetValueOrDefault();
+		if (true && !PumpKeyFilters(control, alt ? 262 : 258, valueOrDefault, (!alt) ? 1 : 536870912))
 		{
-			if (PumpKeyFilters(target, alt ? WM_SYSCHAR : WM_CHAR, c, alt ? 0x20000000 : 1))
+			RaiseKey(s_onKeyPressMethod, control, new System.Windows.Forms.KeyPressEventArgs(valueOrDefault), "press");
+			if (control == _focusedTextBox && _focusedTextBox != null && valueOrDefault >= ' ')
 			{
-				// Consumed (e.g., menu mnemonic); desktop never delivers it.
-				return;
-			}
-			RaiseKey(s_onKeyPressMethod, target, new System.Windows.Forms.KeyPressEventArgs(c), "press");
-			// The fork has no native edit control to consume the char;
-			// the host applies the edit (desktop KeyPress default).
-			if (target == _focusedTextBox && _focusedTextBox != null)
-			{
-				if (c >= ' ')
-				{
-					string text = _focusedTextBox.Text;
-					int start = System.Math.Max(0, System.Math.Min(_focusedTextBox.SelectionStart, text.Length));
-					int len = System.Math.Max(0, System.Math.Min(_focusedTextBox.SelectionLength, text.Length - start));
-					_focusedTextBox.Text = text.Substring(0, start) + c + text.Substring(start + len);
-					_focusedTextBox.SelectionStart = start + 1;
-				}
+				string text2 = _focusedTextBox.Text;
+				int num3 = Math.Max(0, Math.Min(_focusedTextBox.SelectionStart, text2.Length));
+				int num4 = Math.Max(0, Math.Min(_focusedTextBox.SelectionLength, text2.Length - num3));
+				_focusedTextBox.Text = text2.Substring(0, num3) + valueOrDefault + text2.Substring(num3 + num4);
+				_focusedTextBox.SelectionStart = num3 + 1;
 			}
 		}
 	}
+
 	public void OnKeyUp(string key, bool shift = false, bool ctrl = false, bool alt = false)
 	{
 		WasmDialogHost.AdvanceTurn();
-		System.Windows.Forms.WasmRepaintGate.MarkGlobalDirty();
-		var (keyData, _) = MapKey(key, shift, ctrl, alt);
-		System.Windows.Forms.Control? target = KeyTarget();
-		RecordInput("keyup", key + Mods(shift, ctrl, alt) + " target=" + DescribeControl(target));
-		if (target == null)
+		WasmRepaintGate.MarkGlobalDirty();
+		System.Windows.Forms.Keys item = MapKey(key, shift, ctrl, alt).KeyData;
+		System.Windows.Forms.Control control = KeyTarget();
+		RecordInput("keyup", key + Mods(shift, ctrl, alt) + " target=" + DescribeControl(control));
+		if (control != null)
 		{
-			return;
+			WasmMouseState.SetModifiers(ToKeys(shift, ctrl, alt));
+			if (!PumpKeyFilters(control, alt ? 261 : 257, VkForPump(item, shift, ctrl, alt), alt ? 536870912 : 0))
+			{
+				RaiseKey(s_onKeyUpMethod, control, new System.Windows.Forms.KeyEventArgs(item), "up");
+			}
 		}
-		System.Windows.Forms.WasmMouseState.SetModifiers(ToKeys(shift, ctrl, alt));
-		if (PumpKeyFilters(target, alt ? WM_SYSKEYUP : WM_KEYUP, VkForPump(keyData, shift, ctrl, alt), alt ? 0x20000000 : 0))
-		{
-			return;
-		}		RaiseKey(s_onKeyUpMethod, target, new System.Windows.Forms.KeyEventArgs(keyData), "up");
 	}
 
-	// Desktop PreProcessMessage emulation for dialog keys: walk the
-	// focused control's ancestor chain calling ProcessDialogKey (Form
-	// override clicks Accept/CancelButton). Returns true when consumed.
-	// A throwing vendor override must not kill input: contain per level.
 	private static bool EmulateProcessDialogKey(System.Windows.Forms.Control? target, System.Windows.Forms.Keys keyData)
 	{
 		try
 		{
-			if (s_processDialogKeyMethod is null) return false;
-			for (System.Windows.Forms.Control? c = target; c != null; c = c.Parent)
+			if ((object)s_processDialogKeyMethod == null)
+			{
+				return false;
+			}
+			for (System.Windows.Forms.Control control = target; control != null; control = control.Parent)
 			{
 				try
 				{
-					if (s_processDialogKeyMethod.Invoke(c, new object[] { keyData }) is true)
+					if (s_processDialogKeyMethod.Invoke(control, new object[1] { keyData }) is int num && num != 0)
+					{
 						return true;
+					}
 				}
-				catch { }
+				catch
+				{
+				}
 			}
 		}
-		catch { }
+		catch
+		{
+		}
 		return false;
 	}
 
@@ -5334,167 +7372,92 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 		return null;
 	}
+
 	private static bool IsInForm(System.Windows.Forms.Control control, System.Windows.Forms.Form form)
 	{
-		for (System.Windows.Forms.Control? current = control; current != null; current = current.Parent)
+		for (System.Windows.Forms.Control control2 = control; control2 != null; control2 = control2.Parent)
 		{
-			if (current == form)
+			if (control2 == form)
 			{
 				return true;
 			}
 		}
 		return false;
 	}
-	private const int WM_KEYDOWN = 0x0100;
-	private const int WM_KEYUP = 0x0101;
-	private const int WM_CHAR = 0x0102;
-	private const int WM_SYSKEYDOWN = 0x0104;
-	private const int WM_SYSKEYUP = 0x0105;
-	private const int WM_SYSCHAR = 0x0106;
-	// Virtual-key code for the pump: bare-modifier presses carry no KeyCode,
-	// desktop still reports their VK (menu filters match WParam == 18 for Alt).
+
 	private static int VkForPump(System.Windows.Forms.Keys keyData, bool shift, bool ctrl, bool alt)
 	{
-		int vk = (int)(keyData & System.Windows.Forms.Keys.KeyCode);
-		if (vk == 0)
-			 vk = alt ? 18 : ctrl ? 17 : shift ? 16 : 0;
-		return vk;
+		int num = (int)(keyData & System.Windows.Forms.Keys.KeyCode);
+		if (num == 0)
+		{
+			if (alt)
+			{
+				num = 18;
+			}
+			else
+			{
+				num = (ctrl ? 17 : (shift ? 16 : 0));
+			}
+		}
+		return num;
 	}
-	// OS menu-activation service: the browser has no native menus, so no
-	// DefWindowProc turns Alt+letter SYSCHAR into a menu activation. Vendor
-	// menu bars (Syncfusion bars, ...) expose a public ProcessShortcut(char)
-	// entry point for exactly this; the host drives the first visible one
-	// that accepts the key. Duck-typed (no vendor references) and cached per
-	// runtime type; one control's failure never blocks the others or typing.
-	private static readonly System.Collections.Generic.Dictionary<string, System.Reflection.MethodInfo?> s_mnemonicMethods = new();
-	private static readonly System.Collections.Generic.Dictionary<string, System.Reflection.MethodInfo?> s_commandKeyMethods = new();
-	// Desktop PreProcessMessage order for command keys: the focused
-	// control first, then each parent up to the form (menu shortcuts live
-	// on the form/menu strip). ProcessCmdKey is protected, so reflection
-	// per level; each level best-effort, never throws.
+
 	private bool PumpCommandKey(System.Windows.Forms.Control target, System.Windows.Forms.Keys keyData, bool alt, bool shift, bool ctrl)
 	{
 		try
 		{
-			System.IntPtr hwnd = System.IntPtr.Zero;
-			try { hwnd = target.Handle; } catch { }
-			int vk = VkForPump(keyData, shift, ctrl, alt);
-			System.Windows.Forms.Message msg = System.Windows.Forms.Message.Create(hwnd,
-				alt ? WM_SYSKEYDOWN : WM_KEYDOWN, (System.IntPtr)vk, (System.IntPtr)(alt ? 0x20000000 : 1));
-			for (System.Windows.Forms.Control? c = target; c != null; c = c.Parent)
+			nint hWnd = IntPtr.Zero;
+			try
 			{
-				System.Reflection.MethodInfo? mi;
-				string typeKey = c.GetType().AssemblyQualifiedName ?? c.GetType().FullName ?? "?";
+				hWnd = target.Handle;
+			}
+			catch
+			{
+			}
+			int num = VkForPump(keyData, shift, ctrl, alt);
+			System.Windows.Forms.Message message = System.Windows.Forms.Message.Create(hWnd, alt ? 260 : 256, num, (!alt) ? 1 : 536870912);
+			for (System.Windows.Forms.Control control = target; control != null; control = control.Parent)
+			{
+				string key = control.GetType().AssemblyQualifiedName ?? control.GetType().FullName ?? "?";
+				MethodInfo value;
 				lock (s_commandKeyMethods)
 				{
-					if (!s_commandKeyMethods.TryGetValue(typeKey, out mi))
+					if (!s_commandKeyMethods.TryGetValue(key, out value))
 					{
 						try
 						{
-							var msgByRef = typeof(System.Windows.Forms.Message).MakeByRefType();
-							mi = c.GetType().GetMethod("ProcessCmdKey",
-								System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance,
-								null, new[] { msgByRef, typeof(System.Windows.Forms.Keys) }, null);
-							if (mi != null && mi.ReturnType != typeof(bool)) mi = null;
+							Type type = typeof(System.Windows.Forms.Message).MakeByRefType();
+							value = control.GetType().GetMethod("ProcessCmdKey", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new Type[2]
+							{
+								type,
+								typeof(System.Windows.Forms.Keys)
+							}, null);
+							if (value != null && value.ReturnType != typeof(bool))
+							{
+								value = null;
+							}
 						}
 						catch
 						{
-							mi = null;
+							value = null;
 						}
-						s_commandKeyMethods[typeKey] = mi;
+						s_commandKeyMethods[key] = value;
 					}
 				}
-				if (mi == null) continue;
-				try
-				{
-					object[] pm = new object[] { msg, keyData };
-					bool consumed = (bool)(mi.Invoke(c, pm) ?? false);
-					msg = (System.Windows.Forms.Message)pm[0];
-					if (consumed)
-					{
-						return true;
-					}
-				}
-				catch
-				{
-					// A level that cannot run headless simply does not
-					// consume; the walk continues to the next parent.
-				}
-			}
-		}
-		catch
-		{
-		}
-		return false;
-	}
-	private bool PumpMenuMnemonic(char c)
-	{
-		try
-		{
-			System.Windows.Forms.Control? root = _activeForm;
-			if (root == null)
-			{
-				return false;
-			}
-			var stack = new System.Collections.Generic.Stack<System.Windows.Forms.Control>();
-			stack.Push(root);
-			var barControls = new System.Collections.Generic.List<System.Windows.Forms.Control>();
-			while (stack.Count > 0)
-			{
-				System.Windows.Forms.Control ctl = stack.Pop();
-				System.Reflection.MethodInfo? mi;
-				string typeKey = ctl.GetType().AssemblyQualifiedName ?? ctl.GetType().FullName ?? "?";
-				lock (s_mnemonicMethods)
-				{
-					if (!s_mnemonicMethods.TryGetValue(typeKey, out mi))
-					{
-						try
-						{
-							var cand = ctl.GetType().GetMethod("ProcessShortcut",
-								System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance,
-								null, new[] { typeof(char) }, null);
-							mi = (cand != null && cand.ReturnType == typeof(bool)) ? cand : null;
-						}
-						catch
-						{
-							mi = null;
-						}
-						s_mnemonicMethods[typeKey] = mi;
-					}
-				}
-				if (mi != null && ctl.Visible && ctl.Enabled)
-				{
-					barControls.Add(ctl);
-				}
-				try
-				{
-					foreach (System.Windows.Forms.Control kid in ctl.Controls)
-					{
-						stack.Push(kid);
-					}
-				}
-				catch
-				{
-				}
-			}
-			foreach (System.Windows.Forms.Control ctl in barControls)
-			{
-				System.Reflection.MethodInfo mi2 = null;
-				string typeKey2 = ctl.GetType().AssemblyQualifiedName ?? ctl.GetType().FullName ?? "?";
-				lock (s_mnemonicMethods) { s_mnemonicMethods.TryGetValue(typeKey2, out mi2); }
-				if (mi2 != null)
+				if (!(value == null))
 				{
 					try
 					{
-						bool opened = (bool)(mi2.Invoke(ctl, new object[] { c }) ?? false);
-						if (opened)
+						object[] array = new object[2] { message, keyData };
+						bool flag = (bool)(value.Invoke(control, array) ?? ((object)false));
+						message = (System.Windows.Forms.Message)array[0];
+						if (flag)
 						{
 							return true;
 						}
 					}
 					catch
 					{
-						// A bar that cannot run headless simply does not open.
 					}
 				}
 			}
@@ -5504,21 +7467,98 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 		return false;
 	}
-	// Desktop pumps app message filters before dispatching key messages;
-	// vendors' menu/shortcut managers (Syncfusion MainFrameBarManager,
-	// TabbedMDIManager, ribbon/docking filters) live there. The host owns
-	// no message loop, so it synthesizes the message explicitly. HWnd is
-	// the target's (minted) handle; LParam carries only the Alt context
-	// bit (scan codes are unknowable headless). Swallowed (true) means
-	// desktop never delivers the keystroke. Never throws: a faulty
-	// filter must not break typing.
+
+	private bool PumpMenuMnemonic(char c)
+	{
+		try
+		{
+			System.Windows.Forms.Control activeForm = _activeForm;
+			if (activeForm == null)
+			{
+				return false;
+			}
+			Stack<System.Windows.Forms.Control> stack = new Stack<System.Windows.Forms.Control>();
+			stack.Push(activeForm);
+			List<System.Windows.Forms.Control> list = new List<System.Windows.Forms.Control>();
+			while (stack.Count > 0)
+			{
+				System.Windows.Forms.Control control = stack.Pop();
+				string key = control.GetType().AssemblyQualifiedName ?? control.GetType().FullName ?? "?";
+				MethodInfo value;
+				lock (s_mnemonicMethods)
+				{
+					if (!s_mnemonicMethods.TryGetValue(key, out value))
+					{
+						try
+						{
+							MethodInfo method = control.GetType().GetMethod("ProcessShortcut", BindingFlags.Instance | BindingFlags.Public, null, new Type[1] { typeof(char) }, null);
+							value = ((method != null && method.ReturnType == typeof(bool)) ? method : null);
+						}
+						catch
+						{
+							value = null;
+						}
+						s_mnemonicMethods[key] = value;
+					}
+				}
+				if (value != null && control.Visible && control.Enabled)
+				{
+					list.Add(control);
+				}
+				try
+				{
+					foreach (System.Windows.Forms.Control control2 in control.Controls)
+					{
+						stack.Push(control2);
+					}
+				}
+				catch
+				{
+				}
+			}
+			foreach (System.Windows.Forms.Control item in list)
+			{
+				MethodInfo value2 = null;
+				string key2 = item.GetType().AssemblyQualifiedName ?? item.GetType().FullName ?? "?";
+				lock (s_mnemonicMethods)
+				{
+					s_mnemonicMethods.TryGetValue(key2, out value2);
+				}
+				if (!(value2 != null))
+				{
+					continue;
+				}
+				try
+				{
+					if ((bool)(value2.Invoke(item, new object[1] { c }) ?? ((object)false)))
+					{
+						return true;
+					}
+				}
+				catch
+				{
+				}
+			}
+		}
+		catch
+		{
+		}
+		return false;
+	}
+
 	private bool PumpKeyFilters(System.Windows.Forms.Control target, int msg, int wParam, int lParam)
 	{
 		try
 		{
-			System.IntPtr hwnd = System.IntPtr.Zero;
-			try { hwnd = target.Handle; } catch { }
-			var message = System.Windows.Forms.Message.Create(hwnd, msg, (System.IntPtr)wParam, (System.IntPtr)lParam);
+			nint hWnd = IntPtr.Zero;
+			try
+			{
+				hWnd = target.Handle;
+			}
+			catch
+			{
+			}
+			System.Windows.Forms.Message message = System.Windows.Forms.Message.Create(hWnd, msg, wParam, lParam);
 			return System.Windows.Forms.Application.FilterMessage(ref message);
 		}
 		catch (Exception ex)
@@ -5526,7 +7566,9 @@ public sealed class WinFormsAppHost : IDisposable
 			Console.WriteLine("[WinFormsAppHost] Key filter error: " + ex.GetType().Name + ": " + ex.Message.Split('\n')[0] + " site=" + SiteOf(ex));
 			return false;
 		}
-	}	private void RaiseKey(MethodInfo? method, System.Windows.Forms.Control target, EventArgs args, string kind)
+	}
+
+	private void RaiseKey(MethodInfo? method, System.Windows.Forms.Control target, EventArgs args, string kind)
 	{
 		if (method == null || target.IsDisposed)
 		{
@@ -5540,92 +7582,145 @@ public sealed class WinFormsAppHost : IDisposable
 		{
 			Console.WriteLine("[WinFormsAppHost] Key " + kind + " error: " + ex.GetType().Name + ": " + ex.Message.Split('\n')[0] + " site=" + SiteOf(ex));
 			Console.WriteLine("[WinFormsAppHost] Key " + kind + " error: root=" + RootCause(ex).GetType().Name + " site=" + SiteOf(RootCause(ex)) + " msg=" + (RootCause(ex).Message ?? "").Split('\n')[0]);
-			try { Console.WriteLine("[diagstack] " + string.Join(" <- ", new System.Diagnostics.StackTrace(RootCause(ex), false).GetFrames().Take(12).Select(f => f.GetMethod()))); } catch { }
+			try
+			{
+				Console.WriteLine("[diagstack] " + string.Join(" <- ", from f in new StackTrace(RootCause(ex), fNeedFileInfo: false).GetFrames().Take(12)
+					select f.GetMethod()));
+			}
+			catch
+			{
+			}
 			BrowserErrorReporter.Report("key", ex, SiteOf(RootCause(ex)));
 		}
 	}
-	private static string Mods(bool shift, bool ctrl, bool alt) =>
-		(shift ? "+shift" : "") + (ctrl ? "+ctrl" : "") + (alt ? "+alt" : "");
+
+	private static string Mods(bool shift, bool ctrl, bool alt)
+	{
+		return (shift ? "+shift" : "") + (ctrl ? "+ctrl" : "") + (alt ? "+alt" : "");
+	}
+
 	private static (System.Windows.Forms.Keys KeyData, char? KeyChar) MapKey(string key, bool shift, bool ctrl, bool alt)
 	{
-		System.Windows.Forms.Keys code;
-		char? ch = null;
+		char? item = null;
+		System.Windows.Forms.Keys keys;
 		switch (key)
 		{
-		case "Enter": code = System.Windows.Forms.Keys.Return; ch = '\r'; break;
-		case "Escape": code = System.Windows.Forms.Keys.Escape; break;
-		case "Backspace": code = System.Windows.Forms.Keys.Back; break;
-		case "Tab": code = System.Windows.Forms.Keys.Tab; break;
-		case "Delete": code = System.Windows.Forms.Keys.Delete; break;
-		case "Insert": code = System.Windows.Forms.Keys.Insert; break;
-		case "Home": code = System.Windows.Forms.Keys.Home; break;
-		case "End": code = System.Windows.Forms.Keys.End; break;
-		case "PageUp": code = System.Windows.Forms.Keys.Prior; break;
-		case "PageDown": code = System.Windows.Forms.Keys.Next; break;
-		case "ArrowLeft": code = System.Windows.Forms.Keys.Left; break;
-		case "ArrowUp": code = System.Windows.Forms.Keys.Up; break;
-		case "ArrowRight": code = System.Windows.Forms.Keys.Right; break;
-		case "ArrowDown": code = System.Windows.Forms.Keys.Down; break;
-		case " ": code = System.Windows.Forms.Keys.Space; ch = ' '; break;
-		case "CapsLock": code = System.Windows.Forms.Keys.Capital; break;
-		case "Shift": code = System.Windows.Forms.Keys.ShiftKey; break;
-		case "Control": code = System.Windows.Forms.Keys.ControlKey; break;
-		case "Alt": code = System.Windows.Forms.Keys.Menu; break;
-		case "Meta": code = System.Windows.Forms.Keys.LWin; break;
+		case "Enter":
+			keys = System.Windows.Forms.Keys.Return;
+			item = '\r';
+			break;
+		case "Escape":
+			keys = System.Windows.Forms.Keys.Escape;
+			break;
+		case "Backspace":
+			keys = System.Windows.Forms.Keys.Back;
+			break;
+		case "Tab":
+			keys = System.Windows.Forms.Keys.Tab;
+			break;
+		case "Delete":
+			keys = System.Windows.Forms.Keys.Delete;
+			break;
+		case "Insert":
+			keys = System.Windows.Forms.Keys.Insert;
+			break;
+		case "Home":
+			keys = System.Windows.Forms.Keys.Home;
+			break;
+		case "End":
+			keys = System.Windows.Forms.Keys.End;
+			break;
+		case "PageUp":
+			keys = System.Windows.Forms.Keys.Prior;
+			break;
+		case "PageDown":
+			keys = System.Windows.Forms.Keys.Next;
+			break;
+		case "ArrowLeft":
+			keys = System.Windows.Forms.Keys.Left;
+			break;
+		case "ArrowUp":
+			keys = System.Windows.Forms.Keys.Up;
+			break;
+		case "ArrowRight":
+			keys = System.Windows.Forms.Keys.Right;
+			break;
+		case "ArrowDown":
+			keys = System.Windows.Forms.Keys.Down;
+			break;
+		case " ":
+			keys = System.Windows.Forms.Keys.Space;
+			item = ' ';
+			break;
+		case "CapsLock":
+			keys = System.Windows.Forms.Keys.Capital;
+			break;
+		case "Shift":
+			keys = System.Windows.Forms.Keys.ShiftKey;
+			break;
+		case "Control":
+			keys = System.Windows.Forms.Keys.ControlKey;
+			break;
+		case "Alt":
+			keys = System.Windows.Forms.Keys.Menu;
+			break;
+		case "Meta":
+			keys = System.Windows.Forms.Keys.LWin;
+			break;
 		default:
-			if (key.Length > 1 && key[0] == 'F' && int.TryParse(key.AsSpan(1), out int fn) && fn >= 1 && fn <= 24)
+		{
+			if (key.Length > 1 && key[0] == 'F' && int.TryParse(key.AsSpan(1), out var result) && result >= 1 && result <= 24)
 			{
-				code = System.Windows.Forms.Keys.F1 + (fn - 1);
+				keys = (System.Windows.Forms.Keys)(112 + (result - 1));
 			}
 			else if (key.Length == 1)
 			{
-				ch = key[0];
-				code = (System.Windows.Forms.Keys)char.ToUpperInvariant(key[0]);
+				item = key[0];
+				keys = (System.Windows.Forms.Keys)char.ToUpperInvariant(key[0]);
 			}
 			else
 			{
-				code = System.Windows.Forms.Keys.None;
+				keys = System.Windows.Forms.Keys.None;
 			}
 			break;
 		}
-		System.Windows.Forms.Keys data = code;
+		}
+		System.Windows.Forms.Keys keys2 = keys;
 		if (shift)
 		{
-			data |= System.Windows.Forms.Keys.Shift;
+			keys2 |= System.Windows.Forms.Keys.Shift;
 		}
 		if (ctrl)
 		{
-			data |= System.Windows.Forms.Keys.Control;
+			keys2 |= System.Windows.Forms.Keys.Control;
 		}
 		if (alt)
 		{
-			data |= System.Windows.Forms.Keys.Alt;
+			keys2 |= System.Windows.Forms.Keys.Alt;
 		}
-		if ((ctrl || alt) && ch.HasValue)
+		if ((ctrl | alt) && item.HasValue)
 		{
-			// Desktop parity: Ctrl/Alt+key never yields a text char. A
-			// Ctrl+letter KeyPress carries its control code (ignored by edit
-			// controls); anything else produces no KeyPress at all. Without
-			// this the host appended a literal 'a' for Ctrl+A.
-			if (ctrl && char.IsLetter(ch.Value))
-				ch = (char)(char.ToUpperInvariant(ch.Value) - 'A' + 1);
-			else
-				ch = null;
+			item = ((!ctrl || !char.IsLetter(item.Value)) ? ((char?)null) : new char?((char)(char.ToUpperInvariant(item.Value) - 65 + 1)));
 		}
-		return (data, ch);
+		return (KeyData: keys2, KeyChar: item);
 	}
+
 	private static string DescribeKids(System.Windows.Forms.Control.ControlCollection controls, int depth)
 	{
-		System.Text.StringBuilder sb = new System.Text.StringBuilder();
-		foreach (System.Windows.Forms.Control k in controls)
+		StringBuilder stringBuilder = new StringBuilder();
+		foreach (System.Windows.Forms.Control control in controls)
 		{
-			if (sb.Length > 0)
-				sb.Append(";");
-			sb.Append(k.GetType().Name + " v=" + k.Visible + " e=" + k.Enabled + " b=" + k.Left + "," + k.Top + "," + k.Width + "x" + k.Height);
-			if (depth < 2 && k.Controls.Count > 0)
-				sb.Append("[" + DescribeKids(k.Controls, depth + 1) + "]");
+			if (stringBuilder.Length > 0)
+			{
+				stringBuilder.Append(";");
+			}
+			stringBuilder.Append(control.GetType().Name + " v=" + control.Visible + " e=" + control.Enabled + " b=" + control.Left + "," + control.Top + "," + control.Width + "x" + control.Height);
+			if (depth < 2 && control.Controls.Count > 0)
+			{
+				stringBuilder.Append("[" + DescribeKids(control.Controls, depth + 1) + "]");
+			}
 		}
-		return sb.ToString();
+		return stringBuilder.ToString();
 	}
 
 	private System.Windows.Forms.Control? HitTestDeep(System.Windows.Forms.Control.ControlCollection controls, int parentAbsX, int parentAbsY, int x, int y)
@@ -5633,7 +7728,7 @@ public sealed class WinFormsAppHost : IDisposable
 		for (int num = controls.Count - 1; num >= 0; num--)
 		{
 			System.Windows.Forms.Control control = controls[num];
-			if (control.Visible && control.Width > 0 && control.Height > 0 && !(control.GetType().Name == "CaptionControl"))
+			if (control.Visible && control.Enabled && control.Width > 0 && control.Height > 0 && !(control.GetType().Name == "CaptionControl"))
 			{
 				int num2 = parentAbsX + control.Left;
 				int num3 = parentAbsY + control.Top;
@@ -5770,7 +7865,6 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 		if (text.Contains("help"))
 		{
-			// Original glyph unrecoverable (mojibake, see GlyphLiteralTests): "?" renders everywhere.
 			return "?";
 		}
 		return "\u25aa";
@@ -5784,149 +7878,409 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 		string value = (font.Bold ? "bold " : "");
 		string value2 = (font.Italic ? "italic " : "");
-		int value3 = Math.Max(9, (int)Math.Round(font.SizeInPoints * 96.0 / 72.0));
+		int value3 = Math.Max(9, (int)Math.Round((double)font.SizeInPoints * 96.0 / 72.0));
 		return $"{value2}{value}{value3}px '{font.FontFamily.Name}', sans-serif";
 	}
 
-	// Region repaint: the drain gave a sub-rect for a control whose
-	// retained surface matches the current size. The clipped OnPaint
-	// runs over the retained pixels (every primitive clips except
-	// Clear, which the PaintVersion stamp catches), the rect uploads
-	// as a patch, and the layer re-blits. PaintEventArgs carries the
-	// dirty rect as ClipRectangle, as desktop does. Any precondition
-	// miss (whole-control mark, no retained surface, resized, a Clear
-	// during paint, a near-full rect) returns false and the caller
-	// runs the full path.
-
 	private static bool TryPaintRegion(ICanvas canvas, System.Windows.Forms.Control c, int absX, int absY, int w, int h, bool clearFlag)
 	{
-		if (!FrameDirtyRect(c, out System.Drawing.Rectangle? dirty) || dirty is null)
+		if (!FrameDirtyRect(c, out var rc) || !rc.HasValue)
+		{
 			return false;
-		string id = LayerIdFor(c);
-		Bitmap? retained;
+		}
+		string text = LayerIdFor(c);
+		Bitmap value;
 		lock (s_retainedPaint)
 		{
-			s_retainedPaint.TryGetValue(id, out retained);
+			s_retainedPaint.TryGetValue(text, out value);
 		}
-		if (retained is null || retained.Width != w || retained.Height != h)
+		if (value == null || value.Width != w || value.Height != h)
 		{
 			return false;
 		}
-		System.Drawing.Rectangle rc = System.Drawing.Rectangle.Intersect(dirty.Value, new System.Drawing.Rectangle(0, 0, w, h));
-		if (rc.Width <= 0 || rc.Height <= 0)
-			return BlitKnownLayer(canvas, id, absX, absY, w, h);
-		if (TryShiftRetained(canvas, c, retained, absX, absY, w, h, dirty.Value, clearFlag))
+		Rectangle rectangle = Rectangle.Intersect(rc.Value, new Rectangle(0, 0, w, h));
+		if (rectangle.Width <= 0 || rectangle.Height <= 0)
+		{
+			return BlitKnownLayer(canvas, text, absX, absY, w, h);
+		}
+		if (TryShiftRetained(canvas, c, value, absX, absY, w, h, rc.Value, clearFlag))
+		{
 			return true;
-		if ((long)rc.Width * rc.Height * 10 >= (long)w * h * 9)
+		}
+		// A region/full repaint below supersedes any shift the narrow math
+		// rejected (or that strip painting invalidated): the retained
+		// surface no longer matches the noted displacement, so drop the
+		// shift instead of applying it to fresh pixels later. No-op when
+		// no shift is pending. A pure re-blit above leaves it pending.
+		WasmRepaintGate.TakeScrollShift(c, out _, out _);
+		if ((long)rectangle.Width * (long)rectangle.Height * 10 >= (long)w * (long)h * 9)
 		{
 			return false;
 		}
 		if (!(canvas is ICanvasRenderer { SupportsBitmapLayers: not false }))
 		{
-			// Plain canvas: the clipped raster still saves the OnPaint,
-			// then the full surface uploads (no retained layer to patch).
-			if (!PaintRegionPixels(c, retained, rc, clearFlag))
+			if (!PaintRegionPixels(c, value, rectangle, clearFlag))
+			{
 				return false;
-			byte[]? full = ExtractBitmapRgba(retained);
-			if (full is null)
+			}
+			byte[] array = ExtractBitmapRgba(value);
+			if (array == null)
+			{
 				return false;
-			canvas.DrawImage(full, w, h, absX, absY, w, h);
-		if (System.Windows.Forms.WasmFrameCounters.PerfEnabled)
-			System.Windows.Forms.WasmFrameCounters.CountRasterFull((long)w * h);
+			}
+			canvas.DrawImage(array, w, h, absX, absY, w, h);
+			if (WasmFrameCounters.PerfEnabled)
+			{
+				WasmFrameCounters.CountRasterFull((long)w * (long)h);
+			}
 			return true;
 		}
-		bool tmpOk = PaintRegionPixels(c, retained, rc, clearFlag);
-		if (!tmpOk)
+		if (!PaintRegionPixels(c, value, rectangle, clearFlag))
 		{
 			return false;
 		}
-		// No identical-bytes skip: a pre-paint snapshot costs a full rect
-		// swizzle on every frame, while identical region repaints are small
-		// (hover backstops) and cheap to upload. Full paints keep hash-skip.
-		byte[] after = retained.ToRgbaBytes(rc);
-		if (System.Windows.Forms.WasmFrameCounters.PerfEnabled && after != null)
-			System.Windows.Forms.WasmFrameCounters.AddBytesExtracted(after.Length);
-		RecordBitmapPatch(canvas, id, after, rc, absX, absY, w, h);
-		if (System.Windows.Forms.WasmFrameCounters.PerfEnabled)
-			System.Windows.Forms.WasmFrameCounters.CountRasterRegion((long)rc.Width * rc.Height);
+		byte[] array2 = value.ToRgbaBytes(rectangle);
+		if (WasmFrameCounters.PerfEnabled && array2 != null)
+		{
+			WasmFrameCounters.AddBytesExtracted(array2.Length);
+		}
+		RecordBitmapPatch(canvas, text, array2, rectangle, absX, absY, w, h);
+		if (WasmFrameCounters.PerfEnabled)
+		{
+			WasmFrameCounters.CountRasterRegion((long)rectangle.Width * (long)rectangle.Height);
+		}
 		return true;
 	}
 
-	// Scroll reuse: when the drain consumed a same-frame scroll shift for
-	// a control whose retained surface matches the current size, the
-	// retained pixels move in place (ShiftPixels memmove) and only the
-	// union of the prior dirty rect, its shifted position, and the fresh
-	// exposed strip repaints. Edit rects are ambiguous-frame (pre- or
-	// post-scroll coordinates), so all three repaint: a superset repaint
-	// is always exact. Whole-control marks, missing or mismatched records,
-	// zero/oversize/diagonal/multi shifts, and empty or near-full unions
-	// return false and the caller runs the full path. The full-surface
-	// re-Def keeps the retained object (keepRetained): disposing here
-	// would strand the reference the paint just used.
-	private static bool TryShiftRetained(ICanvas canvas, System.Windows.Forms.Control c, Bitmap retained, int absX, int absY, int w, int h, System.Drawing.Rectangle dirty, bool clearFlag)
+	private static bool TryShiftRetained(ICanvas canvas, System.Windows.Forms.Control c, Bitmap retained, int absX, int absY, int w, int h, Rectangle dirty, bool clearFlag)
 	{
-		if (!System.Windows.Forms.WasmRepaintGate.TakeScrollShift(c, out int dx, out int dy))
-			return false;
-		System.Drawing.Rectangle? narrow = ComputeScrollNarrow(w, h, dx, dy, dirty);
-		if (narrow is null)
-			return false;
-		System.Drawing.Rectangle rc = narrow.Value;
-		retained.ShiftPixels(dx, dy);
-		if (!PaintRegionPixels(c, retained, rc, clearFlag))
-			return false;
-		byte[]? full = ExtractBitmapRgba(retained);
-		if (full is null)
-			return false;
-		RecordBitmap(c, canvas, full, w, h, absX, absY, w, h, keepRetained: true);
-		if (System.Windows.Forms.WasmFrameCounters.PerfEnabled)
+		if (!WasmRepaintGate.TakeScrollShift(c, out var dx, out var dy))
 		{
-			System.Windows.Forms.WasmFrameCounters.CountRasterRegion((long)rc.Width * rc.Height);
-			System.Windows.Forms.WasmFrameCounters.AddBytesExtracted(full.Length);
-			System.Windows.Forms.WasmFrameCounters.CountScrollShift();
+			return false;
+		}
+		if (WasmFrameCounters.PerfEnabled)
+			Console.WriteLine($"[Host] ShiftTake control='{c.GetType().FullName}' dx={dx} dy={dy} dirty={dirty} wh={w}x{h}");
+		Rectangle[]? narrow = ComputeScrollNarrow(w, h, dx, dy, dirty);
+		if (narrow is null || narrow.Length == 0)
+		{
+			if (WasmFrameCounters.PerfEnabled)
+				Console.WriteLine($"[Host] ShiftNarrowNull control='{c.GetType().FullName}'");
+			return false;
+		}
+		retained.ShiftPixels(dx, dy);
+		foreach (Rectangle value in narrow)
+		{
+			if (!PaintRegionPixels(c, retained, value, clearFlag))
+			{
+				return false;
+			}
+		}
+		if (!ScrollShiftUploadDisabled &&
+			canvas is ICanvasRenderer { SupportsBitmapLayers: not false } renderer)
+		{
+			// Strip-only upload: the browser shifts its retained layer
+			// first (ShiftBitmap travels out-of-band ahead of the patch),
+			// then splices just the repainted pieces. The full-bitmap hash
+			// is stale after a shift, so drop it: the next full paint
+			// re-registers with Def instead of risking a hash-suppressed
+			// blit of shifted content.
+			string id = LayerIdFor(c);
+			byte[][] strips = new byte[narrow.Length][];
+			for (int i = 0; i < narrow.Length; i++)
+				strips[i] = retained.ToRgbaBytes(narrow[i]);
+			renderer.ShiftBitmap(id, dx, dy);
+			for (int i = 0; i < narrow.Length; i++)
+			{
+				Rectangle value = narrow[i];
+				byte[] strip = strips[i];
+				RecordBitmapPatch(canvas, id, strip, value, absX, absY, w, h);
+				if (WasmFrameCounters.PerfEnabled)
+				{
+					WasmFrameCounters.CountRasterRegion((long)value.Width * (long)value.Height);
+					WasmFrameCounters.AddBytesExtracted(strip.Length);
+				}
+			}
+			lock (s_layerHash)
+			{
+				s_layerHash.Remove(id);
+			}
+			// Shift-epoch tag (WF-P-066): hash the carried surface so a later
+			// whole-control repaint with stable scroll generation can prove
+			// pixel identity and skip its upload. Only watched controls carry
+			// a generation seq; anything else keeps today's behavior.
+			try
+			{
+				if (s_rteScrollWatch.TryGetGenerationSeq(c, out long gen))
+				{
+					byte[] full = retained.ToRgbaBytes();
+					if (WasmFrameCounters.PerfEnabled)
+					{
+						WasmFrameCounters.AddBytesHashed(full.Length);
+					}
+					s_shiftEpochTags.Remove(c);
+					var epochSlotForTake = new ShiftEpochSlot
+					{
+						Tag = new ShiftEpochTag(dx, dy, HashBytes(full), gen),
+					};
+					if (WasmFrameCounters.PerfEnabled)
+					{
+						epochSlotForTake.DiagSurface = full;
+					}
+					s_shiftEpochTags.Add(c, epochSlotForTake);
+					if (WasmFrameCounters.PerfEnabled)
+					{
+						Console.WriteLine("[EpochGate] TAG frame=" + WasmFrameCounters.FrameSeq + " ctrl=" + c.GetType().Name + " dx=" + dx + " dy=" + dy + " gen=" + gen + " hash=" + HashBytes(full).ToString("X16"));
+					}
+				}
+				else
+				{
+					s_shiftEpochTags.Remove(c);
+					if (WasmFrameCounters.PerfEnabled)
+					{
+						Console.WriteLine("[EpochGate] UNTAG frame=" + WasmFrameCounters.FrameSeq + " ctrl=" + c.GetType().Name + " reason=nogenseq");
+					}
+				}
+			}
+			catch
+			{
+			}
+			if (WasmFrameCounters.PerfEnabled)
+			{
+				WasmFrameCounters.CountScrollShift();
+			}
+			return true;
+		}
+		byte[] array = ExtractBitmapRgba(retained);
+		if (array == null)
+		{
+			return false;
+		}
+		RecordBitmap(c, canvas, array, w, h, absX, absY, w, h, keepRetained: true);
+		if (WasmFrameCounters.PerfEnabled)
+		{
+			long narrowArea = 0;
+			foreach (Rectangle piece in narrow)
+				narrowArea += (long)piece.Width * (long)piece.Height;
+			WasmFrameCounters.CountRasterRegion(narrowArea);
+			WasmFrameCounters.AddBytesExtracted(array.Length);
+			WasmFrameCounters.CountScrollShift();
 		}
 		return true;
 	}
 
-	internal static System.Drawing.Rectangle? ComputeScrollNarrow(int w, int h, int dx, int dy, System.Drawing.Rectangle dirty)
+	private static bool ScrollShiftUploadDisabled
+	{
+		get
+		{
+			// A/B + safety kill-switch (default off): with the switch set
+			// the shift path keeps strip raster but uploads full bitmaps.
+			return AppContext.TryGetSwitch("WfWasm.DisableScrollShift", out var off) && off;
+		}
+	}
+
+	// Retained-scroll repaint set (WF-P-054): the disjoint pieces that must
+	// be repainted after shifting the retained surface by (dx,dy) — the
+	// fresh exposed strip plus the prior dirty rect and its shifted position
+	// (edit rects are ambiguous-frame, pre- or post-scroll, so both repaint;
+	// a superset repaint is always exact). Pieces are viewport-clipped and
+	// merged only when the merge adds no gap fill (union area <= summed
+	// areas), so Y-disjoint dirty/strip scrolls carry as two small rects
+	// instead of bounding-boxing to the full frame. The 90% gate runs on the
+	// summed piece areas (== true union area: survivors are pairwise
+	// disjoint), never on a bounding box. Null (or empty) means fall back to
+	// the full path. Guards (zero/diagonal/oversize) are unchanged.
+	internal static Rectangle[]? ComputeScrollNarrow(int w, int h, int dx, int dy, Rectangle dirty)
 	{
 		if ((dx == 0 && dy == 0) || (dx != 0 && dy != 0))
+		{
 			return null;
+		}
 		if (Math.Abs(dx) >= w || Math.Abs(dy) >= h)
+		{
 			return null;
-		// Fresh exposed strip, post-scroll frame coordinates.
-		System.Drawing.Rectangle strip = dx > 0
-			? new System.Drawing.Rectangle(0, 0, dx, h)
-			: dx < 0
-				? new System.Drawing.Rectangle(w + dx, 0, -dx, h)
-				: dy > 0
-					? new System.Drawing.Rectangle(0, 0, w, dy)
-					: new System.Drawing.Rectangle(0, h + dy, w, -dy);
-		System.Drawing.Rectangle moved = dirty;
-		moved.Offset(dx, dy);
-		System.Drawing.Rectangle union = System.Drawing.Rectangle.Union(System.Drawing.Rectangle.Union(dirty, moved), strip);
-		union.Intersect(new System.Drawing.Rectangle(0, 0, w, h));
-		if (union.Width <= 0 || union.Height <= 0)
+		}
+		Rectangle b;
+		if (dx > 0)
+		{
+			b = new Rectangle(0, 0, dx, h);
+		}
+		else if (dx < 0)
+		{
+			b = new Rectangle(w + dx, 0, -dx, h);
+		}
+		else
+		{
+			b = ((dy > 0) ? new Rectangle(0, 0, w, dy) : new Rectangle(0, h + dy, w, -dy));
+		}
+		Rectangle viewport = new Rectangle(0, 0, w, h);
+		List<Rectangle> pieces = new List<Rectangle>(3) { b };
+		Rectangle clipped = Rectangle.Intersect(dirty, viewport);
+		if (clipped.Width > 0 && clipped.Height > 0)
+			pieces.Add(clipped);
+		Rectangle shifted = dirty;
+		shifted.Offset(dx, dy);
+		shifted.Intersect(viewport);
+		if (shifted.Width > 0 && shifted.Height > 0)
+			pieces.Add(shifted);
+		// Merge fixpoint: only pairs whose bounding union adds no fill.
+		// Overlap -> union area < sum; edge-adjacent -> equal; anything
+		// with a gap (or a mere corner touch) stays separate.
+		bool merged;
+		do
+		{
+			merged = false;
+			for (int i = 0; i < pieces.Count && !merged; i++)
+			{
+				for (int j = i + 1; j < pieces.Count && !merged; j++)
+				{
+					Rectangle u = Rectangle.Union(pieces[i], pieces[j]);
+					long ua = (long)u.Width * (long)u.Height;
+					long sa = (long)pieces[i].Width * (long)pieces[i].Height
+						+ (long)pieces[j].Width * (long)pieces[j].Height;
+					if (ua <= sa)
+					{
+						pieces[i] = u;
+						pieces.RemoveAt(j);
+						merged = true;
+					}
+				}
+			}
+		} while (merged);
+		long area = 0;
+		foreach (Rectangle piece in pieces)
+			area += (long)piece.Width * (long)piece.Height;
+		if (pieces.Count == 0 || area * 10 >= (long)w * (long)h * 9)
+		{
 			return null;
-		// Near-full unions save nothing over the full path.
-		if ((long)union.Width * union.Height * 10 >= (long)w * h * 9)
-			return null;
-		return union;
+		}
+		return pieces.ToArray();
 	}
 
-	private static bool PaintRegionPixels(System.Windows.Forms.Control c, Bitmap retained, System.Drawing.Rectangle rc, bool clearFlag)
+	// Post-shift verify epoch (WF-P-066): when TryShiftRetained carries for a
+	// control, the shifted+strip-painted surface is hashed into a tag. At a
+	// later whole-control repaint with stable scroll generation, the fresh
+	// full raster is hashed and compared: equal pixels mean the served layer
+	// (shifted + patched on the browser) already shows them, so the upload is
+	// skipped and the layer hash restored. Any pixel difference uploads as
+	// today, so a wrong skip is impossible by construction.
+	internal readonly record struct ShiftEpochTag(int Dx, int Dy, ulong ShiftHash, long WatchGeneration);
+
+	// Drain facts for the verify decision. LayoutMarksOnly/NoInputMarks are
+	// supplied conservatively by the pump (per-mark provenance does not exist
+	// at the gate without per-mark stack walks, rejected on per-frame cost +
+	// boundary grounds): non-layout or input-silent pixel changes either
+	// advance the watcher generation (voids) or change pixels (the hash gate
+	// voids), so correctness never depends on these flags — they bound how
+	// often a wasted hash is paid, and pin the contract for future provenance.
+	internal readonly record struct PostShiftDrainFacts(
+		bool DirtyIsWhole, bool LayoutMarksOnly, bool GenerationStable, bool NoInputMarks);
+
+	internal static bool ShouldAttemptPostShiftVerify(ShiftEpochTag? tag, PostShiftDrainFacts facts) =>
+		tag.HasValue && facts.DirtyIsWhole && facts.LayoutMarksOnly
+		&& facts.GenerationStable && facts.NoInputMarks;
+
+	internal static bool ShouldSuppressUpload(ulong tagHash, ulong rasterHash) =>
+		tagHash == rasterHash;
+
+	private sealed class ShiftEpochSlot
 	{
-		if (s_onPaintMethod is null || s_onPaintBackgroundMethod is null)
-			return false;
+		public ShiftEpochTag Tag;
+		public byte[]? DiagSurface;
+	}
+
+	private static readonly ConditionalWeakTable<System.Windows.Forms.Control, ShiftEpochSlot> s_shiftEpochTags = new();
+
+	// One-shot take for the verify site: a tag fires at most once, on the
+	// first whole-control full repaint after the carry. Later repaints find
+	// no tag and run today's path.
+	private static bool TryTakePostShiftTag(System.Windows.Forms.Control c, out ShiftEpochTag tag, out byte[]? diagSurface)
+	{
+		tag = default;
+		diagSurface = null;
 		try
 		{
-			int stamp = retained.ClearVersion;
+			if (!s_shiftEpochTags.TryGetValue(c, out ShiftEpochSlot? slot) || slot is null)
+				return false;
+			s_shiftEpochTags.Remove(c);
+			tag = slot.Tag;
+			diagSurface = slot.DiagSurface;
+			slot.DiagSurface = null;
+			return true;
+		}
+		catch
+		{
+			tag = default;
+			diagSurface = null;
+			return false;
+		}
+	}
+
+	// WF-P-FIX (2b): follow-up skip for the re-render branch. When a carried
+	// shift's tag is still present and the drain facts match the verify gate
+	// inputs, the full repaint is redundant: the retained shifted surface is
+	// re-blitted and the layer hash restored with no repaint and no upload.
+	// Disabled via AppContext switch "WfWasm.DisablePostShiftSkip". The
+	// paint-then-compare path below stays as the safety net (switch set, or
+	// paints that reach it without a tag).
+	private static bool TrySkipPostShiftRepaint(ICanvas canvas, System.Windows.Forms.Control c, int absX, int absY, int w, int h)
+	{
+		try
+		{
+			if (AppContext.TryGetSwitch("WfWasm.DisablePostShiftSkip", out bool skipDisabled) && skipDisabled)
+				return false;
+			if (!s_shiftEpochTags.TryGetValue(c, out ShiftEpochSlot? slot) || slot is null)
+				return false;
+			ShiftEpochTag epochTag = slot.Tag;
+			bool wholePost = !FrameDirtyRect(c, out var wrcPost) || !wrcPost.HasValue;
+			bool stablePost = s_rteScrollWatch.TryGetGenerationSeq(c, out long genPost)
+				&& genPost == epochTag.WatchGeneration;
+			var postFacts = new PostShiftDrainFacts(
+				wholePost, !s_frameGlobal, stablePost, NoInputMarks: true);
+			if (!ShouldAttemptPostShiftVerify(epochTag, postFacts))
+				return false;
+			if (canvas is not ICanvasRenderer { SupportsBitmapLayers: not false } postLayers)
+				return false;
+			string postId = LayerIdFor(c);
+			s_shiftEpochTags.Remove(c);
+			lock (s_liveLayers)
+			{
+				s_liveLayers.Add(postId);
+			}
+			lock (s_layerHash)
+			{
+				s_layerHash[postId] = epochTag.ShiftHash;
+				s_layerSize[postId] = (w, h);
+				if (WasmFrameCounters.PerfEnabled)
+				{
+					WasmFrameCounters.CountLayerHashHit(true);
+				}
+			}
+			postLayers.BlitBitmap(postId, absX, absY, w, h);
+			if (WasmFrameCounters.PerfEnabled)
+			{
+				Console.WriteLine("[EpochGate] SKIP frame=" + WasmFrameCounters.FrameSeq + " ctrl=" + c.GetType().Name + " tagGen=" + epochTag.WatchGeneration);
+			}
+			return true;
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
+	private static bool PaintRegionPixels(System.Windows.Forms.Control c, Bitmap retained, Rectangle rc, bool clearFlag)
+	{
+		if ((object)s_onPaintMethod == null || (object)s_onPaintBackgroundMethod == null)
+		{
+			return false;
+		}
+		try
+		{
+			int clearVersion = retained.ClearVersion;
 			using (Graphics graphics = Graphics.FromImage(retained))
 			{
 				if (clearFlag)
 				{
-					// Clear-equivalent restricted to the rect: the flag dance
-					// replaced BackColor with an opaque color, so a solid fill
-					// writes identical bytes to Clear on the rect.
 					using SolidBrush brush = new SolidBrush(c.BackColor);
 					graphics.FillRectangle(brush, rc);
 				}
@@ -5936,10 +8290,7 @@ public sealed class WinFormsAppHost : IDisposable
 				s_onPaintBackgroundMethod.Invoke(c, new object[1] { e });
 				s_onPaintMethod.Invoke(c, new object[1] { e });
 			}
-			// Clear ignores the clip (desktop parity): a Clear during the
-			// paint may have touched pixels outside the rect, so fall back
-			// to a full upload rather than splice a stale surround.
-			return retained.ClearVersion == stamp;
+			return retained.ClearVersion == clearVersion;
 		}
 		catch
 		{
@@ -5949,257 +8300,338 @@ public sealed class WinFormsAppHost : IDisposable
 
 	private static bool BlitKnownLayer(ICanvas canvas, string id, int absX, int absY, int w, int h)
 	{
-		if (!(canvas is ICanvasRenderer { SupportsBitmapLayers: not false } rr))
+		if (!(canvas is ICanvasRenderer { SupportsBitmapLayers: not false } canvasRenderer))
+		{
 			return false;
+		}
 		lock (s_liveLayers)
 		{
 			s_liveLayers.Add(id);
 		}
-		rr.BlitBitmap(id, absX, absY, w, h);
+		canvasRenderer.BlitBitmap(id, absX, absY, w, h);
 		return true;
 	}
 
-	private static void RecordBitmapPatch(ICanvas canvas, string id, byte[] rgba, System.Drawing.Rectangle rc, int absX, int absY, int w, int h)
+	private static void RecordBitmapPatch(ICanvas canvas, string id, byte[] rgba, Rectangle rc, int absX, int absY, int w, int h)
 	{
-		var rr = (ICanvasRenderer)canvas;
+		ICanvasRenderer canvasRenderer = (ICanvasRenderer)canvas;
 		lock (s_liveLayers)
 		{
 			s_liveLayers.Add(id);
 		}
-		// The full-content hash stays stale by design: the next full
-		// raster re-hashes and re-Defs (a mismatch only costs one
-		// upload, it can never serve stale pixels).
 		lock (s_layerHash)
 		{
 			s_layerSize[id] = (w, h);
 		}
-		rr.PatchBitmap(id, rc.X, rc.Y, rc.Width, rc.Height, rgba);
-		rr.BlitBitmap(id, absX, absY, w, h);
+		canvasRenderer.PatchBitmap(id, rc.X, rc.Y, rc.Width, rc.Height, rgba);
+		canvasRenderer.BlitBitmap(id, absX, absY, w, h);
 	}
 
 	private static void StoreRetainedPaint(object layerKey, Bitmap bitmap)
 	{
-		string id = LayerIdFor(layerKey);
-		Bitmap? old;
+		string key = LayerIdFor(layerKey);
+		Bitmap value;
 		lock (s_retainedPaint)
 		{
-			s_retainedPaint.TryGetValue(id, out old);
-			s_retainedPaint[id] = (Bitmap)bitmap.Clone();
-			if (System.Windows.Forms.WasmFrameCounters.PerfEnabled)
-				System.Windows.Forms.WasmFrameCounters.AddBytesCloned((long)bitmap.Width * bitmap.Height * 4);
+			s_retainedPaint.TryGetValue(key, out value);
+			s_retainedPaint[key] = (Bitmap)bitmap.Clone();
+			if (WasmFrameCounters.PerfEnabled)
+			{
+				WasmFrameCounters.AddBytesCloned((long)bitmap.Width * (long)bitmap.Height * 4);
+			}
 		}
-		old?.Dispose();
+		value?.Dispose();
 	}
 
-	// Paint-completion observer (tile-text diagnosis): subscribes the
-	// ElementPainted event (fired at the end of RadElement.Paint) on
-	// tile-subtree elements once groups arrive, then reports per-type
-	// fire counts on subsequent panorama paints. Tells exactly which
-	// levels the walk reaches. Bounded (500 subscriptions/session).
-	private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> s_paintFire = new();
-	private static int s_paintSubs;
 	private static void OnTilePainted(object? sender, System.Windows.Forms.PaintEventArgs e)
 	{
-		// Key per paint site: type + clip rect + text prefix. The clip comes
-		// from the fired args (per-element clip), telling whether the walk
-		// narrows the clip before reaching tile text.
 		try
 		{
-			string clip = "?";
-			try { clip = e.ClipRectangle.ToString(); } catch { }
-			string tp = "?";
+			string text = "?";
 			try
 			{
-				object? t = sender?.GetType().GetProperty("Text")?.GetValue(sender);
-				string? ts = t?.ToString();
-				if (!string.IsNullOrEmpty(ts)) tp = ts.Length <= 18 ? ts : ts.Substring(0, 18);
+				text = e.ClipRectangle.ToString();
 			}
-			catch { }
-			string key = (sender?.GetType().Name ?? "?") + "|" + clip + "|" + tp;
-			// For tile parents also record the paint-time z-order yield
-			// (same iterator PaintChildren uses). A dump-time/pain-time
-			// divergence here (3 vs fewer) locates the walk skip exactly.
+			catch
+			{
+			}
+			string text2 = "?";
 			try
 			{
-				string? tn = sender?.GetType().Name;
-				if (tn == "DockLayoutPanel" || tn == "VerticalTileElement")
-					key += "|zc=" + SafeZOrderedCount(sender);
+				string text3 = (sender?.GetType().GetProperty("Text")?.GetValue(sender))?.ToString();
+				if (!string.IsNullOrEmpty(text3))
+				{
+					text2 = ((text3.Length <= 18) ? text3 : text3.Substring(0, 18));
+				}
 			}
-			catch { }
-			s_paintFire.AddOrUpdate(key, 1, (_, v) => v + 1);
+			catch
+			{
+			}
+			string text4 = (sender?.GetType().Name ?? "?") + "|" + text + "|" + text2;
+			try
+			{
+				string text5 = sender?.GetType().Name;
+				if (text5 == "DockLayoutPanel" || text5 == "VerticalTileElement")
+				{
+					text4 = text4 + "|zc=" + SafeZOrderedCount(sender);
+				}
+			}
+			catch
+			{
+			}
+			s_paintFire.AddOrUpdate(text4, 1, (string _, int v) => v + 1);
 		}
-		catch { }
+		catch
+		{
+		}
 	}
-	internal static System.Collections.Generic.Dictionary<string, int> TakePaintFire()
+
+	internal static Dictionary<string, int> TakePaintFire()
 	{
-		return new System.Collections.Generic.Dictionary<string, int>(s_paintFire);
+		return new Dictionary<string, int>(s_paintFire);
 	}
+
 	internal static int SubscribeTilePaintFire(object? root)
 	{
-		int before = s_paintSubs;
+		int num = s_paintSubs;
 		try
 		{
-			System.Reflection.EventInfo? evt = root?.GetType().GetEvent("ElementPainted");
-			if (evt is not null && s_paintSubs < 500)
+			EventInfo eventInfo = root?.GetType().GetEvent("ElementPainted");
+			if ((object)eventInfo != null && s_paintSubs < 500)
 			{
 				try
 				{
-					// Direct method-group reference (not GetMethod): the trimmer
-					// removes private methods reachable only via reflection,
-					// which silently zeroed subscriptions in WASM builds.
-					System.Windows.Forms.PaintEventHandler direct = OnTilePainted;
-					if (evt.EventHandlerType == typeof(System.Windows.Forms.PaintEventHandler))
-						evt.AddEventHandler(root, direct);
+					System.Windows.Forms.PaintEventHandler handler = OnTilePainted;
+					if (eventInfo.EventHandlerType == typeof(System.Windows.Forms.PaintEventHandler))
+					{
+						eventInfo.AddEventHandler(root, handler);
+					}
 					else
 					{
-						var m = typeof(WinFormsAppHost).GetMethod("OnTilePainted", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)!;
-						evt.AddEventHandler(root, System.Delegate.CreateDelegate(evt.EventHandlerType!, m));
+						MethodInfo method = typeof(WinFormsAppHost).GetMethod("OnTilePainted", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+						eventInfo.AddEventHandler(root, Delegate.CreateDelegate(eventInfo.EventHandlerType, method));
 					}
 					s_paintSubs++;
 				}
-				catch { }
-			}
-			if (root is System.Collections.IEnumerable en && root is not string)
-			{
-				foreach (object? child in en)
+				catch
 				{
-					if (child is null) continue;
-					if (s_paintSubs >= 500) break;
-					SubscribeTilePaintFire(child);
 				}
-				return s_paintSubs - before;
 			}
-			object?[] kids = new object?[]
+			if (root is IEnumerable enumerable && !(root is string))
+			{
+				foreach (object item in enumerable)
+				{
+					if (item != null)
+					{
+						if (s_paintSubs >= 500)
+						{
+							break;
+						}
+						SubscribeTilePaintFire(item);
+					}
+				}
+				return s_paintSubs - num;
+			}
+			object[] array = new object[4]
 			{
 				SafeGetObj(root, "Children"),
 				SafeGetObj(root, "Groups"),
 				SafeGetObj(root, "Items"),
-				SafeGetObj(root, "PanoramaElement"),
+				SafeGetObj(root, "PanoramaElement")
 			};
-			foreach (object? k in kids)
+			object[] array2 = array;
+			foreach (object obj2 in array2)
 			{
-				if (k is null) continue;
-				if (s_paintSubs >= 500) break;
-				SubscribeTilePaintFire(k);
-			}
-			if (root is System.Windows.Forms.Control c)
-				foreach (System.Windows.Forms.Control ch in c.Controls)
+				if (obj2 != null)
 				{
-					if (s_paintSubs >= 500) break;
-					SubscribeTilePaintFire(ch);
+					if (s_paintSubs >= 500)
+					{
+						break;
+					}
+					SubscribeTilePaintFire(obj2);
 				}
+			}
+			if (root is System.Windows.Forms.Control control)
+			{
+				foreach (System.Windows.Forms.Control control2 in control.Controls)
+				{
+					if (s_paintSubs >= 500)
+					{
+						break;
+					}
+					SubscribeTilePaintFire(control2);
+				}
+			}
 		}
-		catch { }
-		if (before == 0)
-			try { Console.WriteLine($"[TILE-VIS] paint-subs {s_paintSubs}"); } catch { }
-		return s_paintSubs - before;
+		catch
+		{
+		}
+		if (num == 0)
+		{
+			try
+			{
+				Console.WriteLine($"[TILE-VIS] paint-subs {s_paintSubs}");
+			}
+			catch
+			{
+			}
+		}
+		return s_paintSubs - num;
 	}
 
-	private static int s_panoPaintTrace;
-	// One-shot panorama repaint trace (tile-text diagnosis): after the
-	// late tile dump, log how the next few panorama paints are served
-	// (clean blit vs region patch vs full) and with what dirty state.
-	// Bounded (6 lines/session); GRID-PAINTED precedent for paint logs.
 	private static void TracePanoPaint(System.Windows.Forms.Control c)
 	{
 		try
 		{
-			if (!s_tileLateDumpDone || s_panoPaintTrace >= 6) return;
-			if (!(c.GetType().FullName?.Contains("Panorama", System.StringComparison.Ordinal) == true)) return;
+			if (!s_tileLateDumpDone || s_panoPaintTrace >= 6)
+			{
+				return;
+			}
+			string? fullName = c.GetType().FullName;
+			if (fullName == null || !fullName.Contains("Panorama", StringComparison.Ordinal))
+			{
+				return;
+			}
 			s_panoPaintTrace++;
-			bool fd = IsFrameDirty(c);
-			FrameDirtyRect(c, out System.Drawing.Rectangle? drc);
-			System.Text.StringBuilder fb = new();
+			bool value = IsFrameDirty(c);
+			FrameDirtyRect(c, out var rc);
+			StringBuilder stringBuilder = new StringBuilder();
 			try
 			{
-				foreach (var kv in TakePaintFire())
+				foreach (KeyValuePair<string, int> item in TakePaintFire())
 				{
-					if (fb.Length > 0) fb.Append(',');
-					fb.Append(kv.Key).Append('=').Append(kv.Value);
-					if (fb.Length > 2000) break;
+					if (stringBuilder.Length > 0)
+					{
+						stringBuilder.Append(',');
+					}
+					stringBuilder.Append(item.Key).Append('=').Append(item.Value);
+					if (stringBuilder.Length > 2000)
+					{
+						break;
+					}
 				}
 			}
-			catch { }
-			Console.WriteLine($"[TILE-VIS] pano-paint dirty={fd} rect={(drc?.ToString() ?? "whole")} fires=[{fb}]");
-			try { Console.WriteLine("[TILE-VIS] " + FormatPanoScrollState(c)); } catch { }
-			try { Console.WriteLine("[TILE-VIS] " + FormatLayoutOffset(c)); } catch { }
+			catch
+			{
+			}
+			Console.WriteLine($"[TILE-VIS] pano-paint dirty={value} rect={rc?.ToString() ?? "whole"} fires=[{stringBuilder}]");
+			try
+			{
+				Console.WriteLine("[TILE-VIS] " + FormatPanoScrollState(c));
+			}
+			catch
+			{
+			}
+			try
+			{
+				Console.WriteLine("[TILE-VIS] " + FormatLayoutOffset(c));
+			}
+			catch
+			{
+			}
 		}
-		catch { }
+		catch
+		{
+		}
 	}
 
-	// Scroll/maximize diagnosis (BookShelf tile text below the fold):
-	// one reflection-only line with the host form geometry plus the
-	// panorama scrollbar range, so a headless probe can tell "no scroll
-	// range" apart from "wheel ignored" apart from "form too small".
-	// Pure formatter (no console); the TracePanoPaint cap bounds it.
-
-	// Layout-offset probe: returns the groups-layout panel's live
-	// PositionOffset plus the panorama's zoomedIn flag, to tell a stuck
-	// scroll/animation offset apart from an arrange-placed position.
-	// Reflection-only, never throws.
 	internal static string FormatLayoutOffset(object? panoramaControl)
 	{
 		try
 		{
-			object? el = SafeGetObj(panoramaControl, "PanoramaElement");
-			if (el is null) return "layoff=n/a";
-			string zoom = "zoom=?";
+			object obj = SafeGetObj(panoramaControl, "PanoramaElement");
+			if (obj == null)
+			{
+				return "layoff=n/a";
+			}
+			string text = "zoom=?";
 			try
 			{
-				System.Reflection.FieldInfo? zf = null;
-				for (System.Type? t = el.GetType(); t is not null && zf is null; t = t.BaseType)
-					zf = t.GetField("zoomedIn", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-				if (zf is not null) zoom = "zoom=" + zf.GetValue(el);
-			}
-			catch { }
-			if (SafeGetObj(el, "Children") is System.Collections.IEnumerable kids)
-			{
-				foreach (object? k in kids)
+				FieldInfo fieldInfo = null;
+				Type type = obj.GetType();
+				while ((object)type != null && (object)fieldInfo == null)
 				{
-					if (k is null) continue;
-					string tn = k.GetType().Name;
-					if (!tn.Contains("LayoutPanel", System.StringComparison.Ordinal)
-						&& !tn.Contains("Layout", System.StringComparison.Ordinal)) continue;
-					string pos = SafeProp(k, "PositionOffset");
-					string bnd = SafeProp(k, "Bounds");
-					string align = SafeProp(el, "ScrollBarAlignment");
-					string thick = SafeProp(el, "ScrollBarThickness");
-					string pad = SafeProp(el, "Padding");
-					return $"layoff panel={tn} pos={pos} bounds={bnd} {zoom} align={align} thick={thick} pad={pad}";
+					fieldInfo = type.GetField("zoomedIn", BindingFlags.Instance | BindingFlags.NonPublic);
+					type = type.BaseType;
+				}
+				if ((object)fieldInfo != null)
+				{
+					text = "zoom=" + fieldInfo.GetValue(obj);
 				}
 			}
-			return "layoff=nopanel " + zoom;
+			catch
+			{
+			}
+			if (SafeGetObj(obj, "Children") is IEnumerable enumerable)
+			{
+				foreach (object item in enumerable)
+				{
+					if (item != null)
+					{
+						string name = item.GetType().Name;
+						if (name.Contains("LayoutPanel", StringComparison.Ordinal) || name.Contains("Layout", StringComparison.Ordinal))
+						{
+							string value = SafeProp(item, "PositionOffset");
+							string value2 = SafeProp(item, "Bounds");
+							string value3 = SafeProp(obj, "ScrollBarAlignment");
+							string value4 = SafeProp(obj, "ScrollBarThickness");
+							string value5 = SafeProp(obj, "Padding");
+							return $"layoff panel={name} pos={value} bounds={value2} {text} align={value3} thick={value4} pad={value5}";
+						}
+					}
+				}
+			}
+			return "layoff=nopanel " + text;
 		}
-		catch { return "layoff=error"; }
+		catch
+		{
+			return "layoff=error";
+		}
 	}
 
 	internal static string FormatPanoScrollState(object? panoramaControl)
 	{
 		try
 		{
-			if (panoramaControl is not System.Windows.Forms.Control c) return "pano-scroll n/a";
-			System.Windows.Forms.Form? f = c.FindForm();
-			string form = f is null ? "form=null"
-				: $"form={f.GetType().Name} bounds={f.Bounds} client={f.ClientSize} ws={f.WindowState} loc={f.Location}";
-			object? el = SafeGetObj(c, "PanoramaElement");
-			string sb = el is null ? "sb=n/a"
-				: $"sb=V{SafeSubProp(el, "ScrollBar", "Value")}/M{SafeSubProp(el, "ScrollBar", "Maximum")}/L{SafeSubProp(el, "ScrollBar", "LargeChange")}/vis{SafeSubProp(el, "ScrollBar", "Visibility")}";
-			string bars = $"auto={SafeProp(c, "AutoScroll")} vvis={SafeSubProp(c, "VerticalScroll", "Visible")} vval={SafeSubProp(c, "VerticalScroll", "Value")}/{SafeSubProp(c, "VerticalScroll", "Maximum")}";
-			System.Text.StringBuilder strips = new();
+			if (!(panoramaControl is System.Windows.Forms.Control control))
+			{
+				return "pano-scroll n/a";
+			}
+			System.Windows.Forms.Form form = control.FindForm();
+			string value = ((form == null) ? "form=null" : $"form={form.GetType().Name} bounds={form.Bounds} client={form.ClientSize} ws={form.WindowState} loc={form.Location}");
+			object obj = SafeGetObj(control, "PanoramaElement");
+			string value2 = ((obj == null) ? "sb=n/a" : $"sb=V{SafeSubProp(obj, "ScrollBar", "Value")}/M{SafeSubProp(obj, "ScrollBar", "Maximum")}/L{SafeSubProp(obj, "ScrollBar", "LargeChange")}/vis{SafeSubProp(obj, "ScrollBar", "Visibility")}");
+			string value3 = $"auto={SafeProp(control, "AutoScroll")} vvis={SafeSubProp(control, "VerticalScroll", "Visible")} vval={SafeSubProp(control, "VerticalScroll", "Value")}/{SafeSubProp(control, "VerticalScroll", "Maximum")}";
+			StringBuilder stringBuilder = new StringBuilder();
 			try
 			{
-				if (f is not null) foreach (System.Windows.Forms.Control kid in f.Controls)
+				if (form != null)
 				{
-					if (strips.Length > 0) strips.Append(' ');
-					strips.Append(kid.Name).Append('=').Append(kid.Bounds).Append(kid.Visible ? "" : "?hid");
-					if (strips.Length > 600) break;
+					foreach (System.Windows.Forms.Control control2 in form.Controls)
+					{
+						if (stringBuilder.Length > 0)
+						{
+							stringBuilder.Append(' ');
+						}
+						stringBuilder.Append(control2.Name).Append('=').Append(control2.Bounds)
+							.Append(control2.Visible ? "" : "?hid");
+						if (stringBuilder.Length > 600)
+						{
+							break;
+						}
+					}
 				}
 			}
-			catch { }
-			string lq = $"lq={System.Windows.Forms.WasmLayoutQueue.TotalPosted}/{System.Windows.Forms.WasmLayoutQueue.TotalDrained}/{System.Windows.Forms.WasmLayoutQueue.TotalFaulted}";
-			return $"pano-scroll {form} pano={c.Name} bounds={c.Bounds} {sb} {bars} strips=[{strips}] {lq}";
+			catch
+			{
+			}
+			string value4 = $"lq={WasmLayoutQueue.TotalPosted}/{WasmLayoutQueue.TotalDrained}/{WasmLayoutQueue.TotalFaulted}";
+			return $"pano-scroll {value} pano={control.Name} bounds={control.Bounds} {value2} {value3} strips=[{stringBuilder}] {value4}";
 		}
-		catch { return "pano-scroll error"; }
+		catch
+		{
+			return "pano-scroll error";
+		}
 	}
 
 	private static bool TryRenderSelfPainted(ICanvas canvas, System.Windows.Forms.Control c, int absX, int absY, int w, int h)
@@ -6214,11 +8646,19 @@ public sealed class WinFormsAppHost : IDisposable
 		{
 			return false;
 		}
+		if (s_selfPaintPoisoned.ContainsKey(type))
+		{
+			return false;
+		}
 		if ((object)s_onPaintMethod == null || (object)s_onPaintBackgroundMethod == null)
 		{
 			return false;
 		}
 		if (TryBlitCleanLayer(canvas, c, absX, absY, w, h))
+		{
+			return true;
+		}
+		if (TrySkipPostShiftRepaint(canvas, c, absX, absY, w, h))
 		{
 			return true;
 		}
@@ -6232,20 +8672,19 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 		try
 		{
-            // Perf item 4 S5 split (render side): time EnsureElementLayout
-            // + OnPaint invokes; extract/record/store is the remainder.
-            bool perfPaint = System.Windows.Forms.WasmFrameCounters.PerfEnabled;
-            long tPaint0 = perfPaint ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-            // Perf item 4: TPF layout-inside-paint split (see paintS).
-            long tLayout0 = System.Windows.Forms.WasmFrameCounters.PerfEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-            EnsureElementLayout(c);
-            if (tLayout0 != 0)
-                System.Windows.Forms.WasmFrameCounters.AddEnsureLayoutTicks(System.Diagnostics.Stopwatch.GetTimestamp() - tLayout0);
-            if (TryPaintRegion(canvas, c, absX, absY, w, h, flag))
-            {
-                return true;
-            }
-            using Bitmap bitmap = new Bitmap(w, h);
+			bool perfEnabled = WasmFrameCounters.PerfEnabled;
+			long num = (perfEnabled ? Stopwatch.GetTimestamp() : 0);
+			long num2 = (WasmFrameCounters.PerfEnabled ? Stopwatch.GetTimestamp() : 0);
+			EnsureElementLayout(c);
+			if (num2 != 0)
+			{
+				WasmFrameCounters.AddEnsureLayoutTicks(Stopwatch.GetTimestamp() - num2);
+			}
+			if (TryPaintRegion(canvas, c, absX, absY, w, h, flag))
+			{
+				return true;
+			}
+			using Bitmap bitmap = new Bitmap(w, h);
 			using (Graphics graphics = Graphics.FromImage(bitmap))
 			{
 				if (flag)
@@ -6253,56 +8692,194 @@ public sealed class WinFormsAppHost : IDisposable
 					graphics.Clear(c.BackColor);
 				}
 				using System.Windows.Forms.PaintEventArgs e = new System.Windows.Forms.PaintEventArgs(graphics, new Rectangle(0, 0, w, h));
-				// Perf item 4: invoke split (Telerik render vs alloc/Clear).
-				long tInv0 = System.Windows.Forms.WasmFrameCounters.PerfEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-				// Per-raster draw attribution: Peek diffs around the invokes
-				// (Peek never resets; Home's Take keeps frame totals).
-				global::System.Drawing.TextRasterCounters.Snapshot preDraw = default;
-				if (tInv0 != 0) preDraw = global::System.Drawing.TextRasterCounters.Peek();
+				long num3 = (WasmFrameCounters.PerfEnabled ? Stopwatch.GetTimestamp() : 0);
+				TextRasterCounters.Snapshot snapshot = default;
+				if (num3 != 0)
+				{
+					snapshot = TextRasterCounters.Peek();
+				}
 				LogFirstPaint(c);
 				s_onPaintBackgroundMethod.Invoke(c, new object[1] { e });
-				if (tInv0 != 0)
-				    System.Windows.Forms.WasmFrameCounters.AddBgInvokeTicks(System.Diagnostics.Stopwatch.GetTimestamp() - tInv0);
-				s_onPaintMethod.Invoke(c, new object[1] { e });
-				if (tInv0 != 0)
+				if (num3 != 0)
 				{
-								long dtInv = System.Diagnostics.Stopwatch.GetTimestamp() - tInv0;
-								System.Windows.Forms.WasmFrameCounters.AddPaintInvokeTicks(dtInv);
-								// Slowest-layer tracking (names the control owning the frame).
-								long prevSlow;
-								do
-								{
-												prevSlow = s_slowTicks;
-												if (dtInv <= prevSlow) break;
-								} while (System.Threading.Interlocked.CompareExchange(ref s_slowTicks, dtInv, prevSlow) != prevSlow);
-								if (dtInv > prevSlow)
-								{
-												s_slowType = c.GetType().Name;
-												var postDraw = global::System.Drawing.TextRasterCounters.Peek();
-												s_slowDraws = postDraw.DrawCalls - preDraw.DrawCalls;
-												s_slowPx = postDraw.DrawPx - preDraw.DrawPx;
-								}
+					WasmFrameCounters.AddBgInvokeTicks(Stopwatch.GetTimestamp() - num3);
+				}
+				s_onPaintMethod.Invoke(c, new object[1] { e });
+				if (num3 != 0)
+				{
+					long num4 = Stopwatch.GetTimestamp() - num3;
+					WasmFrameCounters.AddPaintInvokeTicks(num4);
+					long num5;
+					do
+					{
+						num5 = s_slowTicks;
+					}
+					while (num4 > num5 && Interlocked.CompareExchange(ref s_slowTicks, num4, num5) != num5);
+					if (num4 > num5)
+					{
+						s_slowType = c.GetType().Name;
+						TextRasterCounters.Snapshot snapshot2 = TextRasterCounters.Peek();
+						s_slowDraws = snapshot2.DrawCalls - snapshot.DrawCalls;
+						s_slowPx = snapshot2.DrawPx - snapshot.DrawPx;
+					}
 				}
 			}
-            if (perfPaint)
-                System.Windows.Forms.WasmFrameCounters.AddOnPaintTicks(System.Diagnostics.Stopwatch.GetTimestamp() - tPaint0);
-            byte[] array = ExtractBitmapRgba(bitmap);
+			if (perfEnabled)
+			{
+				WasmFrameCounters.AddOnPaintTicks(Stopwatch.GetTimestamp() - num);
+			}
+			if (perfEnabled)
+			{
+				WasmFrameCounters.CountSelfPaint();
+			}
+			byte[] array = ExtractBitmapRgba(bitmap);
 			if (array == null)
 			{
 				return false;
 			}
+			// Post-shift verify (WF-P-066): a carried shift's pixels may
+			// already be on screen (browser shifted + patched). On a
+			// whole-control repaint with stable scroll generation, compare
+			// the fresh raster against the tagged shifted-surface hash:
+			// identical => re-blit without upload (and restore the layer
+			// hash); different => upload as today. NoInputMarks is supplied
+			// conservatively true: per-mark provenance does not exist at the
+			// gate, and any input-silent pixel change fails the hash compare
+			// (uploads as today), so correctness never depends on the flag.
+			bool tookEpochTag = TryTakePostShiftTag(c, out ShiftEpochTag epochTag, out byte[]? diagSurfacePostShift);
+			if (tookEpochTag)
+			{
+				bool wholePost = !FrameDirtyRect(c, out var wrcPost) || !wrcPost.HasValue;
+				bool haveGenPost = s_rteScrollWatch.TryGetGenerationSeq(c, out long genPost);
+				bool stablePost = haveGenPost && genPost == epochTag.WatchGeneration;
+				var postFacts = new PostShiftDrainFacts(
+					wholePost, !s_frameGlobal, stablePost, NoInputMarks: true);
+				bool attemptPostShift = ShouldAttemptPostShiftVerify(epochTag, postFacts);
+				ICanvasRenderer? postLayersForVerify = canvas as ICanvasRenderer;
+				bool layersOkPostShift = postLayersForVerify is { SupportsBitmapLayers: not false };
+				ulong rasterHashPostShift = 0;
+				bool hashEqPostShift = false;
+				if (attemptPostShift)
+				{
+					if (WasmFrameCounters.PerfEnabled)
+					{
+						WasmFrameCounters.AddBytesHashed(array.Length);
+					}
+					if (layersOkPostShift)
+					{
+						rasterHashPostShift = HashBytes(array);
+						hashEqPostShift = ShouldSuppressUpload(epochTag.ShiftHash, rasterHashPostShift);
+					}
+				}
+				if (WasmFrameCounters.PerfEnabled)
+				{
+					string diagDiffPostShift = "-";
+				if (attemptPostShift && layersOkPostShift && !hashEqPostShift && diagSurfacePostShift is not null && diagSurfacePostShift.Length == array.Length)
+				{
+					long diffBytesPostShift = 0;
+					int diffBlocksPostShift = 0;
+					long firstDiffPostShift = -1;
+					long[] rowBandsPostShift = new long[10];
+					long[] colBandsPostShift = new long[8];
+					for (int slash = 0; slash < array.Length; slash += 4096)
+					{
+						int blen = Math.Min(4096, array.Length - slash);
+						bool blockDiff = false;
+						for (int bi = 0; bi < blen; bi++)
+						{
+							if (array[slash + bi] != diagSurfacePostShift[slash + bi]) { diffBytesPostShift++; blockDiff = true; if (firstDiffPostShift < 0) firstDiffPostShift = slash + bi; int px = (slash + bi) / 4; int y = px / w; int x = px % w; rowBandsPostShift[Math.Min(9, y * 10 / h)]++; colBandsPostShift[Math.Min(7, x * 8 / w)]++; }
+						}
+						if (blockDiff) diffBlocksPostShift++;
+					}
+					diagDiffPostShift = "diffBytes=" + diffBytesPostShift + "/" + array.Length + " blocks=" + diffBlocksPostShift + " first=0x" + firstDiffPostShift.ToString("X") + " rows=[" + string.Join(",", rowBandsPostShift) + "] cols=[" + string.Join(",", colBandsPostShift) + "]";
+				string diagOffsetPostShift = "off=none";
+				if (diagSurfacePostShift is not null && diagSurfacePostShift.Length == array.Length)
+				{
+					long bestOffDiff = long.MaxValue;
+					int bestOx = 0;
+					int bestOy = 0;
+					System.Text.StringBuilder offTable = new System.Text.StringBuilder();
+					for (int oy = -3; oy <= 3; oy++)
+					{
+						for (int ox = -3; ox <= 3; ox++)
+						{
+							long od = 0;
+							int y0 = oy > 0 ? oy : 0;
+							int y1 = oy > 0 ? h : h + oy;
+							int x0 = ox > 0 ? ox : 0;
+							int x1 = ox > 0 ? w : w + ox;
+							for (int yy = y0; yy < y1; yy += 2)
+							{
+								int rowF = yy * w + x0;
+								int rowT = (yy - oy) * w + (x0 - ox);
+								for (int xx = 0; xx < x1 - x0; xx += 2)
+								{
+									int pf = (rowF + xx) * 4;
+									int pt = (rowT + xx) * 4;
+									int d0 = array[pf] - diagSurfacePostShift[pt];
+									od += d0 < 0 ? -d0 : d0;
+								}
+							}
+							if (ox != -3 || oy != -3) offTable.Append(",");
+							offTable.Append(ox).Append(":").Append(oy).Append("=").Append(od);
+							if (od < bestOffDiff) { bestOffDiff = od; bestOx = ox; bestOy = oy; }
+						}
+					}
+					diagOffsetPostShift = "best=" + bestOx + "," + bestOy + " sad=" + bestOffDiff + " table=[" + offTable.ToString() + "]";
+				}
+				diagDiffPostShift += " " + diagOffsetPostShift;
+				}
+				Console.WriteLine("[EpochGate] DRAIN frame=" + WasmFrameCounters.FrameSeq + " ctrl=" + c.GetType().Name + " tag=hit tagGen=" + epochTag.WatchGeneration + " tagHash=" + epochTag.ShiftHash.ToString("X16") + " whole=" + wholePost + " rect=" + (wrcPost.HasValue ? wrcPost.Value.ToString() : "none") + " global=" + s_frameGlobal + " genPost=" + (haveGenPost ? genPost.ToString() : "nogen") + " attempt=" + attemptPostShift + " layers=" + layersOkPostShift + " hashEq=" + hashEqPostShift + " raster=" + rasterHashPostShift.ToString("X16") + " " + diagDiffPostShift);
+				}
+				if (attemptPostShift && layersOkPostShift && hashEqPostShift
+					&& postLayersForVerify is not null)
+					{
+						string postId = LayerIdFor(c);
+						lock (s_liveLayers)
+						{
+							s_liveLayers.Add(postId);
+						}
+						lock (s_layerHash)
+						{
+							s_layerHash[postId] = epochTag.ShiftHash;
+							s_layerSize[postId] = (w, h);
+							if (WasmFrameCounters.PerfEnabled)
+							{
+								WasmFrameCounters.CountLayerHashHit(true);
+							}
+						}
+						postLayersForVerify.BlitBitmap(postId, absX, absY, w, h);
+						StoreRetainedPaint(c, bitmap);
+						if (WasmFrameCounters.PerfEnabled)
+						{
+							WasmFrameCounters.CountRasterFull((long)w * (long)h);
+						}
+						return true;
+					}
+			}
+			else if (WasmFrameCounters.PerfEnabled)
+			{
+				Console.WriteLine("[EpochGate] DRAIN frame=" + WasmFrameCounters.FrameSeq + " ctrl=" + c.GetType().Name + " tag=miss global=" + s_frameGlobal);
+			}
 			RecordBitmap(c, canvas, array, w, h, absX, absY, w, h);
-		if (System.Windows.Forms.WasmFrameCounters.PerfEnabled)
-			System.Windows.Forms.WasmFrameCounters.CountRasterFull((long)w * h);
+			if (WasmFrameCounters.PerfEnabled)
+			{
+				WasmFrameCounters.CountRasterFull((long)w * (long)h);
+			}
 			StoreRetainedPaint(c, bitmap);
 			return true;
 		}
 		catch (Exception ex)
 		{
+			if (ex.InnerException is TypeLoadException || ex.InnerException is MissingMethodException || ex.InnerException is MissingMemberException)
+			{
+				s_selfPaintPoisoned.TryAdd(type, 0);
+			}
 			string text = type.FullName ?? type.Name;
 			if (s_selfPaintLogged.TryAdd(text, 1))
 			{
-				Console.WriteLine($"[WinFormsAppHost] Self-paint failed for {text}: TYPE={ex.GetType().FullName} MSG={ex.Message} site={SiteOf(ex)} INNER={ex.InnerException?.GetType().FullName}:{ex.InnerException?.Message}");
+				string value = ((ex.InnerException == null) ? "none" : (ex.InnerException.GetType().FullName + ":" + ex.InnerException.Message + ((ex.InnerException is TypeLoadException ex2 && !string.IsNullOrEmpty(ex2.TypeName)) ? (" TYPENAME=" + ex2.TypeName) : "") + StackHead(ex.InnerException, 6) + " OSTACK=" + StackHead(ex, 14).Replace(" STACK=", "")));
+				Console.WriteLine($"[WinFormsAppHost] Self-paint failed for {text}: TYPE={ex.GetType().FullName} MSG={ex.Message} site={SiteOf(ex)} INNER={value}");
 			}
 			return false;
 		}
@@ -6324,13 +8901,13 @@ public sealed class WinFormsAppHost : IDisposable
 	private static void EnsureElementLayout(System.Windows.Forms.Control c)
 	{
 		Type type = c.GetType();
-		ElementLayoutMembers orAdd = s_layoutMembers.GetOrAdd(type, delegate(Type type2)
+		ElementLayoutMembers orAdd = s_layoutMembers.GetOrAdd(type, (Type type2) =>
 		{
 			PropertyInfo tree = type2.GetProperty("ElementTree", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 			MethodInfo pump = tree?.PropertyType.GetMethod("PerformLayout", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, Type.EmptyTypes, null);
 			if ((object)tree != null && (object)pump != null)
 			{
-				return new ElementLayoutMembers((System.Windows.Forms.Control obj3) => tree.GetValue(obj3), null, delegate(object obj3)
+				return new ElementLayoutMembers((System.Windows.Forms.Control obj3) => tree.GetValue(obj3), null, (object obj3) =>
 				{
 					pump.Invoke(obj3, null);
 				});
@@ -6340,7 +8917,7 @@ public sealed class WinFormsAppHost : IDisposable
 			PropertyInfo valid = type3?.GetProperty("IsArrangeValid", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 			PropertyInfo never = type3?.GetProperty("NeverArranged", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 			MethodInfo update = type3?.GetMethod("UpdateLayout", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-			return ((object)root == null || (object)valid == null || (object)never == null || (object)update == null) ? null : new ElementLayoutMembers((System.Windows.Forms.Control obj3) => root.GetValue(obj3), (object obj3) => !(bool)(valid.GetValue(obj3) ?? ((object)true)) || (bool)(never.GetValue(obj3) ?? ((object)false)), delegate(object obj3)
+			return ((object)root == null || (object)valid == null || (object)never == null || (object)update == null) ? null : new ElementLayoutMembers((System.Windows.Forms.Control obj3) => root.GetValue(obj3), (object obj3) => !(bool)(valid.GetValue(obj3) ?? ((object)true)) || (bool)(never.GetValue(obj3) ?? ((object)false)), (object obj3) =>
 			{
 				update.Invoke(obj3, null);
 			});
@@ -6362,12 +8939,6 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 	}
 
-	// True when a transparent-BackColor control sits over pixels a flat color cannot
-	// represent (ancestor BackgroundImage or ancestor owner-paint): the isolated
-	// self-paint bitmap must stay transparent so the layer blit (drawImage,
-	// source-over) composites the real beneath-pixels. Clearing with
-	// EffectiveBackColor here paints a wrong flat rect (e.g. black Telerik
-	// labels over BookShelf wood theme).
 	internal static bool HasPaintedAncestor(System.Windows.Forms.Control c)
 	{
 		for (System.Windows.Forms.Control parent = c.Parent; parent != null; parent = parent.Parent)
@@ -6396,9 +8967,6 @@ public sealed class WinFormsAppHost : IDisposable
 		{
 			return false;
 		}
-		// Stock framework overrides (Panel, ScrollableControl, ...) repaint the flat
-		// BackColor; only foreign assemblies (Telerik, user controls) can paint
-		// something a flat Clear cannot represent.
 		return method.DeclaringType.Assembly != typeof(System.Windows.Forms.Control).Assembly;
 	}
 
@@ -6423,12 +8991,12 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 		try
 		{
-			// Single pass, no LockBits pin/roundtrip (used to be expand +
-			// memcpy + swizzle: three full-pixel passes per frame).
-			byte[] perfRgba = bmp.ToRgbaBytes();
-			if (System.Windows.Forms.WasmFrameCounters.PerfEnabled && perfRgba != null)
-				System.Windows.Forms.WasmFrameCounters.AddBytesExtracted(perfRgba.Length);
-			return perfRgba;
+			byte[] array = bmp.ToRgbaBytes();
+			if (WasmFrameCounters.PerfEnabled && array != null)
+			{
+				WasmFrameCounters.AddBytesExtracted(array.Length);
+			}
+			return array;
 		}
 		catch
 		{
@@ -6442,24 +9010,26 @@ public sealed class WinFormsAppHost : IDisposable
 		{
 			return false;
 		}
-		if (owner is not null && !IsFrameDirty(owner) && canvas is ICanvasRenderer { SupportsBitmapLayers: not false } rr)
+		if (owner != null && !IsFrameDirty(owner) && canvas is ICanvasRenderer { SupportsBitmapLayers: not false } canvasRenderer)
 		{
-			string bid = LayerIdFor(bmp);
-			bool have;
-			bool sameSize = true;
+			string text = LayerIdFor(bmp);
+			bool flag = true;
+			bool flag2;
 			lock (s_layerHash)
 			{
-				have = s_layerHash.ContainsKey(bid);
-				if (have && s_layerSize.TryGetValue(bid, out var bs))
-					sameSize = bs.w == bmp.Width && bs.h == bmp.Height;
+				flag2 = s_layerHash.ContainsKey(text);
+				if (flag2 && s_layerSize.TryGetValue(text, out (int, int) value))
+				{
+					flag = value.Item1 == bmp.Width && value.Item2 == bmp.Height;
+				}
 			}
-			if (have && sameSize)
+			if (flag2 & flag)
 			{
 				lock (s_liveLayers)
 				{
-					s_liveLayers.Add(bid);
+					s_liveLayers.Add(text);
 				}
-				rr.BlitBitmap(bid, x + (w - (float)bmp.Width) / 2f, y + (h - (float)bmp.Height) / 2f, bmp.Width, bmp.Height);
+				canvasRenderer.BlitBitmap(text, x + (w - (float)bmp.Width) / 2f, y + (h - (float)bmp.Height) / 2f, bmp.Width, bmp.Height);
 				return true;
 			}
 		}
@@ -6484,10 +9054,12 @@ public sealed class WinFormsAppHost : IDisposable
 			{
 				return null;
 			}
-			byte[] perfRgba = bmp.ToRgbaBytes();
-			if (System.Windows.Forms.WasmFrameCounters.PerfEnabled && perfRgba != null)
-				System.Windows.Forms.WasmFrameCounters.AddBytesExtracted(perfRgba.Length);
-			return perfRgba;
+			byte[] array = bmp.ToRgbaBytes();
+			if (WasmFrameCounters.PerfEnabled && array != null)
+			{
+				WasmFrameCounters.AddBytesExtracted(array.Length);
+			}
+			return array;
 		}
 		catch
 		{
@@ -6513,12 +9085,21 @@ public sealed class WinFormsAppHost : IDisposable
 				return 1.0;
 			}
 			PropertyInfo[] properties = activeDw.GetType().GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-			foreach (PropertyInfo propertyInfo in properties)
+			PropertyInfo[] array = properties;
+			foreach (PropertyInfo propertyInfo in array)
 			{
 				if (propertyInfo.Name.EndsWith("ScaleRatio", StringComparison.Ordinal))
 				{
 					object value = propertyInfo.GetValue(activeDw);
-					double value2 = ((value is double num) ? num : ((value is float num2) ? ((double)num2) : 1.0));
+					double value2;
+					if (value is double num)
+					{
+						value2 = num;
+					}
+					else
+					{
+						value2 = ((value is float num2) ? ((double)num2) : 1.0);
+					}
 					return Math.Clamp(value2, 0.05, 64.0);
 				}
 			}
@@ -6540,7 +9121,8 @@ public sealed class WinFormsAppHost : IDisposable
 				return;
 			}
 			PropertyInfo[] properties = activeDw.GetType().GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-			foreach (PropertyInfo propertyInfo in properties)
+			PropertyInfo[] array = properties;
+			foreach (PropertyInfo propertyInfo in array)
 			{
 				if (propertyInfo.Name.EndsWith("ViewportCanvasOffset", StringComparison.Ordinal))
 				{
@@ -6625,7 +9207,8 @@ public sealed class WinFormsAppHost : IDisposable
 		try
 		{
 			PropertyInfo[] properties = type.GetProperties(BindingFlags.Instance | BindingFlags.Public);
-			foreach (PropertyInfo propertyInfo in properties)
+			PropertyInfo[] array = properties;
+			foreach (PropertyInfo propertyInfo in array)
 			{
 				if (propertyInfo.GetIndexParameters().Length == 0 && !(propertyInfo.Name == "Item") && !(propertyInfo.Name == "SyncRoot") && !(propertyInfo.Name == "Count"))
 				{
@@ -6676,7 +9259,8 @@ public sealed class WinFormsAppHost : IDisposable
 				if (obj4 != null)
 				{
 					PropertyInfo[] properties = obj4.GetType().GetProperties(BindingFlags.Instance | BindingFlags.Public);
-					foreach (PropertyInfo propertyInfo in properties)
+					PropertyInfo[] array = properties;
+					foreach (PropertyInfo propertyInfo in array)
 					{
 						if (propertyInfo.GetIndexParameters().Length == 0)
 						{
@@ -6715,18 +9299,12 @@ public sealed class WinFormsAppHost : IDisposable
 		{
 			return null;
 		}
-		System.Windows.Forms.Control? appWorkspace = FindControlByTypeName(_activeForm, "AppWorkspace");
-		if (appWorkspace == null)
-		{
-			return null;
-		}
-		return appWorkspace.GetType().GetProperty("ActiveDocumentWorkspace", BindingFlags.Instance | BindingFlags.Public)?.GetValue(appWorkspace);
+		System.Windows.Forms.Control control = FindControlByTypeName(_activeForm, "AppWorkspace");
+		return control?.GetType().GetProperty("ActiveDocumentWorkspace", BindingFlags.Instance | BindingFlags.Public)?.GetValue(control);
 	}
 
 	private static System.Windows.Forms.Control? FindControlByTypeName(System.Windows.Forms.Control root, string typeName)
 	{
-		// Breadth-first: direct children first (wrapper layout), then deeper
-		// levels (real MainForm nests AppWorkspace inside dock panels).
 		Queue<System.Windows.Forms.Control> queue = new Queue<System.Windows.Forms.Control>();
 		queue.Enqueue(root);
 		while (queue.Count > 0)
@@ -6744,18 +9322,20 @@ public sealed class WinFormsAppHost : IDisposable
 		return null;
 	}
 
-	// Cheap layer census for the canvas read path: the raw surface read
-	// below only sees the active layer, so 2+ layers must take the vendor
-	// composite. Unknown shapes report 1 (raw path, status quo ante).
 	private static int GetDocumentLayerCount(object? activeDw)
 	{
 		try
 		{
-			object? doc = activeDw?.GetType().GetProperty("Document", BindingFlags.Instance | BindingFlags.Public)?.GetValue(activeDw);
-			object? layers = doc?.GetType().GetProperty("Layers", BindingFlags.Instance | BindingFlags.Public)?.GetValue(doc);
-			if (layers is IList list) return list.Count;
+			object obj = activeDw?.GetType().GetProperty("Document", BindingFlags.Instance | BindingFlags.Public)?.GetValue(activeDw);
+			object obj2 = obj?.GetType().GetProperty("Layers", BindingFlags.Instance | BindingFlags.Public)?.GetValue(obj);
+			if (obj2 is IList { Count: var count })
+			{
+				return count;
+			}
 		}
-		catch { }
+		catch
+		{
+		}
 		return 1;
 	}
 
@@ -6807,9 +9387,7 @@ public sealed class WinFormsAppHost : IDisposable
 		try
 		{
 			object activeDocumentWorkspaceFromActiveForm = GetActiveDocumentWorkspaceFromActiveForm();
-			int docW;
-			int docH;
-			object activeDocumentSurface = GetActiveDocumentSurface(activeDocumentWorkspaceFromActiveForm, out docW, out docH);
+			object activeDocumentSurface = GetActiveDocumentSurface(activeDocumentWorkspaceFromActiveForm, out var docW, out var docH);
 			if (activeDocumentSurface == null)
 			{
 				return "none";
@@ -6819,7 +9397,8 @@ public sealed class WinFormsAppHost : IDisposable
 			if (num != IntPtr.Zero && (nuint)num > (nuint)65535u)
 			{
 				int num2 = 0;
-				uint* ptr = (uint*)((IntPtr)num).ToPointer();
+				nint num3 = num;
+				uint* ptr = (uint*)((IntPtr)num3).ToPointer();
 				for (int i = 0; i < docW * docH; i++)
 				{
 					if (ptr[i] != uint.MaxValue && ptr[i] != 0)
@@ -6839,7 +9418,6 @@ public sealed class WinFormsAppHost : IDisposable
 
 	private unsafe static byte[]? ExtractSurfaceRgba(object surface, int w, int h, out int blankKind)
 	{
-		// blankKind 0 = content/error, 1 = all-white, 2 = all-transparent.
 		blankKind = 0;
 		try
 		{
@@ -6860,12 +9438,13 @@ public sealed class WinFormsAppHost : IDisposable
 			}
 			int num3 = (int)(surface.GetType().GetProperty("Stride", BindingFlags.Instance | BindingFlags.Public)?.GetValue(surface) ?? ((object)(w * 4)));
 			bool flag = false;
-			bool allWhite = true;
-			bool allZero = true;
-			byte* ptr = (byte*)((IntPtr)num).ToPointer();
-			int num4 = w * h;
+			bool flag2 = true;
+			bool flag3 = true;
+			nint num4 = num;
+			byte* ptr = (byte*)((IntPtr)num4).ToPointer();
+			int num5 = w * h;
 			uint* ptr2 = (uint*)ptr;
-			for (int i = 0; i < num4; i++)
+			for (int i = 0; i < num5; i++)
 			{
 				if (ptr2[i] != uint.MaxValue && ptr2[i] != 0)
 				{
@@ -6873,17 +9452,22 @@ public sealed class WinFormsAppHost : IDisposable
 					break;
 				}
 				if (ptr2[i] != uint.MaxValue)
-					allWhite = false;
+				{
+					flag2 = false;
+				}
 				if (ptr2[i] != 0)
-					allZero = false;
+				{
+					flag3 = false;
+				}
 			}
 			if (!flag)
 			{
-				blankKind = allWhite ? 1 : (allZero ? 2 : 0);
+				blankKind = (flag2 ? 1 : (flag3 ? 2 : 0));
 				return null;
 			}
 			byte[] array = new byte[w * h * 4];
-			byte* ptr3 = (byte*)((IntPtr)num).ToPointer();
+			num4 = num;
+			byte* ptr3 = (byte*)((IntPtr)num4).ToPointer();
 			fixed (byte* ptr4 = array)
 			{
 				for (int j = 0; j < h; j++)
@@ -6892,12 +9476,12 @@ public sealed class WinFormsAppHost : IDisposable
 					byte* ptr6 = ptr4 + j * w * 4;
 					for (int k = 0; k < w; k++)
 					{
-						int num5 = k * 4;
 						int num6 = k * 4;
-						ptr6[num6] = ptr5[num5 + 2];
-						ptr6[num6 + 1] = ptr5[num5 + 1];
-						ptr6[num6 + 2] = ptr5[num5];
-						ptr6[num6 + 3] = ptr5[num5 + 3];
+						int num7 = k * 4;
+						ptr6[num7] = ptr5[num6 + 2];
+						ptr6[num7 + 1] = ptr5[num6 + 1];
+						ptr6[num7 + 2] = ptr5[num6];
+						ptr6[num7 + 3] = ptr5[num6 + 3];
 					}
 				}
 			}
@@ -6910,67 +9494,61 @@ public sealed class WinFormsAppHost : IDisposable
 		}
 	}
 
-	// Live composited read (layers + tool overlays) for in-flight strokes.
-	// Chain (vendor, decompile-verified): workspace.DocumentCanvas .
-	// DocumentCanvasLayer . DocumentRenderer . GetSnapshotBitmap() ->
-	// IBitmapSource<ColorBgra32>.CopyPixels(pBuffer, stride, size, null).
-	// Returns null on ANY failure so the caller falls back to the raw
-	// read; the working path is never at risk.
 	private unsafe static byte[]? ExtractCompositedRgba(object workspace, int w, int h)
 	{
 		try
 		{
-			object? canvas = workspace.GetType().GetProperty("DocumentCanvas", BindingFlags.Instance | BindingFlags.Public)?.GetValue(workspace);
-			object? layer = canvas?.GetType().GetProperty("DocumentCanvasLayer", BindingFlags.Instance | BindingFlags.Public)?.GetValue(canvas);
-			// DocumentRenderer is internal on DocumentCanvasLayer: bind
-			// non-public too (diag proved the public-only lookup missed).
-			object? renderer = layer?.GetType().GetProperty("DocumentRenderer", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(layer);
-			renderer = renderer ?? layer?.GetType().GetField("documentRenderer", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(layer);
-			object? snapshot = renderer?.GetType().GetMethod("GetSnapshotBitmap", BindingFlags.Instance | BindingFlags.Public)?.Invoke(renderer, null);
+			object obj = workspace.GetType().GetProperty("DocumentCanvas", BindingFlags.Instance | BindingFlags.Public)?.GetValue(workspace);
+			object obj2 = obj?.GetType().GetProperty("DocumentCanvasLayer", BindingFlags.Instance | BindingFlags.Public)?.GetValue(obj);
+			object obj3 = obj2?.GetType().GetProperty("DocumentRenderer", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(obj2);
+			obj3 = obj3 ?? obj2?.GetType().GetField("documentRenderer", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(obj2);
+			object obj4 = obj3?.GetType().GetMethod("GetSnapshotBitmap", BindingFlags.Instance | BindingFlags.Public)?.Invoke(obj3, null);
 			if (_compositedDiagCount < 3)
 			{
 				_compositedDiagCount++;
-				Console.WriteLine($"[PaintDotNet] Composited diag #{_compositedDiagCount}: canvas={(canvas == null ? "null" : canvas.GetType().Name)} layer={(layer == null ? "null" : layer.GetType().Name)} renderer={(renderer == null ? "null" : renderer.GetType().Name)} snapshot={(snapshot == null ? "null" : snapshot.GetType().Name)}");
+				Console.WriteLine($"[PaintDotNet] Composited diag #{_compositedDiagCount}: canvas={((obj == null) ? "null" : obj.GetType().Name)} layer={((obj2 == null) ? "null" : obj2.GetType().Name)} renderer={((obj3 == null) ? "null" : obj3.GetType().Name)} snapshot={((obj4 == null) ? "null" : obj4.GetType().Name)}");
 			}
-			if (snapshot == null || w <= 0 || h <= 0)
+			if (obj4 == null || w <= 0 || h <= 0)
 			{
 				return null;
 			}
-			MethodInfo? copy = null;
-			foreach (MethodInfo m in snapshot.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public))
+			MethodInfo methodInfo = null;
+			MethodInfo[] methods = obj4.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public);
+			foreach (MethodInfo methodInfo2 in methods)
 			{
-				if (m.Name != "CopyPixels")
+				if (!(methodInfo2.Name != "CopyPixels"))
 				{
-					continue;
-				}
-				var ps = m.GetParameters();
-				if (ps.Length == 4 && ps[0].ParameterType.IsPointer && ps[1].ParameterType == typeof(int) && ps[2].ParameterType == typeof(uint))
-				{
-					copy = m;
-					break;
+					ParameterInfo[] parameters = methodInfo2.GetParameters();
+					if (parameters.Length == 4 && parameters[0].ParameterType.IsPointer && parameters[1].ParameterType == typeof(int) && parameters[2].ParameterType == typeof(uint))
+					{
+						methodInfo = methodInfo2;
+						break;
+					}
 				}
 			}
-			if (copy == null)
+			if (methodInfo == null)
 			{
 				return null;
 			}
-			byte[] rgba = new byte[w * h * 4];
-			fixed (byte* dst = rgba)
+			byte[] array = new byte[w * h * 4];
+			fixed (byte* ptr = array)
 			{
-				// The CopyPixels slot takes void*: box the buffer as a
-				// void* Pointer (byte* does not convert).
-				object boxed = System.Reflection.Pointer.Box(dst, typeof(void).MakePointerType());
-				copy.Invoke(snapshot, new object?[] { boxed, w * 4, (uint)(w * h * 4), null });
+				object obj5 = Pointer.Box(ptr, typeof(void).MakePointerType());
+				methodInfo.Invoke(obj4, new object[4]
+				{
+					obj5,
+					w * 4,
+					(uint)(w * h * 4),
+					null
+				});
 			}
-			// Vendor pixels are BGRA-ordered (ColorBgra32, same family as
-			// the Scan0 path above): swap to RGBA in place.
-			for (int b = 0; b < rgba.Length; b += 4)
+			for (int j = 0; j < array.Length; j += 4)
 			{
-				byte tmp = rgba[b];
-				rgba[b] = rgba[b + 2];
-				rgba[b + 2] = tmp;
+				byte b = array[j];
+				array[j] = array[j + 2];
+				array[j + 2] = b;
 			}
-			return rgba;
+			return array;
 		}
 		catch (Exception ex)
 		{
@@ -7018,7 +9596,8 @@ public sealed class WinFormsAppHost : IDisposable
 			while (type != null && methodInfo == null)
 			{
 				MethodInfo[] methods = type.GetMethods(BindingFlags.DeclaredOnly | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-				foreach (MethodInfo methodInfo2 in methods)
+				MethodInfo[] array = methods;
+				foreach (MethodInfo methodInfo2 in array)
 				{
 					if (!(methodInfo2.Name != "OnRenderAdvanced") && methodInfo2.GetParameters().Length == 2 && !(methodInfo2.GetParameters()[1].ParameterType.FullName != "PaintDotNet.Rendering.RectFloat") && !(methodInfo2.DeclaringType?.FullName == "PaintDotNet.Controls.AdvancedDirect2DControl"))
 					{
@@ -7034,7 +9613,8 @@ public sealed class WinFormsAppHost : IDisposable
 				while (type2 != null && methodInfo == null)
 				{
 					MethodInfo[] methods2 = type2.GetMethods(BindingFlags.DeclaredOnly | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-					foreach (MethodInfo methodInfo3 in methods2)
+					MethodInfo[] array2 = methods2;
+					foreach (MethodInfo methodInfo3 in array2)
 					{
 						if (methodInfo3.Name != "OnRender" || methodInfo3.GetParameters().Length != 2)
 						{
@@ -7087,7 +9667,8 @@ public sealed class WinFormsAppHost : IDisposable
 		try
 		{
 			Assembly[] assemblies = AppDomain.CurrentDomain.GetAssemblies();
-			foreach (Assembly assembly in assemblies)
+			Assembly[] array = assemblies;
+			foreach (Assembly assembly in array)
 			{
 				if (assembly.GetName().Name == "PaintDotNet.Windows.Core")
 				{
@@ -7097,7 +9678,8 @@ public sealed class WinFormsAppHost : IDisposable
 			Console.WriteLine("[D2DDBG2] core scan done");
 			bool flag = false;
 			Assembly[] assemblies2 = AppDomain.CurrentDomain.GetAssemblies();
-			foreach (Assembly assembly2 in assemblies2)
+			Assembly[] array2 = assemblies2;
+			foreach (Assembly assembly2 in array2)
 			{
 				if (assembly2.GetName().Name == "PaintDotNet.Framework")
 				{
@@ -7131,8 +9713,9 @@ public sealed class WinFormsAppHost : IDisposable
 		{
 			Console.WriteLine("[D2DDBG2] Type.GetType threw: " + ex3.GetType().Name + ": " + ex3.Message.Split('\n')[0]);
 		}
-		string[] array = new string[2] { "PaintDotNet.Primitives", "PaintDotNet.Windows.Core" };
-		foreach (string assemblyString in array)
+		string[] array3 = new string[2] { "PaintDotNet.Primitives", "PaintDotNet.Windows.Core" };
+		string[] array4 = array3;
+		foreach (string assemblyString in array4)
 		{
 			try
 			{
@@ -7143,7 +9726,8 @@ public sealed class WinFormsAppHost : IDisposable
 			}
 		}
 		Assembly[] assemblies3 = AppDomain.CurrentDomain.GetAssemblies();
-		foreach (Assembly assembly3 in assemblies3)
+		Assembly[] array5 = assemblies3;
+		foreach (Assembly assembly3 in array5)
 		{
 			try
 			{
@@ -7164,7 +9748,8 @@ public sealed class WinFormsAppHost : IDisposable
 			}
 		}
 		Assembly[] assemblies4 = AppDomain.CurrentDomain.GetAssemblies();
-		foreach (Assembly assembly4 in assemblies4)
+		Assembly[] array6 = assemblies4;
+		foreach (Assembly assembly4 in array6)
 		{
 			try
 			{
@@ -7184,7 +9769,8 @@ public sealed class WinFormsAppHost : IDisposable
 		if (s_rectFloatType != null && s_rectFloatCtor == null)
 		{
 			ConstructorInfo[] constructors = s_rectFloatType.GetConstructors();
-			foreach (ConstructorInfo constructorInfo in constructors)
+			ConstructorInfo[] array7 = constructors;
+			foreach (ConstructorInfo constructorInfo in array7)
 			{
 				ParameterInfo[] parameters = constructorInfo.GetParameters();
 				if (parameters.Length == 4 && parameters[0].ParameterType == typeof(float) && parameters[1].ParameterType == typeof(float) && parameters[2].ParameterType == typeof(float) && parameters[3].ParameterType == typeof(float))
@@ -7197,7 +9783,8 @@ public sealed class WinFormsAppHost : IDisposable
 		if (s_cpuCtxType != null && s_cpuCtxCtor == null)
 		{
 			ConstructorInfo[] constructors2 = s_cpuCtxType.GetConstructors();
-			foreach (ConstructorInfo constructorInfo2 in constructors2)
+			ConstructorInfo[] array8 = constructors2;
+			foreach (ConstructorInfo constructorInfo2 in array8)
 			{
 				ParameterInfo[] parameters2 = constructorInfo2.GetParameters();
 				if (parameters2.Length == 1 && parameters2[0].ParameterType == typeof(long))
@@ -7216,8 +9803,9 @@ public sealed class WinFormsAppHost : IDisposable
 			{
 				Assembly[] assemblies5 = AppDomain.CurrentDomain.GetAssemblies();
 				value = assemblies5.Length;
-				Assembly[] array2 = assemblies5;
-				foreach (Assembly assembly5 in array2)
+				Assembly[] array9 = assemblies5;
+				Assembly[] array10 = array9;
+				foreach (Assembly assembly5 in array10)
 				{
 					string text2 = assembly5.GetName().Name ?? "?";
 					if (text2.StartsWith("PaintDotNet"))
@@ -7243,7 +9831,8 @@ public sealed class WinFormsAppHost : IDisposable
 			while (type != null && type.FullName != "System.Windows.Forms.Control")
 			{
 				FieldInfo[] fields = type.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-				foreach (FieldInfo fieldInfo in fields)
+				FieldInfo[] array = fields;
+				foreach (FieldInfo fieldInfo in array)
 				{
 					string text = fieldInfo.FieldType.FullName ?? "";
 					if (text.Contains("Effect") || text.Contains("Bitmap") || text.Contains("Brush") || text.Contains("DeviceContext") || text.Contains("CommandList"))
@@ -7271,36 +9860,65 @@ public sealed class WinFormsAppHost : IDisposable
 
 	private void TryRenderD2DControl(ICanvas canvas, System.Windows.Forms.Control c, int absX, int absY, int w, int h)
 	{
+		// rev292c: LayersStrip renders through the CPU path now (its
+		// blacklist predates the strip-composite + UI-upload fixes; a
+		// blank strip is no longer an acceptable fail-closed shape).
+		// ToleranceSliderControl stays blacklisted (unproven).
+		lock (s_d2dRenderFailed)
+		{
+			s_d2dRenderFailed.Add("PaintDotNet.Controls.ToleranceSliderControl");
+		}
+		try
+		{
+			string text = c.GetType().FullName ?? "";
+			if (text.Contains("Strip") && !text.Contains("DocumentStrip-NONE"))
+			{
+				Type type = c.GetType();
+				FieldInfo fieldInfo = null;
+				while (type != null && fieldInfo == null)
+				{
+					fieldInfo = type.GetField("drawShadow", BindingFlags.Instance | BindingFlags.NonPublic);
+					type = type.BaseType;
+				}
+				if (fieldInfo != null && fieldInfo.FieldType == typeof(bool))
+				{
+					if (s_d2dRenderFailed.Add("noshadow:" + text))
+					{
+						Console.WriteLine("[NOSHADOW] " + text);
+					}
+					fieldInfo.SetValue(c, false);
+				}
+			}
+		}
+		catch
+		{
+		}
 		if (!IsD2DControl(c) || (long)w * (long)h > 2000000)
 		{
 			return;
 		}
-		string text = c.GetType().FullName ?? "?";
+		string text2 = c.GetType().FullName ?? "?";
 		lock (s_d2dRenderFailed)
 		{
-			if (s_d2dRenderFailed.Contains(text))
+			if (s_d2dRenderFailed.Contains(text2))
 			{
 				return;
 			}
 		}
-		// (Former ColorWheelControl blocklist removed: it predates the CPU
-		// Direct2D factory synthesis. The upload chain (reinterpret,
-		// counted clips, color-profile resources) is harness-pinned
-		// now; failures stay contained below with a [D2D] console line.)
 		try
 		{
 			lock (s_d2dRenderFailed)
 			{
-				if (s_d2dRenderFailed.Add("try:" + text))
+				if (s_d2dRenderFailed.Add("try:" + text2))
 				{
-					Console.WriteLine("[D2DTRY] " + text);
+					Console.WriteLine("[D2DTRY] " + text2);
 				}
 			}
 			lock (s_d2dRenderFailed)
 			{
-				if (s_d2dRenderFailed.Add("nulls:" + text))
+				if (s_d2dRenderFailed.Add("nulls:" + text2))
 				{
-					TempD2DNullProbe(c, text);
+					TempD2DNullProbe(c, text2);
 				}
 			}
 			RenderD2DControlCore(canvas, c, absX, absY, w, h);
@@ -7309,7 +9927,7 @@ public sealed class WinFormsAppHost : IDisposable
 		{
 			lock (s_d2dRenderFailed)
 			{
-				s_d2dRenderFailed.Add(text);
+				s_d2dRenderFailed.Add(text2);
 			}
 			Exception ex2 = ex;
 			while (ex2 is TargetInvocationException && ex2.InnerException != null)
@@ -7317,13 +9935,13 @@ public sealed class WinFormsAppHost : IDisposable
 				ex2 = ex2.InnerException;
 			}
 			string value = ex2.Message.Split('\n')[0];
-			Console.WriteLine($"[D2D] {text} CPU render failed: {ex2.GetType().Name}: {value}");
+			Console.WriteLine($"[D2D] {text2} CPU render failed: {ex2.GetType().Name}: {value}");
 			try
 			{
-				StackFrame stackFrame = ((StackTrace)null)?.GetFrame(0);
+				StackFrame stackFrame = null;
 				if (stackFrame != null)
 				{
-					Console.WriteLine($"[D2DIL] {text} il=0x{stackFrame.GetILOffset():x}");
+					Console.WriteLine($"[D2DIL] {text2} il=0x{stackFrame.GetILOffset():x}");
 				}
 			}
 			catch
@@ -7334,12 +9952,13 @@ public sealed class WinFormsAppHost : IDisposable
 				string[] array = Array.Empty<string>();
 				int num = 0;
 				string[] array2 = array;
-				foreach (string text2 in array2)
+				string[] array3 = array2;
+				foreach (string text3 in array3)
 				{
-					string text3 = text2.Trim();
-					if (text3.Length != 0)
+					string text4 = text3.Trim();
+					if (text4.Length != 0)
 					{
-						Console.WriteLine($"[D2DSTACK] {text} #{num}: " + ((text3.Length > 220) ? text3.Substring(0, 220) : text3));
+						Console.WriteLine($"[D2DSTACK] {text2} #{num}: " + ((text4.Length > 220) ? text4.Substring(0, 220) : text4));
 						if (++num >= 8)
 						{
 							break;
@@ -7372,11 +9991,13 @@ public sealed class WinFormsAppHost : IDisposable
 			{
 				Type type = null;
 				string[] array = new string[1] { "PaintDotNet.VisualStyling.ColorRectangleDirect2D" };
-				foreach (string text in array)
+				string[] array2 = array;
+				foreach (string text in array2)
 				{
 					type = assembly.GetType(text);
-					string[] array2 = new string[3] { "PaintDotNet.Framework", "PaintDotNet.Core", "paintdotnet" };
-					foreach (string text2 in array2)
+					string[] array3 = new string[3] { "PaintDotNet.Framework", "PaintDotNet.Core", "paintdotnet" };
+					string[] array4 = array3;
+					foreach (string text2 in array4)
 					{
 						if (type != null)
 						{
@@ -7409,28 +10030,28 @@ public sealed class WinFormsAppHost : IDisposable
 					else
 					{
 						ParameterInfo[] parameters = methodInfo.GetParameters();
-						object[] array3 = new object[parameters.Length];
+						object[] array5 = new object[parameters.Length];
 						for (int num = 0; num < parameters.Length; num++)
 						{
 							Type parameterType = parameters[num].ParameterType;
 							if (parameterType.IsInstanceOfType(cpuCtx))
 							{
-								array3[num] = cpuCtx;
+								array5[num] = cpuCtx;
 							}
 							else if (parameterType == typeof(bool))
 							{
-								array3[num] = true;
+								array5[num] = true;
 							}
 							else if (parameterType.IsValueType)
 							{
-								array3[num] = Activator.CreateInstance(parameterType);
+								array5[num] = Activator.CreateInstance(parameterType);
 							}
 							else
 							{
-								array3[num] = null;
+								array5[num] = null;
 							}
 						}
-						methodInfo.Invoke(null, array3);
+						methodInfo.Invoke(null, array5);
 						Console.WriteLine("[D2DDEEP] " + tn + " render=ok");
 					}
 				}
@@ -7443,8 +10064,9 @@ public sealed class WinFormsAppHost : IDisposable
 					ex3 = ex3.InnerException;
 				}
 				Console.WriteLine($"[D2DDEEP] {tn} render=FAIL:{ex3.GetType().FullName}:{ex3.Message.Split('\n')[0]}");
-				string[] array4 = (ex3.StackTrace ?? "").Split('\n');
-				foreach (string text3 in array4)
+				string[] array6 = (ex3.StackTrace ?? "").Split('\n');
+				string[] array7 = array6;
+				foreach (string text3 in array7)
 				{
 					string text4 = text3.Trim();
 					if (text4.Length != 0)
@@ -7453,27 +10075,29 @@ public sealed class WinFormsAppHost : IDisposable
 					}
 				}
 			}
-			(string, string)[] array5 = new(string, string)[2]
+			(string, string)[] array8 = new (string, string)[2]
 			{
 				("checkers", "CheckerboardEffect"),
 				("colormgmt", "ColorManagementEffect")
 			};
-			for (int num3 = 0; num3 < array5.Length; num3++)
+			for (int num3 = 0; num3 < array8.Length; num3++)
 			{
-				(string, string) tuple = array5[num3];
+				(string, string) tuple = array8[num3];
 				try
 				{
 					Type type2 = null;
-					string[] array6 = new string[2]
+					string[] array9 = new string[2]
 					{
 						"PaintDotNet.VisualStyling." + tuple.Item2,
 						"PaintDotNet.Direct2D1.Effects." + tuple.Item2
 					};
-					foreach (string text5 in array6)
+					string[] array10 = array9;
+					foreach (string text5 in array10)
 					{
 						type2 = assembly.GetType(text5);
-						string[] array7 = new string[4] { "PaintDotNet.Core", "PaintDotNet.Windows.Core", "PaintDotNet.Framework", "paintdotnet" };
-						foreach (string text6 in array7)
+						string[] array11 = new string[4] { "PaintDotNet.Core", "PaintDotNet.Windows.Core", "PaintDotNet.Framework", "paintdotnet" };
+						string[] array12 = array11;
+						foreach (string text6 in array12)
 						{
 							if (type2 != null)
 							{
@@ -7512,8 +10136,9 @@ public sealed class WinFormsAppHost : IDisposable
 			try
 			{
 				Type type3 = null;
-				string[] array8 = new string[4] { "PaintDotNet.Windows.Core", "PaintDotNet.Core", "PaintDotNet.Framework", "paintdotnet" };
-				foreach (string text7 in array8)
+				string[] array13 = new string[4] { "PaintDotNet.Windows.Core", "PaintDotNet.Core", "PaintDotNet.Framework", "paintdotnet" };
+				string[] array14 = array13;
+				foreach (string text7 in array14)
 				{
 					try
 					{
@@ -7540,7 +10165,14 @@ public sealed class WinFormsAppHost : IDisposable
 					try
 					{
 						MethodInfo methodInfo2 = obj8?.GetType().GetMethod("get_Storage", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-						text8 = ((methodInfo2 == null) ? "no-getter" : ((methodInfo2.Invoke(obj8, null) == null) ? "null" : "ok"));
+						if (methodInfo2 == null)
+						{
+							text8 = "no-getter";
+						}
+						else
+						{
+							text8 = ((methodInfo2.Invoke(obj8, null) == null) ? "null" : "ok");
+						}
 					}
 					catch (Exception ex6)
 					{
@@ -7549,7 +10181,14 @@ public sealed class WinFormsAppHost : IDisposable
 					try
 					{
 						MethodInfo methodInfo3 = obj8?.GetType().GetMethod("get_Factory", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-						text9 = ((methodInfo3 == null) ? "no-getter" : ((methodInfo3.Invoke(obj8, null) == null) ? "null" : "ok"));
+						if (methodInfo3 == null)
+						{
+							text9 = "no-getter";
+						}
+						else
+						{
+							text9 = ((methodInfo3.Invoke(obj8, null) == null) ? "null" : "ok");
+						}
 					}
 					catch (Exception ex7)
 					{
@@ -7625,7 +10264,14 @@ public sealed class WinFormsAppHost : IDisposable
 			try
 			{
 				MethodInfo methodInfo = obj?.GetType().GetMethod("get_Storage", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-				text = ((methodInfo == null) ? "no-getter" : ((methodInfo.Invoke(obj, null) == null) ? "null" : "ok"));
+				if (methodInfo == null)
+				{
+					text = "no-getter";
+				}
+				else
+				{
+					text = ((methodInfo.Invoke(obj, null) == null) ? "null" : "ok");
+				}
 			}
 			catch (Exception ex2)
 			{
@@ -7634,7 +10280,14 @@ public sealed class WinFormsAppHost : IDisposable
 			try
 			{
 				MethodInfo methodInfo2 = obj?.GetType().GetMethod("get_Factory", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-				text2 = ((methodInfo2 == null) ? "no-getter" : ((methodInfo2.Invoke(obj, null) == null) ? "null" : "ok"));
+				if (methodInfo2 == null)
+				{
+					text2 = "no-getter";
+				}
+				else
+				{
+					text2 = ((methodInfo2.Invoke(obj, null) == null) ? "null" : "ok");
+				}
 			}
 			catch (Exception ex3)
 			{
@@ -7644,7 +10297,14 @@ public sealed class WinFormsAppHost : IDisposable
 			{
 				FieldInfo fieldInfo = value.GetType().Assembly.GetType("PaintDotNet.Direct2D1.Effects.DeviceEffect")?.GetField("effect", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 				object obj2 = fieldInfo?.GetValue(value);
-				text3 = ((fieldInfo == null) ? "no-field" : ((obj2 == null) ? "null" : obj2.GetType().FullName));
+				if (fieldInfo == null)
+				{
+					text3 = "no-field";
+				}
+				else
+				{
+					text3 = ((obj2 == null) ? "null" : obj2.GetType().FullName);
+				}
 			}
 			catch (Exception ex4)
 			{
@@ -7668,19 +10328,25 @@ public sealed class WinFormsAppHost : IDisposable
 		{
 			throw new InvalidOperationException("no OnRenderAdvanced/OnRender content override");
 		}
-		byte[] array = new byte[w * h * 4];
+		int num = checked(w * h * 4);
+		byte[] array = new byte[num + 64];
+		for (int i = 0; i < 64; i++)
+		{
+			array[num + i] = 171;
+		}
 		GCHandle gCHandle = GCHandle.Alloc(array, GCHandleType.Pinned);
 		try
 		{
-			long num = CpuPaint.CreateTarget(gCHandle.AddrOfPinnedObject(), w, h, w * 4, 4);
-			if (num == 0)
+			long num2 = CpuPaint.CreateTarget(gCHandle.AddrOfPinnedObject(), w, h, w * 4, 4);
+			if (num2 == 0)
 			{
 				throw new InvalidOperationException("CreateTarget failed");
 			}
+			object obj = null;
 			try
 			{
-				CpuPaint.ClearTarget(num, 0f, 0f, 0f, 0f, hasColor: false);
-				object obj = (((object)s_cpuCtxCtor != null) ? s_cpuCtxCtor.Invoke(new object[1] { num }) : Activator.CreateInstance(s_cpuCtxType, num));
+				CpuPaint.ClearTarget(num2, 0f, 0f, 0f, 0f, hasColor: false);
+				obj = (((object)s_cpuCtxCtor != null) ? s_cpuCtxCtor.Invoke(new object[1] { num2 }) : Activator.CreateInstance(s_cpuCtxType, num2));
 				string text = c.GetType().FullName ?? "?";
 				lock (s_d2dRenderFailed)
 				{
@@ -7720,6 +10386,22 @@ public sealed class WinFormsAppHost : IDisposable
 						(float)h
 					});
 					methodInfo.Invoke(c, new object[2] { obj, obj3 });
+					bool flag = false;
+					for (int j = 0; j < 64; j++)
+					{
+						if (array[num + j] != 171)
+						{
+							flag = true;
+							break;
+						}
+					}
+					lock (s_d2dRenderFailed)
+					{
+						if (s_d2dRenderFailed.Add("canary:" + text))
+						{
+							Console.WriteLine("[D2DCANARY] " + text + " " + w + "x" + h + (flag ? " TRASHED" : " ok"));
+						}
+					}
 				}
 				finally
 				{
@@ -7728,26 +10410,28 @@ public sealed class WinFormsAppHost : IDisposable
 			}
 			finally
 			{
-				CpuPaint.FreeContext(num);
+				if (obj == null)
+				{
+					CpuPaint.FreeContext(num2);
+				}
 			}
 		}
 		finally
 		{
 			gCHandle.Free();
 		}
-		for (int i = 0; i < array.Length; i += 4)
+		for (int k = 0; k < array.Length; k += 4)
 		{
-			byte b = array[i];
-			array[i] = array[i + 2];
-			array[i + 2] = b;
+			byte b = array[k];
+			array[k] = array[k + 2];
+			array[k + 2] = b;
 		}
 		RecordBitmap(c, canvas, array, w, h, absX, absY, w, h);
-		if (System.Windows.Forms.WasmFrameCounters.PerfEnabled)
-			System.Windows.Forms.WasmFrameCounters.CountRasterFull((long)w * h);
+		if (WasmFrameCounters.PerfEnabled)
+		{
+			WasmFrameCounters.CountRasterFull((long)w * (long)h);
+		}
 	}
-
-
-
 
 	internal static MethodInfo? ResolveD2DCreated(Type controlType)
 	{
@@ -7912,19 +10596,22 @@ public sealed class WinFormsAppHost : IDisposable
 	internal static (int Buttons, int Change) ToPointerButtonInts(System.Windows.Forms.MouseButtons buttons, PointerEventKind kind)
 	{
 		int item = ((buttons == System.Windows.Forms.MouseButtons.Right) ? 32 : 16);
+		bool flag = false;
 		if (1 == 0)
 		{
 		}
 		int num = kind switch
 		{
-			PointerEventKind.Pressed => (buttons != System.Windows.Forms.MouseButtons.Right) ? 1 : 3,
-			PointerEventKind.Released => (buttons == System.Windows.Forms.MouseButtons.Right) ? 4 : 2,
-			_ => 0,
+			PointerEventKind.Pressed => (buttons != System.Windows.Forms.MouseButtons.Right) ? 1 : 3, 
+			PointerEventKind.Released => (buttons == System.Windows.Forms.MouseButtons.Right) ? 4 : 2, 
+			_ => 0, 
 		};
 		if (1 == 0)
 		{
 		}
-		int item2 = num;
+		int num2 = num;
+		bool flag2 = false;
+		int item2 = num2;
 		return (Buttons: item, Change: item2);
 	}
 
@@ -8020,9 +10707,9 @@ public sealed class WinFormsAppHost : IDisposable
 					(double)x,
 					(double)y
 				});
-				(int Buttons, int Change) tuple = ToPointerButtonInts(buttons, kind);
-				int item = tuple.Buttons;
-				int item2 = tuple.Change;
+				(int, int) tuple = ToPointerButtonInts(buttons, kind);
+				int item = tuple.Item1;
+				int item2 = tuple.Item2;
 				object obj3 = Enum.ToObject(s_pointerTypeEnum, 4);
 				object obj4 = Enum.ToObject(s_pointerButtonsEnum, item);
 				object obj5 = Enum.ToObject(s_pointerButtonChangeTypeEnum, item2);

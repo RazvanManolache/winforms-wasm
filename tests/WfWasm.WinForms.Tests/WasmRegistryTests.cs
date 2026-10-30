@@ -23,6 +23,21 @@ public sealed class WasmRegistryTests
     }
 
     [Fact]
+    public void Miss_Census_Counts_GetValue_Misses()
+    {
+        static int Count()
+        {
+            string dump = System.Windows.Forms.WasmRegistry.DumpRegistryMissCensus();
+            return int.Parse(dump.Split('=')[1]);
+        }
+        int before = Count();
+        System.Windows.Forms.WasmRegistry.GetValue(null, "AccentColor");
+        System.Windows.Forms.WasmRegistry.GetValue("k", "AccentColor", 1);
+        int after = Count();
+        Assert.True(after >= before + 2, $"census moved {before} -> {after}");
+    }
+
+    [Fact]
     public void Writes_Are_NoOps()
     {
         var ex = Record.Exception(() =>

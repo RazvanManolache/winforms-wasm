@@ -12,7 +12,7 @@ public sealed class PdnCheckBoxMeasureRedirectTests
     [Fact]
     public void Redirect_Real_CheckBoxMeasure_Answers_CpuText()
     {
-        string src = TestPaths.Repo(@"targets\paint.net\PaintDotNet.Framework.dll");
+        string src = @"E:\AI\Code\WindowsForms\targets\paint.net\PaintDotNet.Framework.dll";
         string tmp = Path.Combine(Path.GetTempPath(), $"PdnBox_{Guid.NewGuid()}.dll");
         File.Copy(src, tmp);
         try

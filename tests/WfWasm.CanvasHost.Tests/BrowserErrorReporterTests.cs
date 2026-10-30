@@ -196,6 +196,67 @@ public sealed class BrowserErrorReporterTests
     }
 
     [Fact]
+    public async Task Report_Prefers_Js_Transport_And_Skips_HttpClient()
+    {
+        // WF-R-NRE-0730: the fire-and-forget HttpClient POST completes via
+        // JavaScriptExports.CompleteTask, whose synchronous NRE takes the
+        // runtime down (exit 1). The JS-side fetch creates no managed Task,
+        // so when it is available no HTTP call may happen at all.
+        var handler = new CaptureHandler();
+        BrowserErrorReporter.Initialize(new HttpClient(handler) { BaseAddress = new Uri("http://127.0.0.1:5210") });
+        var seen = new List<(string Url, string Json)>();
+        // Marker-scoped: parallel suites share the static reporter, so only
+        // swallow our own marker; every other report falls through to HTTP.
+        BrowserErrorReporter.JsTransportOverride = (url, json) =>
+        {
+            if (!json.Contains("js-transport-marker"))
+                return false;
+            seen.Add((url, json));
+            return true;
+        };
+        try
+        {
+            BrowserErrorReporter.Report("first-chance", new NotSupportedException("js-transport-marker"), "F.M");
+            await Task.Delay(500);
+            Assert.Single(seen);
+            Assert.Contains("api/client-errors", seen[0].Url);
+            Assert.Contains("NotSupportedException|F.M|js-transport-marker", seen[0].Json);
+            Assert.Contains("first-chance", seen[0].Json);
+            // Marker-scoped: parallel suites share the global HttpClient, so
+            // only our own marker's absence proves the JS-first skip.
+            Assert.DoesNotContain(handler.SnapshotBodies(), b => b.Contains("js-transport-marker"));
+        }
+        finally
+        {
+            BrowserErrorReporter.JsTransportOverride = null;
+            BrowserErrorReporter.Initialize(new HttpClient(new CaptureHandler()));
+        }
+    }
+
+    [Fact]
+    public async Task Report_Falls_Back_To_Http_When_Js_Transport_Fails()
+    {
+        // The JS hook may be absent (desktop tests, stale shell): a failed
+        // JS dispatch must still post through HttpClient.
+        var handler = new CaptureHandler();
+        BrowserErrorReporter.Initialize(new HttpClient(handler) { BaseAddress = new Uri("http://127.0.0.1:5210") });
+        BrowserErrorReporter.JsTransportOverride = (url, json) => false;
+        try
+        {
+            BrowserErrorReporter.Report("first-chance", new NotSupportedException("http-fallback-marker"), "F.M");
+            for (int i = 0; i < 100 && handler.SnapshotBodies().Length == 0; i++)
+                await Task.Delay(50);
+            string ours = Assert.Single(handler.SnapshotBodies(), b => b.Contains("http-fallback-marker"));
+            Assert.Contains("NotSupportedException|F.M|http-fallback-marker", ours);
+        }
+        finally
+        {
+            BrowserErrorReporter.JsTransportOverride = null;
+            BrowserErrorReporter.Initialize(new HttpClient(new CaptureHandler()));
+        }
+    }
+
+    [Fact]
     public void TopFrame_Strips_Assembly_Qualified_Generics()
     {
         // Observed live: the raw site segment was

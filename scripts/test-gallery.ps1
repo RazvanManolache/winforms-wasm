@@ -30,20 +30,29 @@ if ($LASTEXITCODE -ne 0 -or !$cfg) { throw "gallery server :$Port unreachable" }
 Write-Host "  server :$Port ok"
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$out = Join-Path $ws ".artifacts/gallery-$stamp"
+$out = "E:/tmp/gal-$stamp"
 Write-Host "== gallery run -> $out"
 $negFlag = @()
 if ($Negative) { $negFlag += '--negative' }
+# Run the report even when cases fail: a failing report must still be
+# verified (and must still fail acceptance). $runFailed gates the exit.
 python (Join-Path $gal 'run.py') --out $out --cases $Cases --port $Port @negFlag
-if ($LASTEXITCODE -ne 0) { throw 'gallery run failed' }
+$runFailed = $LASTEXITCODE
 
 Write-Host '== gallery verify'
-python (Join-Path $gal 'verify.py') --run $out
-$verdict = $LASTEXITCODE
+# NOTE: --expect-cases is NOT auto-derived from -Cases here: -Cases names
+# case-function stems while row ids differ ('smoke-click-keys', ...).
+# Required-case enforcement lives in explicit verify invocations + selftests.
+$verifyArgs = @('--run', $out)
+if ($Negative) { $verifyArgs += '--expect-negative' }
+python (Join-Path $gal 'verify.py') @verifyArgs
+$verifyFailed = $LASTEXITCODE
 
 Write-Host '== gallery checker self-tests'
 python (Join-Path $gal 'selftest.py')
-if ($LASTEXITCODE -ne 0) { throw 'gallery self-tests failed' }
+$selftestFailed = $LASTEXITCODE
 
-Write-Host "out=$out verdict=$([int]$verdict)"
-exit $verdict
+$failed = ($runFailed -ne 0) -or ($verifyFailed -ne 0) -or ($selftestFailed -ne 0)
+Write-Host "out=$out run=$runFailed verify=$verifyFailed selftest=$selftestFailed"
+if ($failed) { throw 'gallery acceptance failed (see stage above)' }
+exit 0

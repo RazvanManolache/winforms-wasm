@@ -178,7 +178,7 @@ public static class WasmDialogHost
     public static void Track(Form form, bool modal)
     {
         ArgumentNullException.ThrowIfNull(form);
-        lock (s_lock)
+            lock (s_lock)
         {
             UntrackLocked(form);
             s_windows.Add(new WasmShownWindow(form, modal));

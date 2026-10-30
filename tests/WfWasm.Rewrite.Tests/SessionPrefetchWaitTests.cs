@@ -120,7 +120,7 @@ public sealed class SessionPrefetchWaitTests
         string tmp = Path.Combine(Path.GetTempPath(), $"{tag}_{Guid.NewGuid()}.dll");
         byte[] bytes = File.ReadAllBytes(src);
         string? dir = Path.GetDirectoryName(src);
-        using var resolver = new FrameworkResolver(dir, [TestPaths.Repo(@".artifacts\runtime"), TestPaths.Repo(@"external-apps\paintnet-support")]);
+        using var resolver = new FrameworkResolver(dir, [@"E:\tmp\rewritten-small", @"E:\tmp\rewritten-paint"]);
         var readerParams = new ReaderParameters { AssemblyResolver = resolver };
         using (var ms = new MemoryStream(bytes))
         using (var read = AssemblyDefinition.ReadAssembly(ms, readerParams))
@@ -137,7 +137,7 @@ public sealed class SessionPrefetchWaitTests
         string tmp = Path.Combine(Path.GetTempPath(), $"{tag}_{Guid.NewGuid()}.dll");
         byte[] bytes = File.ReadAllBytes(src);
         string? dir = Path.GetDirectoryName(src);
-        using var resolver = new FrameworkResolver(dir, [TestPaths.Repo(@".artifacts\runtime"), TestPaths.Repo(@"external-apps\paintnet-support")]);
+        using var resolver = new FrameworkResolver(dir, [@"E:\tmp\rewritten-small", @"E:\tmp\rewritten-paint"]);
         var readerParams = new ReaderParameters { AssemblyResolver = resolver };
         using (var ms = new MemoryStream(bytes))
         using (var read = AssemblyDefinition.ReadAssembly(ms, readerParams))

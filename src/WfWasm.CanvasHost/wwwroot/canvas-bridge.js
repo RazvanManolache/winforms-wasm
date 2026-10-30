@@ -13,6 +13,20 @@
 // One canvas element, no DOM UI.
 window.wfwasm = window.wfwasm || {};
 window.wfwasm._frames = 0;
+// WF-R-NRE-0730: sync error-report dispatch for BrowserErrorReporter.
+// The POST fires purely on the JS side (keepalive: it survives even a
+// dying runtime) and returns nothing, so managed code never holds a Task
+// for it: no CompleteTask completion, no FailFast vector.
+window.wfwasmReportError = function (url, json) {
+    try {
+        fetch(url || '/api/client-errors', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: String(json == null ? '' : json),
+            keepalive: true
+        });
+    } catch (e) { }
+};
 window.wfwasm._fts = [];
 // v1 JS-side input-timeline instrumentation. STRICTLY inert unless
 // wfwasm.perfEnable() runs: no listeners, no rAF, no extra clocks.
@@ -230,6 +244,11 @@ window.wfwasm.paint = function (canvasId, commandsJson, frameSeq) {
             // patchBitmap marker: pixels travel out-of-band via
             // wfwasmTexPatch (PaintAsync strips patches, so this runs
             // only for hand-built streams). No-op by design.
+        } else if (c[0] === 12) {
+            // shiftBitmap marker: the shift travels out-of-band via
+            // wfwasmTexShift ahead of the patch (PaintAsync strips
+            // shifts, so this runs only for hand-built streams).
+            // No-op by design.
         }
     }
     if (perf) {
@@ -279,6 +298,29 @@ window.wfwasmTexPatch = function (layerId, bytes, x, y, w, h) {
         var img = g.createImageData(w, h);
         img.data.set(src.subarray(0, w * h * 4));
         g.putImageData(img, x, y);
+        return "ok";
+    } catch (e) {
+        return "error:" + ((e && e.message) || e);
+    }
+};
+// Retained scroll shift: moves a layer bitmap by (dx,dy) through a
+// scratch copy (never a self-drawImage), so a following TexPatch of
+// the exposed strip lands on already-moved pixels. Pixel p moves to
+// p+(dx,dy), matching managed ShiftPixels. Missing layers or a zero
+// shift keep the old layer (the managed side falls back to Def).
+window.wfwasmTexShift = function (layerId, dx, dy) {
+    try {
+        dx |= 0; dy |= 0;
+        if (!layerId || (dx === 0 && dy === 0)) return "noop";
+        var layer = window.wfwasm._tex ? window.wfwasm._tex.get(String(layerId)) : null;
+        if (!layer) return "nolayer";
+        var tmp = document.createElement("canvas");
+        tmp.width = layer.width; tmp.height = layer.height;
+        tmp.getContext("2d").drawImage(layer, 0, 0);
+        var g = layer.getContext("2d", { alpha: true });
+        g.clearRect(0, 0, layer.width, layer.height);
+        g.drawImage(tmp, dx, dy);
+        tmp.width = 0; tmp.height = 0;
         return "ok";
     } catch (e) {
         return "error:" + ((e && e.message) || e);

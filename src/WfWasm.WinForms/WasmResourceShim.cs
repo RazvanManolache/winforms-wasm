@@ -86,6 +86,21 @@ public static class WasmResourceShim
     // answers null exactly like BCL (missing-set detection keeps
     // working); enumeration over the derived set is empty (its table is
     // never filled) rather than fatal.
+    // BCL-arity overloads so the rewriter can retarget 1-arg and 2-arg
+    // GetResourceSet call sites with a plain operand swap (no IL stack
+    // surgery). Defaults mirror BCL exactly: GetResourceSet(culture)
+    // == (culture, createIfNotExists: true, tryParents: true).
+    public static System.Resources.ResourceSet? SafeGetResourceSet(
+        System.Resources.ResourceManager? rm,
+        System.Globalization.CultureInfo? culture) =>
+        SafeGetResourceSet(rm, culture, createIfNotExists: true, tryParents: true);
+
+    public static System.Resources.ResourceSet? SafeGetResourceSet(
+        System.Resources.ResourceManager? rm,
+        System.Globalization.CultureInfo? culture,
+        bool createIfNotExists) =>
+        SafeGetResourceSet(rm, culture, createIfNotExists, tryParents: true);
+
     public static System.Resources.ResourceSet? SafeGetResourceSet(
         System.Resources.ResourceManager? rm,
         System.Globalization.CultureInfo? culture,
@@ -173,7 +188,14 @@ public static class WasmResourceShim
     private static bool TryHydrateImageStream(System.Resources.ResourceManager? rm, string? name, out ImageListStreamer? streamer)
     {
         streamer = null;
-        if (rm is null || name is null || !name.EndsWith(".ImageStream", StringComparison.Ordinal))
+        // Suffix pre-filter only: the bytes path below validates. Both
+        // designer spellings occur live: "<list>.ImageStream" (WinForms)
+        // and "<component>.Images" (Syncfusion tile-layout imageStreamer
+        // blobs, which miss as UnknownType without this and NRE the
+        // Form1 ctor). Anything else keeps today's miss path unchanged.
+        if (rm is null || name is null
+            || (!name.EndsWith(".ImageStream", StringComparison.Ordinal)
+                && !name.EndsWith(".Images", StringComparison.Ordinal)))
             return false;
         try
         {

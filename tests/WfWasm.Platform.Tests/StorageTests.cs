@@ -5,7 +5,7 @@ namespace WfWasm.Platform.Tests;
 
 public sealed class StorageTests : IDisposable
 {
-    private readonly string _root = Path.Combine(Path.Combine(Path.GetTempPath(), "wf-platform-tests"), Guid.NewGuid().ToString("N"));
+    private readonly string _root = Path.Combine("E:/tmp/wf-platform-tests", Guid.NewGuid().ToString("N"));
     private static readonly PlatformScope Alice = new("alice", "app");
     private static readonly PlatformScope Bob = new("bob", "app");
     private static RegistryEntry Value(string name, string kind, object data) => new(name, kind, JsonSerializer.SerializeToElement(data));

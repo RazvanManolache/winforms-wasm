@@ -12,7 +12,7 @@ public sealed class CpuDrawingContextContractTests
 {
     private static string PaintDir()
     {
-        string dir = TestPaths.Repo(@"targets\paint.net");
+        string dir = @"E:\AI\Code\WindowsForms\targets\paint.net";
         Assert.True(Directory.Exists(dir), "pristine PDN inputs missing: " + dir);
         return dir;
     }
@@ -28,7 +28,7 @@ public sealed class CpuDrawingContextContractTests
 
     private static string ForkDll()
     {
-        string dll = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
+        string dll = @"E:\tmp\rewritten-small\WfWasm.WinForms.dll";
         Assert.True(File.Exists(dll), "migrated fork not built (run rewrite-small.ps1): " + dll);
         return dll;
     }
@@ -84,7 +84,7 @@ public sealed class CpuDrawingContextContractTests
         string forkDll = ForkDll();
         string drawingDll = BinDll("WfWasm.Drawing", "net9.0", "WfWasm.Drawing");
         string cpuDll = BinDll("WfWasm.PdnCpu", "net9.0", "WfWasm.PdnCpu");
-        string handmap = TestPaths.Repo(@"src\WfWasm.Rewrite.Tool\handmap.paint.net.txt");
+        string handmap = @"E:\AI\Code\WindowsForms\src\WfWasm.Rewrite.Tool\handmap.paint.net.txt";
         Assert.True(File.Exists(handmap), "PDN handmap missing: " + handmap);
         string[] closure = new[] { "PaintDotNet.Primitives.dll", "PaintDotNet.ComponentModel.dll", "PaintDotNet.Windows.Core.dll", "PaintDotNet.Windows.dll", "PaintDotNet.Windows.Framework.dll" };
         foreach (string f in closure)

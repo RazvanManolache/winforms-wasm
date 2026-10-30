@@ -384,13 +384,25 @@ def case_tile_layout(ctx):
 
 
 def case_failed_ctor(ctx):
-    row = ctx.new_row('failed-ctor-contained', 'syncfusion-auto-complete')
+    # Target history: syncfusion-auto-complete held this slot until it
+    # HEALED (2026-10-28, run 1af6eb4c5208: APP-LIFE constructed +
+    # first-painted RadioButtonAdv, zero inventoried reports; console
+    # E:/tmp/gal-tick1028m/consoles-failed-ctor-contained.txt).
+    # Repointed at benchmark-devexpress, which still fails
+    # window creation (TypeInitialization ColorCreator -> NRE, reported
+    # as app-load 'could not create its real window').
+    row = ctx.new_row('failed-ctor-contained', 'benchmark-devexpress')
     # The failure under test IS the error report: expect exactly the
     # app-load window-create report, nothing else. Boolean True is banned
     # (verifier rejects it); each entry names app+phase+signature.
     row['expectedErrors'] = [
-        {'app': 'syncfusion-auto-complete', 'phase': 'app-load',
-         'signature': 'could not create its window'},
+        {'app': 'benchmark-devexpress', 'phase': 'app-load',
+         'signature': 'could not create its real window'},
+        # Same causal chain, intermediate report phase (proven rev290:
+        # ColorCreator TypeInit -> inner NRE -> form-create TIE wrapper ->
+        # app-load containment report; consoles lines 29-39, count 1).
+        {'app': 'benchmark-devexpress', 'phase': 'form-create',
+         'signature': 'TargetInvocationException'},
     ]
     # launch fails BY DESIGN here (window never created); isolation is the
     # dimension under test. Declared so the verifier's passed-with-failed-dim
@@ -399,11 +411,18 @@ def case_failed_ctor(ctx):
         'launch': 'failure under test: window never created by design',
     }
     inv0 = ctx.inv()
-    pg, consoles, errors, form, controls = ctx.launch(row, 'syncfusion-auto-complete', wait_s=15)
+    # wait_s=90: DevExpress pulls ~10MB+ of vendor assemblies on demand
+    # (XtraBars alone is 6.8MB); the 15s default returns mid-download,
+    # before window creation even runs (proven by run 500630a590f8:
+    # console ends at 'Requested XtraBars', no APP-LIFE at all).
+    pg, consoles, errors, form, controls = ctx.launch(row, 'benchmark-devexpress', wait_s=90)
     try:
-        marker = any('could not create its window' in c for c in consoles)
+        # Substring stops before 'window': the legacy message reads
+        # '... could not create its window' while DevExpress reports
+        # '... could not create its real window' (both observed live).
+        marker = any('could not create its' in c for c in consoles)
         ctx.check(row, 'failure:window-marker', marker, 'app-load marker in console')
-        unexp = ctx.err_delta(row, inv0, ['syncfusion-auto-complete'], row['artifacts']['t0'])
+        unexp = ctx.err_delta(row, inv0, ['benchmark-devexpress'], row['artifacts']['t0'])
         ctx.check(row, 'failure:inventoried', len(unexp) > 0, f'reports={unexp[:1]}')
         row['dims']['launch'] = 'failed'
         # isolation: shell must stay usable -> smoke click works after

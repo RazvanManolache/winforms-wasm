@@ -33,7 +33,7 @@ public sealed class UiaRewriteTests
         // Regression: DllNotFoundException UIAutomationCore <- Add <-
         // CategoryListLoaded <- DeserializeData left BookShelf shelves
         // empty (categories loaded, UI update aborted).
-        string input = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release\Telerik.WinControls.UI.dll");
+        string input = @"E:\AI\Code\WindowsForms\telerik\Telerik UI for WinForms demos\Bin\Release\Telerik.WinControls.UI.dll";
         if (!File.Exists(input)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"TelerikUI_Uia_{Guid.NewGuid()}.dll");
         try

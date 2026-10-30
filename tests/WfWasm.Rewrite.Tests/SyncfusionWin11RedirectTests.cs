@@ -64,7 +64,7 @@ public sealed class SyncfusionWin11RedirectTests
     [Fact]
     public void Redirect_Real_Win11Check_Answers_False()
     {
-        string src = TestPaths.Repo(@"external-apps\syncfusion\syncfusion-calendar\Syncfusion.Shared.Base.dll");
+        string src = @"E:\tmp\wfwasm-syncfusion-apps\syncfusion-calendar\Syncfusion.Shared.Base.dll";
         string tmp = Path.Combine(Path.GetTempPath(), $"SfReal_{Guid.NewGuid()}.dll");
         File.Copy(src, tmp);
         try

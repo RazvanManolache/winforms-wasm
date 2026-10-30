@@ -33,7 +33,7 @@ public sealed class VfsRewriteTests
         // every such call to the AppFileSystem registry (same shapes).
         // Regression: FileNotFoundException '/background.jpg' + empty
         // photo strip on telerik-photo (GetFiles hit the real disk).
-        string input = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\ExamplesProjects\PhotoAlbum\bin\PhotoAlbum.exe");
+        string input = @"E:\AI\Code\WindowsForms\telerik\Telerik UI for WinForms demos\ExamplesProjects\PhotoAlbum\bin\PhotoAlbum.exe";
         if (!File.Exists(input)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"PhotoAlbum_GetFiles_{Guid.NewGuid()}.exe");
         try
@@ -80,7 +80,7 @@ public sealed class VfsRewriteTests
         // served content and falls through to MEMFS otherwise.
         // Regression: offline data load silently empty (Exists hit the
         // real disk) after the ExecutablePath null crash was fixed.
-        string input = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\ExamplesProjects\BookShelf\bin\BookShelf.exe");
+        string input = @"E:\AI\Code\WindowsForms\telerik\Telerik UI for WinForms demos\ExamplesProjects\BookShelf\bin\BookShelf.exe";
         if (!File.Exists(input)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"BookShelf_FileOps_{Guid.NewGuid()}.exe");
         try
@@ -226,7 +226,7 @@ public sealed class VfsRewriteTests
         // Regression: ERP Purchases grid silently empty despite 14/14
         // content fetches landing (served transform had zero
         // AppFileSystem refs).
-        string input = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\ExamplesProjects\ERP\ERP.Client\bin\ERP.Repository.dll");
+        string input = @"E:\AI\Code\WindowsForms\telerik\Telerik UI for WinForms demos\ExamplesProjects\ERP\ERP.Client\bin\ERP.Repository.dll";
         if (!File.Exists(input)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"ErpRepo_FileOps_{Guid.NewGuid()}.dll");
         try
@@ -286,7 +286,7 @@ public sealed class VfsRewriteTests
         // path) -> File.ReadAllBytes must consult the VFS registry
         // (Documents/*.pdf staged as content). Regression:
         // AttachInfoControl NRE with no redirect and no staged doc.
-        string input = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release\Telerik.WinControls.PdfViewer.dll");
+        string input = @"E:\AI\Code\WindowsForms\telerik\Telerik UI for WinForms demos\Bin\Release\Telerik.WinControls.PdfViewer.dll";
         if (!File.Exists(input)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"PdfViewer_ReadBytes_{Guid.NewGuid()}.dll");
         try

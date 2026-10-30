@@ -1,10 +1,11 @@
-// Licensed to the .NET Foundation under one or more agreements.
+﻿// Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Drawing;
 using Windows.Win32.Foundation;
 using Windows.Win32.Graphics.Gdi;
 
+using Gfx = System.Drawing.Graphics;
 namespace Windows.Win32
 {
     internal static partial class PInvokeCore
@@ -90,8 +91,87 @@ namespace Windows.Win32
         public const uint DTS_UPDOWN = 0x0001;
         public const uint DTS_TIMEFORMAT = 0x0009;
 
-        public static BOOL DrawFrameControl(HDC hdc, ref RECT lprc, uint uType, uint uState) => (BOOL)true;
-        public static unsafe BOOL DrawFrameControl(HDC hdc, RECT* lprc, uint uType, uint uState) => (BOOL)true;
+        public static BOOL DrawFrameControl(HDC hdc, ref RECT lprc, uint uType, uint uState)
+            => PaintFrameControl(hdc, lprc, uType, uState);
+        public static unsafe BOOL DrawFrameControl(HDC hdc, RECT* lprc, uint uType, uint uState)
+            => lprc is null ? (BOOL)false : PaintFrameControl(hdc, *lprc, uType, uState);
+
+        // Headless DrawFrameControl: classic (non-theme) button frames painted
+        // with Graphics primitives through the HDC target registry (same seam
+        // as WasmFillBridge). Only DFC_BUTTON check/radio marks are emulated;
+        // every other frame type keeps today's silent no-op success so
+        // callers (ControlPaint, renderers) never fail headless.
+        private static BOOL PaintFrameControl(HDC hdc, RECT lprc, uint uType, uint uState)
+        {
+            const uint DFC_BUTTON = 4;
+            if (uType != DFC_BUTTON)
+                return (BOOL)true;
+            uint kind = uState & 0x1Fu;
+            bool isRadio = kind == 0x4u;
+            bool isMixed = kind == 0x8u;
+            if (!isRadio && !isMixed && kind != 0x0u)
+                return (BOOL)true;
+            if (!PInvoke.WasmFillBridge.TryGetTarget(hdc, out Gfx? graphics) || graphics is null)
+                return (BOOL)true;
+            try
+            {
+                Rectangle rect = lprc;
+                if (rect.Width <= 0 || rect.Height <= 0)
+                    return (BOOL)true;
+                bool check = (uState & 0x400u) != 0;
+                bool pushed = (uState & 0x200u) != 0;
+                bool inactive = (uState & 0x100u) != 0;
+                bool flat = (uState & 0x4000u) != 0;
+                bool mono = (uState & 0x8000u) != 0;
+                Color edge = (mono || flat) ? Color.Black : SystemColors.ControlDark;
+                Color face = pushed ? SystemColors.Control : Color.White;
+                Color mark = inactive ? SystemColors.GrayText : Color.Black;
+                using (var back = new SolidBrush(face))
+                using (var edgePen = new Pen(edge))
+                using (var markPen = new Pen(mark, 2))
+                {
+                    if (isRadio)
+                    {
+                        graphics.FillEllipse(back, rect);
+                        graphics.DrawEllipse(edgePen, rect);
+                        if (check)
+                        {
+                            int dx = rect.Width / 4, dy = rect.Height / 4;
+                            using var dot = new SolidBrush(mark);
+                            graphics.FillEllipse(dot, rect.X + dx, rect.Y + dy,
+                                rect.Width - 2 * dx, rect.Height - 2 * dy);
+                        }
+                    }
+                    else
+                    {
+                        graphics.FillRectangle(back, rect);
+                        graphics.DrawRectangle(edgePen, rect.X, rect.Y, rect.Width - 1, rect.Height - 1);
+                        if (check)
+                        {
+                            if (isMixed)
+                            {
+                                int dx = rect.Width / 4, dy = rect.Height / 4;
+                                using var fill = new SolidBrush(mark);
+                                graphics.FillRectangle(fill, rect.X + dx, rect.Y + dy,
+                                    rect.Width - 2 * dx, rect.Height - 2 * dy);
+                            }
+                            else
+                            {
+                                graphics.DrawLine(markPen,
+                                    rect.X + 3, rect.Y + 6, rect.X + 5, rect.Y + 9);
+                                graphics.DrawLine(markPen,
+                                    rect.X + 5, rect.Y + 9, rect.X + 10, rect.Y + 3);
+                            }
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            return (BOOL)true;
+        }
         public static BOOL GetComboBoxInfo(HWND hwndCombo, ref UI.Controls.COMBOBOXINFO pcbi) => (BOOL)false;
         public static BOOL GetComboBoxInfo(ref UI.Controls.COMBOBOXINFO pcbi) => (BOOL)false;
         public static void SetThemeAppProperties(UI.Controls.SET_THEME_APP_PROPERTIES_FLAGS flags) { }

@@ -29,12 +29,23 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 
 DIMENSIONS = ['launch', 'usefulPixels', 'interaction', 'dataOrFileResult',
               'isolation', 'performance', 'backendEvidence']
 VALID = {'passed', 'failed', 'blocked', 'untested'}
 FALLBACK_MARKERS = ('could not create its window', 'could not continue')
+# A passed interaction must prove observed effect, not just a routed
+# click: assertion names carrying these markers, or a detail line with a
+# nonzero changed= count (disabled callbacks / suppressed repaints leave
+# changed=0, which the harness records as a failing assertion).
+EFFECT_MARKERS = ('change', 'restores', 'reveals', 'paints', 'nonblank',
+                  'exact', 'appears', 'acts', 'drains')
+# Broken dependency delivery: the app shell loaded but a managed payload
+# never arrived. Scoped to .dll fetches so transient image/font retries
+# cannot fail a healthy row.
+DELIVERY_MARKERS = ('could not load file or assembly',)
 
 
 def sha(p):
@@ -53,6 +64,29 @@ def read_consoles(row):
             return f.read()
     except OSError:
         return None
+
+
+def delivery_broken(text):
+    """True when consoles show a managed payload fetch/load failure."""
+    if text is None:
+        return False
+    if re.search(r'Failed to fetch.*\.(dll|wasm)', text):
+        return True
+    return any(m in text for m in DELIVERY_MARKERS)
+
+
+def effect_proven(asserts):
+    """True when a passing assertion shows measured effect (name marker
+    or a nonzero changed= count in its detail)."""
+    for a in asserts:
+        if not a.get('ok', False):
+            continue
+        name = a.get('name', '') or ''
+        if any(m in name for m in EFFECT_MARKERS):
+            return True
+        if re.search(r'changed=[1-9]\d*', a.get('detail', '') or ''):
+            return True
+    return False
 
 
 def error_matches(entry, app, err):
@@ -158,6 +192,15 @@ def verify_run(rundir, expect_run=None, expect_rev=None, expect_cases=None,
                 problems.append(f'{rid}: interaction passed without shot evidence')
             if dims.get('usefulPixels') == 'passed' and not shots:
                 problems.append(f'{rid}: usefulPixels passed without shot evidence')
+            if dims.get('interaction') == 'passed' and not effect_proven(asserts):
+                problems.append(f'{rid}: interaction passed without measured effect '
+                                '(need a passing change/exact/changed=N assertion)')
+            for a in asserts:
+                if (a.get('ok', False) and 'change' in (a.get('name', '') or '')
+                        and re.search(r'changed=0\b', a.get('detail', '') or '')):
+                    problems.append(f"{rid}: contradictory assertion {a.get('name')!r} "
+                                    'claims change with changed=0')
+                    break
             text = read_consoles(r)
             if dims.get('launch') == 'passed' and text is not None:
                 for m in FALLBACK_MARKERS:
@@ -169,6 +212,14 @@ def verify_run(rundir, expect_run=None, expect_rev=None, expect_cases=None,
                         if not covered:
                             problems.append(f'{rid}: launch passed on fallback shell ({m!r})')
                         break
+                else:
+                    if delivery_broken(text):
+                        exp = r.get('expectedErrors')
+                        covered = (isinstance(exp, list)
+                                   and any(isinstance(e, dict) and e.get('signature') in text
+                                           for e in exp))
+                        if not covered:
+                            problems.append(f'{rid}: launch passed with broken dependency delivery')
         exp = r.get('expectedErrors', None)
         if isinstance(exp, bool) or (exp is not None and not isinstance(exp, list)):
             problems.append(f'{rid}: expectedErrors must be a list of entries (boolean is not specific)')

@@ -1,4 +1,4 @@
-using System.Reflection;
+﻿using System.Reflection;
 using WfWasm.CanvasHost;
 using WfWasm.Renderer;
 using WfWasm.Shim;

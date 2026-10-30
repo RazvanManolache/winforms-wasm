@@ -331,14 +331,18 @@ public sealed unsafe class CpuPaintCompositeTests
                     0f, 0f, 3f, 3f, true,
                     0f, 0f, 2f, 2f, true,
                     1f, true);
-                // NOTE: DrawBitmap's high bound is ceil-inclusive, so a
-                // 3-wide dest paints x=0..3 (4 px); BlitRaster instead
-                // ends at dx0+ceil(w*sx)-1 (3 px). Pinning actual
-                // behavior here; the 1px extent difference is filed
-                // separately for the coordinator to rule on.
-                for (int y = 0; y < 4; y++)
-                    for (int x = 0; x < 4; x++)
+                // Ruled 2026-10-28 (coordinator): an integral far edge is
+                // exclusive — a 3-wide dest paints x=0..2, matching
+                // BlitRaster's dx0+ceil(w*sx)-1. The old ceil-inclusive
+                // bound smeared a 4th pixel (filed; now fixed).
+                for (int y = 0; y < 3; y++)
+                    for (int x = 0; x < 3; x++)
                         Assert.Equal(0xFF00FF00u, PixelOf(pixels, 4, x, y));
+                for (int i = 0; i < 4; i++)
+                {
+                    Assert.Equal(0u, PixelOf(pixels, 4, 3, i));
+                    Assert.Equal(0u, PixelOf(pixels, 4, i, 3));
+                }
             }
             finally
             {
@@ -456,6 +460,45 @@ public sealed unsafe class CpuPaintCompositeTests
         finally
         {
             CpuPaint.FreeContext(ctx);
+            pin.Free();
+        }
+    }
+
+    // DocumentStrip sgen hunt: the crashing boot paint uploads a 9x7
+    // shadow resource (odd, non-power-of-two, non-multiple-of-4 rows).
+    // Stride/edge math that assumes row padding or aligned widths drops
+    // the last row/column or overruns the source here; assert every one
+    // of the 63 pixels lands and nothing leaks outside the dest rect.
+    [Fact]
+    public void TinySource_Blits_All_Pixels_9x7()
+    {
+        var (ctx, pixels, pin) = MakeBgraTarget(16, 16);
+        try
+        {
+            uint[] sprite = new uint[9 * 7];
+            for (int i = 0; i < sprite.Length; i++) sprite[i] = 0xFF112233u;
+            long bmp = MakeColorBitmap(sprite, 9, 7);
+            try
+            {
+                CpuPaint.DrawBitmap(ctx, bmp,
+                    0f, 0f, 9f, 7f, true,
+                    0f, 0f, 9f, 7f, true,
+                    1f, false);
+                for (int y = 0; y < 7; y++)
+                    for (int x = 0; x < 9; x++)
+                        Assert.Equal(0xFF112233u, PixelOf(pixels, 16, x, y));
+                Assert.Equal(0u, PixelOf(pixels, 16, 9, 0));
+                Assert.Equal(0u, PixelOf(pixels, 16, 0, 7));
+                Assert.Equal(0u, PixelOf(pixels, 16, 15, 15));
+            }
+            finally
+            {
+                CpuPaint.FreeBitmap(bmp);
+                CpuPaint.FreeContext(ctx);
+            }
+        }
+        finally
+        {
             pin.Free();
         }
     }

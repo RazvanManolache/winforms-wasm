@@ -237,4 +237,43 @@ public class CanvasBridgeTests
         Assert.DoesNotContain(json, c => c is PatchBitmapCommand);
         Assert.Single(json);
     }
+
+    [Fact]
+    public void SerializeCommands_ShiftOpShapeCarriesNoPixels()
+    {
+        var recorder = new RecordingRenderer();
+        recorder.ShiftBitmap("L1", 60, -33);
+
+        using var doc = JsonDocument.Parse(CanvasBridge.SerializeCommands(recorder.Commands));
+        JsonElement op = doc.RootElement[0];
+        Assert.Equal(12, op[0].GetInt32());
+        Assert.Equal("L1", op[1].GetString());
+        Assert.Equal(60, op[2].GetInt32());
+        Assert.Equal(-33, op[3].GetInt32());
+        Assert.Equal(4, op.GetArrayLength());
+    }
+
+    [Fact]
+    public void SplitUploads_KeepsShiftBeforePatchInUploadOrder()
+    {
+        // The browser must shift the retained layer BEFORE splicing the
+        // strip; upload order follows command order, so the shift marker
+        // has to split out ahead of the patch.
+        var recorder = new RecordingRenderer();
+        recorder.ShiftBitmap("L1", 60, 0);
+        recorder.PatchBitmap("L1", 0, 0, 60, 240, new byte[60 * 240 * 4]);
+        recorder.BlitBitmap("L1", 0, 0, 320, 240);
+
+        var (json, uploads) = CanvasBridge.SplitUploads(recorder.Commands);
+        Assert.Equal(2, uploads.Count);
+        Assert.True(uploads[0].IsShift);
+        Assert.Equal("L1", uploads[0].LayerId);
+        Assert.Equal(60, uploads[0].Width);
+        Assert.Equal(0, uploads[0].Height);
+        Assert.Empty(uploads[0].Rgba);
+        Assert.True(uploads[1].IsPatch);
+        Assert.DoesNotContain(json, c => c is ShiftBitmapCommand);
+        Assert.DoesNotContain(json, c => c is PatchBitmapCommand);
+        Assert.Single(json);
+    }
 }

@@ -2303,15 +2303,16 @@ namespace System.Drawing
             // origin is ignored (matches the rect cores); multiline
             // blocks align as one block, not per line.
                         ToDevice(layoutRectangle, out float dx, out float dy, out float dw, out float dh);
-            int maxW = dw > 0f ? ClampRasterWidth(dw)
+            int glyphTurns = GetQuarterTurns();
+            // Rotated text (chart axis titles): the rasterizer wraps in device space,
+            // so request the unrotated width (AABB height for +-90-degree turns).
+            float measureW = (glyphTurns == 1 || glyphTurns == 3) ? dh : dw;
+            int maxW = measureW > 0f ? ClampRasterWidth(measureW)
                 : IsDisplay ? 2048  // point layout: unbounded, no CPU target by design
                 : Math.Max(1, _target!.Width - (int)dx);  // CPU path always has a target here
             if (!WrapsText(format))
             maxW = 2048;
             BrowserText.Raster? raster = BrowserText.TryRaster(text, font, DpiY, Math.Min(maxW, 2048));
-            // TEMP-DIAG(headtext): remove after the mosaic root cause lands.
-            if (text == "RGB" || text == "HSV" || text == "OPACITY - ALPHA")
-                System.Console.WriteLine("[D2DTXT] text='" + text + "' raster=" + (raster is null ? "null" : raster.Width + "x" + raster.Height) + " dpi=" + DpiY + " maxW=" + Math.Min(maxW, 2048) + " target=" + (_target is null ? "null" : _target.Width + "x" + _target.Height) + " css=" + BrowserText.ToCss(font, DpiY));
             if (raster is null)
                 throw new NotSupportedException("Browser text raster failed.");
             // GDI+ layout trimming: over-wide single-line text fits to the
@@ -2319,9 +2320,9 @@ namespace System.Drawing
             // has no trim concept; without this, NoClip callers (Telerik
             // grid cells with autoEllipsis) overrun their neighbors.
             if (format is not null && format.Trimming != StringTrimming.None
-                && dw > 0f && !WrapsText(format) && raster.Width > dw)
+                && measureW > 0f && !WrapsText(format) && raster.Width > measureW)
             {
-                string fitted = FitToWidth(text, font, format, dw);
+                string fitted = FitToWidth(text, font, format, measureW);
                 if (fitted.Length == 0)
                     return;
                 if (!ReferenceEquals(fitted, text))
@@ -2339,6 +2340,16 @@ namespace System.Drawing
             Color ink = brush is SolidBrush solid ? solid.Color : ResolveColor(brush, layoutRectangle.X, layoutRectangle.Y);
             int ox = (int)MathF.Round(dx);
             int oy = (int)MathF.Round(dy);
+            if (glyphTurns != 0 && raster is not null)
+            {
+                // Glyph rotation (chart axis titles under RotateTransform): transpose
+                // the raster exactly, then reposition at the mapped layout origin.
+                // ToDevice returns the AABB, whose origin is only correct for
+                // unrotated text. Clip stays the AABB (superset of the true rotated
+                // layout clip; matches the existing rect-core approximation).
+                DevicePoint(new PointF(layoutRectangle.X, layoutRectangle.Y), out float mx, out float my);
+                (raster, ox, oy) = PlaceRotatedRaster(raster, glyphTurns, mx, my);
+            }
             if (dw > 0f && format is not null)
             {
                 ox = format.Alignment switch
@@ -2431,6 +2442,59 @@ namespace System.Drawing
                 TextRasterCounters.NoteDrawTicks(System.Diagnostics.Stopwatch.GetTimestamp() - tDraw0);
         }
 
+            // Pure quarter-turn detection for glyph rotation. Accepts only orthonormal
+            // proper rotations (no scale/shear/reflection) within half a degree of
+            // k*90 degrees; anything else keeps the legacy unrotated behavior. The
+            // common translate-only path exits after one internal matrix check.
+            private int GetQuarterTurns()
+            {
+                if (_transform.IsPureTranslation(out _, out _))
+                    return 0;
+                float[] e = DeviceMatrix().Elements;
+                double det = (double)e[0] * e[3] - (double)e[1] * e[2];
+                if (det < 0.999 || det > 1.001)
+                    return 0;
+                double row = System.Math.Sqrt((double)e[0] * e[0] + (double)e[1] * e[1]);
+                if (row < 0.999 || row > 1.001)
+                    return 0;
+                if (System.Math.Abs(e[3] - e[0]) > 0.01f || System.Math.Abs(e[2] + e[1]) > 0.01f)
+                    return 0;
+                double ang = System.Math.Atan2(e[1], e[0]) * 180.0 / System.Math.PI;
+                int k = (int)System.Math.Round(ang / 90.0);
+                if (System.Math.Abs(ang - k * 90.0) > 0.5)
+                    return 0;
+                return ((k % 4) + 4) % 4;
+            }
+            
+            // Lossless quarter-turn raster rotation (pixel permutation, no resampling
+            // blur) plus blit origin at the mapped layout origin. Glyph hinting stays
+            // in unrotated raster space (documented approximation).
+            private static (BrowserText.Raster raster, int ox, int oy) PlaceRotatedRaster(
+                BrowserText.Raster raster, int turns, float mx, float my)
+            {
+                int w0 = raster.Width, h0 = raster.Height;
+                bool odd = turns == 1 || turns == 3;
+                int w1 = odd ? h0 : w0;
+                int h1 = odd ? w0 : h0;
+                byte[] src = raster.Rgba;
+                byte[] dst = new byte[w1 * h1 * 4];
+                for (int j = 0; j < h0; j++)
+                    for (int i = 0; i < w0; i++)
+                    {
+                        int di, dj;
+                        if (turns == 1) { di = h0 - 1 - j; dj = i; }
+                        else if (turns == 3) { di = j; dj = w0 - 1 - i; }
+                        else { di = w0 - 1 - i; dj = h0 - 1 - j; }
+                        System.Buffer.BlockCopy(src, (j * w0 + i) * 4, dst, (dj * w1 + di) * 4, 4);
+                    }
+                int ox = (int)System.MathF.Round(mx);
+                int oy = (int)System.MathF.Round(my);
+                if (turns == 1) ox -= w1 - 1;
+                else if (turns == 3) oy -= h1 - 1;
+                else { ox -= w1 - 1; oy -= h1 - 1; }
+                return (new BrowserText.Raster(w1, h1, dst), ox, oy);
+            }
+            
         // Binary-search fit for layout trimming (single-line only). Returns the
         // longest display string (with ellipsis where the mode requires it) whose
         // tight width fits maxDeviceW. Measurement is world-space; the layout
@@ -3016,3 +3080,4 @@ namespace System.Drawing
         }
     }
 }
+

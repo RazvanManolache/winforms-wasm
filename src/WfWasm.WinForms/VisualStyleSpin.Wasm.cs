@@ -19,6 +19,12 @@ internal static class VisualStyleSpinPainter
         DrawSpinBackground(renderer, dc, bounds, bounds);
     }
 
+    // NOTE: HWND-tailed DrawBackground(HDC, Rectangle, HWND) sites are
+    // deliberately NOT retargeted: HDC carries no pixels without a Graphics
+    // (the helper would no-op anyway), and any valuetype-exact helper
+    // reference fails to bind headless (interpreter kind-17; DockSample
+    // DummyDoc/DummySolutionExplorer + PDN numerics precedent). The
+    // original stubbed P/Invoke is a safe headless no-op.
     public static void DrawSpinBackground(object? renderer, object? dc, Rectangle bounds, Rectangle clip)
     {
         if (renderer is not VisualStyleRenderer vsr)

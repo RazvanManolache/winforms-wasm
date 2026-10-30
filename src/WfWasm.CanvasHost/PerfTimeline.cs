@@ -64,6 +64,7 @@ public static class PerfTimeline
         public long NRasterRegion { get; set; }
         public long NBlit { get; set; }
         public long NScrollShift { get; set; }
+        public long NSelfPaint { get; set; }
         public long RasterPx { get; set; }
         public long UploadBytes { get; set; }
         public long JsonChars { get; set; }

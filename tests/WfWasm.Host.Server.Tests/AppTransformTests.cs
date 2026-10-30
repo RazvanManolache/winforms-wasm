@@ -99,7 +99,7 @@ public sealed class AppTransformTests
         Assert.True(AppTransform.TryGetSpec("telerik-erp", out AppTransform.AppSpec? maybe));
         Assert.True(maybe is not null);
         var files = maybe!.ContentFiles;
-        string data = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\ExamplesProjects\ERP\ERP.Client\Data");
+        const string data = @"E:\AI\Code\WindowsForms\telerik\Telerik UI for WinForms demos\ExamplesProjects\ERP\ERP.Client\Data";
         string[] onDisk = Directory.GetFiles(data, "*.json");
         foreach (string disk in onDisk)
         {
@@ -109,7 +109,7 @@ public sealed class AppTransformTests
         }
         // rev176 staged the viewer Documents alongside the Data caches;
         // the map must cover both families exactly.
-        string docs = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\ExamplesProjects\ERP\ERP.Client\Documents");
+        const string docs = @"E:\AI\Code\WindowsForms\telerik\Telerik UI for WinForms demos\ExamplesProjects\ERP\ERP.Client\Documents";
         foreach (string pdf in new[] { "Documentation.pdf", "Instructions.pdf" })
         {
             string key = "Documents/" + pdf;
@@ -148,5 +148,22 @@ public sealed class AppTransformTests
         var face = asm.MainModule.GetTypeReferences()
             .First(t => t.FullName == "MS.Internal.Text.TextInterface.FontFace");
         Assert.Equal("DirectWriteForwarder", face.Scope.Name);
+    }
+
+    [Fact]
+    public void Paintnet_MagicScaler_Gets_Full_Rewrite()
+    {
+        // PhotoSauce.MagicScaler must NOT ship verbatim: rewritten PDN
+        // imaging adapters implement its IPixelSource with remapped drawing
+        // types (Rectangle -> WfWasm.Drawing), while a verbatim MagicScaler
+        // keeps System.Drawing.Primitives tokens. The VTable slot then
+        // mismatches and every adapter fails to load headless
+        // (TypeLoadException: VTable setup), blanking all thumbnails.
+        Assert.True(AppTransform.TryGetSpec("paintnet", out AppTransform.AppSpec? maybe));
+        Assert.True(maybe is not null);
+        Assert.DoesNotContain(maybe!.Verbatim, n =>
+            n.Equals("PhotoSauce.MagicScaler.dll", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(maybe.Assemblies, n =>
+            n.Equals("PhotoSauce.MagicScaler.dll", StringComparison.OrdinalIgnoreCase));
     }
 }

@@ -196,13 +196,13 @@ public sealed class RichTextDrawRedirectTests
         // runtime (MissingMethod on desktop, TypeLoad in wasm) even though
         // the metadata looks right. Runs the rules over pristine vendor
         // bytes and JITs the result with the real fork on the load path.
-        string src = TestPaths.Repo(@"external-apps\syncfusion\syncfusion-diagram\Syncfusion.Diagram.Base.dll");
+        string src = @"E:\tmp\wfwasm-syncfusion-apps\syncfusion-diagram\Syncfusion.Diagram.Base.dll";
         string tmp = Path.Combine(Path.GetTempPath(), $"RtfDrawReal_{Guid.NewGuid()}.dll");
         try
         {
             byte[] bytes = File.ReadAllBytes(src);
             using var resolver = new FrameworkResolver(Path.GetDirectoryName(src),
-                [TestPaths.Repo(@".artifacts\runtime"), TestPaths.Repo(@"external-apps\syncfusion\syncfusion-diagram")]);
+                [@"E:\tmp\rewritten-small", @"E:\tmp\wfwasm-syncfusion-apps\syncfusion-diagram"]);
             var readerParams = new ReaderParameters { AssemblyResolver = resolver };
             using (var ms = new MemoryStream(bytes))
             using (var read = AssemblyDefinition.ReadAssembly(ms, readerParams))
@@ -219,8 +219,8 @@ public sealed class RichTextDrawRedirectTests
                 {
                     foreach (string dir in new[]
                     {
-                        TestPaths.Repo(@".artifacts\runtime"),
-                        TestPaths.Repo(@"external-apps\syncfusion\syncfusion-diagram"),
+                        @"E:\tmp\rewritten-small",
+                        @"E:\tmp\wfwasm-syncfusion-apps\syncfusion-diagram",
                     })
                     {
                         string p = Path.Combine(dir, name.Name + ".dll");

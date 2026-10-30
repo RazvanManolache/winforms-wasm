@@ -36,7 +36,9 @@ def good_row(run_id, rev, shot=None, consoles=None, sha=None):
             'status': 'passed',
             'dims': {d: ('passed' if d in ('launch', 'interaction') else 'untested')
                      for d in DIMENSIONS},
-            'assertions': [{'name': 'click:routed', 'ok': True, 'detail': 'hit=Button'}],
+            'assertions': [{'name': 'click:routed', 'ok': True, 'detail': 'hit=Button'},
+                           {'name': 'click:status-pixels-change', 'ok': True,
+                            'detail': 'changed=137'}],
             'artifacts': arts,
             'errors': {'unexpected': [], 'firstChance': 0},
             'untested': []}
@@ -243,6 +245,60 @@ def main():
     d = make_run(tmp, run_id='run19', mutate=fail_row)
     verdict, _ = verify_run(d)
     ok &= check('accept-failed-row-report', verdict)
+    # 20. interaction passed on fixture-only assertions (disabled click
+    # callback / dropped effect check) rejected
+    def fixture_only(r):
+        r['assertions'] = [{'name': 'click:routed', 'ok': True, 'detail': 'hit=Button'}]
+    d = make_run(tmp, run_id='run20', mutate=fixture_only)
+    verdict, _ = verify_run(d)
+    ok &= check('reject-interaction-without-effect', not verdict)
+    # 21. contradictory ok=True with changed=0 rejected (suppressed repaint
+    # presented as a measured change)
+    def zero_change_ok(r):
+        r['assertions'] = [{'name': 'click:status-pixels-change', 'ok': True,
+                            'detail': 'changed=0'}]
+    d = make_run(tmp, run_id='run21', mutate=zero_change_ok)
+    verdict, _ = verify_run(d)
+    ok &= check('reject-contradictory-change', not verdict)
+    # 22. launch passed while a .dll fetch failed rejected (broken
+    # dependency delivery, not a working app)
+    def broken_delivery(r):
+        with open(r['artifacts']['consoles'], 'w') as f:
+            f.write('[log] constructed SmokeForm1\n'
+                    '[error] Failed to fetch WfWasm.WinForms.abc123.wasm\n')
+    d = make_run(tmp, run_id='run22', mutate=broken_delivery)
+    verdict, _ = verify_run(d)
+    ok &= check('reject-broken-delivery', not verdict)
+    # 22b. ... accepted when the delivery failure is a declared expected error
+    def covered_delivery(r):
+        broken_delivery(r)
+        r['expectedErrors'] = [{'app': 'smoke',
+                                'signature': 'WfWasm.WinForms.abc123.wasm'}]
+        r['errors']['unexpected'] = ['Failed to fetch WfWasm.WinForms.abc123.wasm']
+    d = make_run(tmp, run_id='run22b', mutate=covered_delivery)
+    verdict, _ = verify_run(d)
+    ok &= check('accept-covered-delivery', verdict)
+    # 23. two-phase causal chain covered by two narrow entries accepted
+    # (rev290 failed-ctor: form-create TIE wrapper + app-load report)
+    def two_phase_chain(r):
+        r['errors']['unexpected'] = [
+            '[form-create] TargetInvocationException||Exception has been thrown by the target of an invocation.',
+            '[app-load] InvalidOperation||DevExpress demo could not create its real window']
+        r['expectedErrors'] = [
+            {'app': 'smoke', 'phase': 'app-load',
+             'signature': 'could not create its real window'},
+            {'app': 'smoke', 'phase': 'form-create',
+             'signature': 'TargetInvocationException'}]
+    d = make_run(tmp, run_id='run23', mutate=two_phase_chain)
+    verdict, _ = verify_run(d)
+    ok &= check('accept-two-phase-chain', verdict)
+    # 23b. ... but a genuinely new defect next to the chain still rejects
+    def chain_plus_novel(r):
+        two_phase_chain(r)
+        r['errors']['unexpected'].append('[app-load] NullReference||Object reference, fresh defect')
+    d = make_run(tmp, run_id='run23b', mutate=chain_plus_novel)
+    verdict, _ = verify_run(d)
+    ok &= check('reject-novel-beside-chain', not verdict)
     print('selftest: ' + ('ALL GREEN' if ok else 'FAILURES PRESENT'))
     return 0 if ok else 1
 

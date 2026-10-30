@@ -47,6 +47,27 @@ public static unsafe class CpuPaint
     private static T FromHandle<T>(long handle) where T : class
         => (T)GCHandle.FromIntPtr((IntPtr)handle).Target!;
 
+    // Fail-closed handle resolution (finalizer hardening): a scratch
+    // handle goes stale when one path frees it and the command-list
+    // finalizer (or a late take) reaps it again, and GCHandle slots
+    // recycle numerically, so a stale value can alias a live foreign
+    // object. A throw — or a foreign hit — out of FromHandle on the
+    // finalizer thread is a fatal host exit (CpuCommandList.Finalize ->
+    // FreeScratchTarget -> TargetOf, dump-proven), so the
+    // finalizer-reached lookup answers null and callers skip instead.
+    // Loud FromHandle stays for bitmap paths whose tests pin throwing.
+    private static T? TryFromHandle<T>(long handle) where T : class
+    {
+        try
+        {
+            return GCHandle.FromIntPtr((IntPtr)handle).Target as T;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private static void FreeHandle(long handle)
     {
         // Fail closed on scratch IDs (negative): they are owned by the
@@ -54,7 +75,10 @@ public static unsafe class CpuPaint
         // a GCHandle would corrupt an unrelated slot.
         if (handle <= 0)
             return;
-        GCHandle.FromIntPtr((IntPtr)handle).Free();
+        // Fail-closed (planter hunt Hole B): a double-free must skip, never
+        // throw — a throw on the finalizer thread is a fatal exit.
+        try { GCHandle.FromIntPtr((IntPtr)handle).Free(); }
+        catch { return; }
     }
 
     // rev204: target operands arrive as raw handles or scratch IDs.
@@ -71,10 +95,10 @@ public static unsafe class CpuPaint
             lock (s_cmdListLock)
             {
                 return s_scratchMap.TryGetValue(v, out long h)
-                    ? FromHandle<Target>(h) : null;
+                    ? TryFromHandle<Target>(h) : null;
             }
         }
-        return FromHandle<Target>(v);
+        return TryFromHandle<Target>(v);
     }
 
     public static long CreateContext(IntPtr target, int width, int height, int stride)
@@ -212,6 +236,816 @@ public static unsafe class CpuPaint
         return f?.GetValue(scaled);
     }
 
+    // Nullable<T> generic-instantiation member calls (get_Value /
+    // get_HasValue) trip the same Mono kind-17 load failure as the
+    // ScaledResource getters above (PdnToolBar glass background reads
+    // WindowColorizationInfo? mid-paint). The rewriter boxes the value
+    // first: boxing a Nullable<T> yields null or the boxed inner value,
+    // so the helpers below carry no generic token at any boundary.
+    public static object NullableValue(object boxed)
+    {
+        return boxed;
+    }
+
+    public static bool NullableHasValue(object boxed)
+    {
+        return boxed != null;
+    }
+
+    // Nullable<T>.GetValueOrDefault() (parameterless) on concrete
+    // instantiations trips the same headless load failure; the one-arg
+    // overload is left alone. The box already unwrapped the Nullable
+    // (null or the boxed inner value), so a null box means default(T):
+    // boxed default for value types, null for reference types. Carries
+    // no generic token at any boundary.
+    public static object NullableValueOrDefault(object boxed, Type type)
+    {
+        if (boxed != null) return boxed;
+        return type.IsValueType ? Activator.CreateInstance(type) : null;
+    }
+
+    // LayersStrip/ImageStrip shadow-cache side table (rev258 REAL FIX):
+    // Dictionary<SizeInt32,DeviceBitmap>.Add throws InvalidCastException
+    // under the browser interpreter (kind-17 instantiation of the
+    // value-type key), and the failed attempt tears the table internals
+    // (Insert/Find disagree; the next 16x16 DRAWIMG reads a torn buffer
+    // -> wasm OOB trap -> session death). The PDN dict is therefore never
+    // mutated at these sites: Add-if-absent appends here, Get consults
+    // here first, Clear evicts. Keyed by dict reference + Equals;
+    // FIFO-capped (shadow caches hold a handful of 16x16s). Populated
+    // ONLY via DictTryAddValue, which is retarget-scoped to the two
+    // shadow sites, so global Get behavior for every other dictionary
+    // is unchanged.
+    private sealed class ShadowEntry
+    {
+        public object Dict;
+        public object Key;
+        public object Value;
+    }
+    private static readonly System.Collections.Generic.List<ShadowEntry> s_shadowCache =
+        new System.Collections.Generic.List<ShadowEntry>();
+    private static readonly object s_shadowGate = new object();
+    private const int ShadowCacheCap = 512;
+
+    // Evicts every side-table entry for one dict (retargeted from the
+    // shadow-cache Clear sites: ClearDropShadowDeviceBitmapCache,
+    // OnDispose, OnThemeConfigChanged). Void: replaces callvirt Clear
+    // with no stack residue.
+    public static void DictShadowClear(object dict)
+    {
+        if (dict == null) return;
+        lock (s_shadowGate)
+        {
+            for (int i = s_shadowCache.Count - 1; i >= 0; i--)
+            {
+                if (object.ReferenceEquals(s_shadowCache[i].Dict, dict))
+                    s_shadowCache.RemoveAt(i);
+            }
+        }
+    }
+
+    // Deterministic thumbnail delivery (rev264 REAL FIX): the queue tail
+    // calls RenderThreadLoop synchronously per enqueue, but nothing drains
+    // headless except the timing-dependent threadpool post pump -- so
+    // delivery is accidental (blank strips) and occasionally fatal (a null
+    // bitmap delivered when the pump happens to fire). This wrapper renders
+    // AND drains inline with a re-entrancy guard: nested tail calls
+    // (handler -> re-queue) return immediately and the outer pass picks
+    // re-queued items up, so nesting depth is 1 and the pass terminates
+    // when the queue empties. Reflection keeps PDN types out of this
+    // assembly (boundary stays object-typed); per-item cost is a handful
+    // of enqueues per boot plus interactions.
+    // Thumbnail queue handler construction (rev265 REAL FIX): the strip
+    // queue sites build ValueEventHandler<T> via newobj in IL, which
+    // throws InvalidProgramException under the browser interpreter when
+    // the closed instantiation is not already loaded (boot-order
+    // dependent: the same IL succeeds on other boots). The rewriter
+    // replaces the newobj + manager call with this helper: the delegate
+    // is built via reflection (no generic tokens in IL) and the manager
+    // call is dispatched the same way. Upstream catches a construction
+    // failure the same way it catches the IPE (first-chance + continue),
+    // so behavior on failure is unchanged; on success queueing works.
+    public static void QueueThumbnail(object manager, object provider, int size, object target, string methodName)
+    {
+        if (manager == null) throw new ArgumentNullException("manager");
+        if (provider == null) throw new ArgumentNullException("provider");
+        if (size < 1) throw new ArgumentOutOfRangeException("size");
+        if (target == null) throw new ArgumentNullException("target");
+        if (string.IsNullOrEmpty(methodName)) throw new ArgumentNullException("methodName");
+        const System.Reflection.BindingFlags bf = System.Reflection.BindingFlags.Instance
+            | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+        var t = manager.GetType();
+        // The 3-arg manager call itself cannot be reflection-Invoked
+        // headless: its closed-delegate parameter needs a valuetype-
+        // involving instantiation stub the interpreter cannot build
+        // (InvalidProgramException). Replicate its body with non-generic
+        // operations only: the queue item is a NON-generic nested class,
+        // so it is allocated without its constructor and its auto-property
+        // backing fields are assigned directly (same values the .ctor
+        // computes, including the UtcNow stamp). Dedup (RemoveFromQueue +
+        // back-replace) is skipped: the deterministic drain empties the
+        // queue every pass, so duplicates only cost a render.
+        var itemType = t.GetNestedType("ThumbnailQueueItem", bf);
+        if (itemType == null) throw new InvalidOperationException("thumbnail queue item missing");
+        var queueM = t.GetMethod("QueueThumbnailUpdate", bf);
+        var dt = queueM == null ? null : queueM.GetParameters()[2].ParameterType;
+        var mi = target.GetType().GetMethod(methodName, bf);
+        if (queueM == null || dt == null || mi == null)
+            throw new InvalidOperationException("thumbnail queue entry points missing");
+        var handler = System.Delegate.CreateDelegate(dt, target, mi);
+        System.Console.WriteLine("[QUEUE-H] " + provider.GetType().FullName + " size=" + size);
+        ProbeAdapterLoads();
+        var item = System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(itemType);
+        SetQueueItemField(item, "<Provider>k__BackingField", provider);
+        SetQueueItemField(item, "<Callback>k__BackingField", handler);
+        SetQueueItemField(item, "<SideLength>k__BackingField", size);
+        SetQueueItemField(item, "<EnqueueTimeUtc>k__BackingField", System.DateTime.UtcNow);
+        var qfield = t.GetField("renderQueue", bf);
+        var ulockfield = t.GetField("updateLock", bf);
+        if (qfield == null || ulockfield == null)
+            throw new InvalidOperationException("thumbnail queue fields missing");
+        var ulock = ulockfield.GetValue(manager);
+        var q = qfield.GetValue(manager);
+        System.Reflection.MethodInfo enq = null;
+        if (q != null)
+        {
+            foreach (var em in q.GetType().GetMethods(bf))
+            {
+                var ps = em.GetParameters();
+                if (em.Name == "Enqueue" && ps.Length == 1 && ps[0].ParameterType.IsAssignableFrom(itemType)) { enq = em; break; }
+            }
+        }
+        if (ulock == null || q == null || enq == null)
+            throw new InvalidOperationException("thumbnail queue not ready");
+        lock (ulock)
+        {
+            enq.Invoke(q, new object[] { item });
+            System.Threading.Monitor.Pulse(ulock);
+        }
+        // Deterministic delivery: the manager 3-arg method is bypassed,
+        // so its queue tail (render+drain) never runs. Drive the pass
+        // here instead; the re-entrancy guard inside makes nested
+        // handler re-queues return immediately while the outer pass picks
+        // them up.
+        RenderAndDrainInline(manager);
+    }
+
+    private static void SetQueueItemField(object item, string name, object value)
+    {
+        const System.Reflection.BindingFlags bf = System.Reflection.BindingFlags.Instance
+            | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+        var f = item.GetType().GetField(name, bf);
+        if (f == null) throw new InvalidOperationException("thumbnail queue item field missing: " + name);
+        f.SetValue(item, value);
+    }
+
+    private static int s_probedLoads;
+    // One-shot in-vivo loader matrix for the MagicScaler adapter chain
+    // (rev266 VTable hunt). Runs once per session from QueueThumbnail;
+    // each line names the outcome so loader failures attribute to a
+    // single type shape. Pinned by ProbeAdapterLoadsTests; keep quiet
+    // and one-shot.
+    public static void ProbeAdapterLoads()
+    {
+        if (System.Threading.Interlocked.Exchange(ref s_probedLoads, 1) != 0) return;
+        string[] names = new string[]
+        {
+            "PaintDotNet.Disposable",
+            "PaintDotNet.Imaging.IColorProfile",
+            "PaintDotNet.Rendering.RectInt32",
+            "PhotoSauce.MagicScaler.IPixelSource",
+            "PaintDotNet.Imaging.BitmapSourceAsPixelSource",
+            "PaintDotNet.Imaging.PixelSourceClipper",
+            "PaintDotNet.Imaging.PerThreadPixelSource",
+            "PaintDotNet.Imaging.PixelSourceExtensions/CancellablePixelSource",
+            "PaintDotNet.Imaging.SandwichBufferedPixelSource/SourceBuffer",
+            "PhotoSauce.MagicScaler.Transforms.ConvolverBgraByte",
+            "PhotoSauce.MagicScaler.NoopMetadataSource",
+            "PhotoSauce.MagicScaler.Interpolators.PointInterpolator",
+            "System.Collections.Generic.List`1[[System.String]]",
+        };
+        foreach (string name in names)
+        {
+            System.Type found = null;
+            foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try { found = asm.GetType(name, false, false); } catch { found = null; }
+                if (found != null) break;
+            }
+            if (found == null) { System.Console.WriteLine("[PROBE-T] " + name + " gettype=NULL"); continue; }
+            if (found.IsInterface || found.IsAbstract) { System.Console.WriteLine("[PROBE-T] " + name + " gettype=OK kind=iface-or-abstract"); continue; }
+            try
+            {
+                System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(found);
+                System.Console.WriteLine("[PROBE-T] " + name + " gettype=OK alloc=OK");
+            }
+            catch (System.Exception ex) { System.Console.WriteLine("[PROBE-T] " + name + " gettype=OK alloc=FAIL-" + ex.GetType().Name); }
+        }
+    }
+    private static System.Reflection.BindingFlags s_invokeFlags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+    // The ready-handler Invoke in DrainThumbnailReadyInvokeList goes through
+    // a closed ValueEventHandler<T> token the interpreter cannot JIT
+    // (kind-17 IPE). Invoke it via reflection instead (the interpreter
+    // path all our other entry points use): same (handler, sender, args).
+    public static void InvokeReadyHandler(object handler, object sender, object args)
+    {
+        try
+        {
+            if (handler == null) throw new ArgumentNullException("handler");
+            if (IsNullThumbnailBitmap(args))
+            {
+                System.Console.WriteLine("[DRAIN] skip null-bitmap item");
+                return;
+            }
+            var invoke = handler.GetType().GetMethod("Invoke", s_invokeFlags);
+            if (invoke == null) throw new InvalidOperationException("ready handler has no Invoke");
+            invoke.Invoke(handler, new object[] { sender, args });
+        }
+        catch (System.Exception dx)
+        {
+            System.Console.WriteLine("[DRAIN] helper-throw " + dx.GetType().FullName + ": " + dx.Message);
+            var ix = dx.InnerException; int dd = 0;
+            while (ix != null && dd < 3)
+            {
+                System.Console.WriteLine("[DRAIN] helper-inner" + dd + " " + ix.GetType().FullName + ": " + ix.Message);
+                ix = ix.InnerException; dd++;
+            }
+            throw;
+        }
+    }
+    // Permanent null-bitmap guard for the thumbnail drain (desktop never
+    // produces null thumbs; a headless render failure does, and delivering
+    // it killed the session). Reflection-only: PDN assemblies load
+    // dynamically, so no static PDN types here. Fail-closed (skip) on any
+    // anomaly: a skipped thumb is a blank strip, a throw kills delivery.
+    // Called from rewritten PDN IL with the ready-event-args object; the
+    // rule keeps every generic token pristine and routes only this
+    // object-typed check through here (a closed-instantiation member
+    // access in PDN IL fails Mono verification: rev268 entry IPE).
+    public static bool IsNullThumbnailBitmap(object args)
+    {
+        try
+        {
+            if (args is null) return true;
+            var value = args.GetType().GetProperty("Value")?.GetValue(args);
+            if (value is null) return true;
+            var item2 = value.GetType().GetField("Item2")?.GetValue(value);
+            return item2 is null;
+        }
+        catch { return true; }
+    }
+    // Branch-free disposal for the thumbnail drain: the args object is
+    // the closed ValueEventArgs instantiation, so the bitmap fetch and
+    // both disposals go through reflection (a closed-instantiation member
+    // access or a forward skip-branch in PDN IL fails Mono verification:
+    // rev268 entry IPE). Null bitmaps need no bitmap dispose but the
+    // pooled args are still returned. Fail-open: delivery already ran.
+    public static void DisposeThumbnailItem(object args)
+    {
+        try
+        {
+            if (args is null) return;
+            var value = args.GetType().GetProperty("Value")?.GetValue(args);
+            if (value is null) return;
+            if (value.GetType().GetField("Item2")?.GetValue(value) is IDisposable bmp)
+            {
+                try { bmp.Dispose(); } catch { }
+            }
+            var disp = args.GetType().GetMethod("Dispose", s_invokeFlags, null, Type.EmptyTypes, null);
+            try { disp?.Invoke(args, null); } catch { }
+        }
+        catch { }
+    }
+    private static int GetReadyCount(System.Type t, object manager, System.Reflection.BindingFlags bf)
+    {
+        try
+        {
+            var f = t.GetField("thumbnailReadyInvokeList", bf);
+            var v = f == null ? null : f.GetValue(manager);
+            var c = v as System.Collections.ICollection;
+            if (c != null) return c.Count;
+            var p = v == null ? null : v.GetType().GetProperty("Count");
+            var o = p == null ? null : p.GetValue(v, null);
+            return o is int n ? n : -1;
+        }
+        catch { return -2; }
+    }
+    private static int s_renderDepth;
+    public static void RenderAndDrainInline(object manager)
+    {
+        if (manager == null) throw new ArgumentNullException("manager");
+        if (s_renderDepth != 0) return;
+        s_renderDepth = 1;
+        try
+        {
+            var t = manager.GetType();
+            const System.Reflection.BindingFlags bf = System.Reflection.BindingFlags.Instance
+                | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+            var loop = t.GetMethod("RenderThreadLoop", bf, null, System.Type.EmptyTypes, null);
+            var drain = t.GetMethod("DrainThumbnailReadyInvokeList", bf, null, System.Type.EmptyTypes, null);
+            var qpeek = t.GetField("renderQueue", bf);
+            var qpeekv = qpeek == null ? null : qpeek.GetValue(manager) as System.Collections.ICollection;
+            System.Console.WriteLine("[DRAIN] inline pass depth=" + (qpeekv == null ? -1 : qpeekv.Count));
+            var qfield = t.GetField("renderQueue", bf);
+            var q = qfield == null ? null : (System.Collections.ICollection)qfield.GetValue(manager);
+            if (loop == null || drain == null || q == null)
+                throw new InvalidOperationException("render inline entry points missing");
+            int guard = 0;
+            System.Console.WriteLine("[DRAIN] inline begin depth=" + q.Count + " readyBefore=" + GetReadyCount(t, manager, bf));
+            while (q.Count > 0 && guard++ < 10000)
+            {
+                try { loop.Invoke(manager, null); }
+                catch (System.Exception ex)
+                {
+                    string s = ex.ToString();
+                    System.Console.WriteLine("[DRAIN] render-throw " + (s.Length > 2000 ? s.Substring(0, 2000) : s));
+                    throw;
+                }
+                try { drain.Invoke(manager, null); }
+                catch (System.Exception ex)
+                {
+                    string s = ex.ToString();
+                    System.Console.WriteLine("[DRAIN] drain-throw " + (s.Length > 2000 ? s.Substring(0, 2000) : s));
+                    throw;
+                }
+                if (guard == 1) System.Console.WriteLine("[DRAIN] inline iter readyAfter=" + GetReadyCount(t, manager, bf) + " remaining=" + q.Count);
+            }
+            System.Console.WriteLine("[DRAIN] inline end iters=" + guard + " remaining=" + q.Count + " readyAfter=" + GetReadyCount(t, manager, bf));
+        }
+        finally { s_renderDepth = 0; }
+    }
+
+    // Dictionary<K,V>.TryGetValue trips the same Mono kind-17 load
+    // failure on at least one live instantiation
+    // (Dictionary<Control,int> in UIHelpers reentrancy guard: every PDN
+    // boot painted around it). Route through non-generic IDictionary:
+    // same contract (missing key reads default + false; null key throws
+    // ArgumentNullException like the BCL), no generic token at any
+    // boundary. The out slot is object-typed at the boundary; the rule
+    // unboxes to V past the (already present) true-branch.
+    public static bool DictTryGetValue(object dict, object key, out object value)
+    {
+        if (key == null) throw new ArgumentNullException("key");
+        lock (s_shadowGate)
+        {
+            foreach (ShadowEntry e in s_shadowCache)
+            {
+                if (object.ReferenceEquals(e.Dict, dict) && object.Equals(e.Key, key))
+                {
+                    value = e.Value;
+                    return true;
+                }
+            }
+        }
+        var d = (System.Collections.IDictionary)dict;
+        if (d.Contains(key)) { value = d[key]; return true; }
+        // Fallback linear scan: value-type-key Find mis-evaluates under the
+        // browser interpreter (hash Find misses while Insert still detects
+        // the duplicate - observed live as the LayersStrip shadow-cache
+        // Key:50,50 dup-Add on every render). The scan bypasses the broken
+        // hash path using Equals; it only runs on hash-miss, so hot hits
+        // pay nothing. A true miss scans to the end and stays false.
+        foreach (System.Collections.DictionaryEntry e in d)
+        {
+            if (object.Equals(e.Key, key)) { value = e.Value; return true; }
+        }
+        value = null;
+        return false;
+    }
+
+    // Add-if-absent with the same scan fallback: returns false instead of
+    // throwing when the key is already present. Narrow-scope companion to
+    // DictTryGetValue for caches the interpreter Find cannot see
+    // (LayersStrip/ImageStrip shadow bitmap caches).
+    public static bool DictTryAddValue(object dict, object key, object value)
+    {
+        if (key == null) throw new ArgumentNullException("key");
+        var d = (System.Collections.IDictionary)dict;
+        lock (s_shadowGate)
+        {
+            foreach (ShadowEntry e in s_shadowCache)
+            {
+                if (object.ReferenceEquals(e.Dict, dict) && object.Equals(e.Key, key))
+                    return false;
+            }
+        }
+        if (d.Contains(key)) return false;
+        foreach (System.Collections.DictionaryEntry e in d)
+        {
+            if (object.Equals(e.Key, key)) return false;
+        }
+        // Generic Dictionary<K,V> tables are interpreter-untrustworthy
+        // for these K/V (a throwing Add tears Insert/Find agreement and
+        // the next thumbnail DRAWIMG OOBs): carry the entry in the side
+        // table and never mutate the PDN dict. Non-generic tables keep
+        // the direct Add.
+        if (dict.GetType().IsGenericType)
+        {
+            lock (s_shadowGate)
+            {
+                foreach (ShadowEntry e in s_shadowCache)
+                {
+                    if (object.ReferenceEquals(e.Dict, dict) && object.Equals(e.Key, key))
+                        return false;
+                }
+                if (s_shadowCache.Count >= ShadowCacheCap) s_shadowCache.RemoveAt(0);
+                s_shadowCache.Add(new ShadowEntry { Dict = dict, Key = key, Value = value });
+            }
+            return true;
+        }
+        d.Add(key, value);
+        return true;
+    }
+
+    // Setting<TValue>.OnValidateValueT trips the same Mono
+    // interpreter failure as the other value-type-instantiation
+    // families: the (trivial, 2-instruction) virtual dispatch itself
+    // throws InvalidProgramException on instantiations like
+    // Setting<FormWindowState>, killing MainForm..ctor via
+    // AppSettings validation. The type instantiates fine and
+    // unbox.any TValue executes fine; only the direct callvirt on
+    // the value-type instantiation fails. Route through a
+    // non-generic boundary carrying (setting, boxedValue) as
+    // objects and dispatch through reflection (the
+    // MethodBaseInvoker path executes headless; direct callvirt
+    // does not). Fail-open (accept): a validation hiccup must
+    // never kill boot; validation only rejects bad input.
+    private static readonly System.Collections.Generic.Dictionary<Type, System.Reflection.MethodInfo> s_validateCache
+        = new System.Collections.Generic.Dictionary<Type, System.Reflection.MethodInfo>();
+
+    // Same deterministic-throw skip as s_converterSkipValidation, for the
+    // Setting<TValue>.OnValidateValueT path.
+    private static readonly System.Collections.Generic.HashSet<Type> s_validateSkipT
+        = new System.Collections.Generic.HashSet<Type>();
+
+    // The interpreter throws InvalidProgramException directly out of the
+    // generated invoke stub (the override never starts); desktop reflection
+    // wraps the override's own throw in TargetInvocationException. Both
+    // shapes mean the same thing: this validator cannot execute here, ever.
+    private static bool IsUnrunnableValidator(System.Exception ex) =>
+        ex is System.InvalidProgramException
+        || (ex is System.Reflection.TargetInvocationException tie
+            && tie.InnerException is System.InvalidProgramException);
+
+    // EqualityComparer<TValue> members trip the same interpreter
+    // failure on value-type TValue: the static get_Default() itself
+    // throws InvalidProgramException (touch-attributed:
+    // Setting`1::OnGetStaticEqualityComparer@0000 is the last print
+    // before Setting.Initialize dies in ScalarSetting/DoubleSetting
+    // construction), and the Equals/GetHashCode virtuals on the
+    // resulting comparer would throw the same way. All three route
+    // through non-generic boundaries carrying only objects (plus a
+    // System.Type for the static factory) and dispatch via reflection.
+    // Equals falls back to object.Equals and GetHashCode to the
+    // value's own override when the comparer cannot be reached, which
+    // matches Default-comparer semantics for the value types PDN
+    // settings use (including NaN-equals-NaN for doubles).
+    private static readonly System.Collections.Generic.Dictionary<Type, object> s_comparerCache
+        = new System.Collections.Generic.Dictionary<Type, object>();
+
+    public static object SettingEqualityComparer(Type valueType)
+    {
+        try
+        {
+            if (valueType is null)
+                return null!;
+            lock (s_comparerCache)
+            {
+                if (s_comparerCache.TryGetValue(valueType, out object? cached))
+                    return cached!;
+            }
+            object? comparer = typeof(System.Collections.Generic.EqualityComparer<>)
+                .MakeGenericType(valueType)
+                .GetProperty("Default",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)!
+                .GetValue(null);
+            if (comparer is null)
+                return null!;
+            lock (s_comparerCache)
+                s_comparerCache[valueType] = comparer;
+            return comparer;
+        }
+        catch
+        {
+            return null!;
+        }
+    }
+
+    private static readonly System.Collections.Generic.Dictionary<Type, System.Reflection.MethodInfo> s_comparerEqualsCache
+        = new System.Collections.Generic.Dictionary<Type, System.Reflection.MethodInfo>();
+
+    public static bool SettingComparerEquals(object comparer, object a, object b)
+    {
+        try
+        {
+            if (comparer is null)
+                return object.Equals(a, b);
+            Type t = comparer.GetType();
+            System.Reflection.MethodInfo? m;
+            lock (s_comparerEqualsCache)
+                s_comparerEqualsCache.TryGetValue(t, out m);
+            if (m is null)
+            {
+                foreach (var cand in t.GetMethods(
+                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public))
+                {
+                    if (cand.Name == "Equals" && cand.GetParameters().Length == 2)
+                    {
+                        m = cand;
+                        break;
+                    }
+                }
+                if (m is null)
+                    return object.Equals(a, b);
+                lock (s_comparerEqualsCache)
+                    s_comparerEqualsCache[t] = m;
+            }
+            return (bool)m.Invoke(comparer, new object?[] { a, b })!;
+        }
+        catch
+        {
+            return object.Equals(a, b);
+        }
+    }
+
+    private static readonly System.Collections.Generic.Dictionary<Type, System.Reflection.MethodInfo> s_comparerHashCache
+        = new System.Collections.Generic.Dictionary<Type, System.Reflection.MethodInfo>();
+
+    public static int SettingComparerHash(object comparer, object x)
+    {
+        try
+        {
+            if (comparer is null)
+                return x is null ? 0 : x.GetHashCode();
+            Type t = comparer.GetType();
+            System.Reflection.MethodInfo? m;
+            lock (s_comparerHashCache)
+                s_comparerHashCache.TryGetValue(t, out m);
+            if (m is null)
+            {
+                foreach (var cand in t.GetMethods(
+                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public))
+                {
+                    if (cand.Name == "GetHashCode" && cand.GetParameters().Length == 1)
+                    {
+                        m = cand;
+                        break;
+                    }
+                }
+                if (m is null)
+                    return x is null ? 0 : x.GetHashCode();
+                lock (s_comparerHashCache)
+                    s_comparerHashCache[t] = m;
+            }
+            return (int)m.Invoke(comparer, new object?[] { x })!;
+        }
+        catch
+        {
+            return x is null ? 0 : x.GetHashCode();
+        }
+    }
+
+    // Setting<TValue>.OnGetStaticEqualityComparer is virtual-but-never-
+    // overridden (verified: zero overrides in the shipped assemblies);
+    // its body is just the (now rerouted) get_Default. The .ctor's
+    // callvirt to it on a value-type instantiation throws the same
+    // InvalidProgram, so it routes through here and dispatches via
+    // reflection like OnValidateValueT.
+    private static readonly System.Collections.Generic.Dictionary<Type, System.Reflection.MethodInfo> s_getComparerCache
+        = new System.Collections.Generic.Dictionary<Type, System.Reflection.MethodInfo>();
+
+    public static object SettingGetComparer(object setting)
+    {
+        try
+        {
+            if (setting is null)
+                return null!;
+            Type t = setting.GetType();
+            System.Reflection.MethodInfo? m;
+            lock (s_getComparerCache)
+                s_getComparerCache.TryGetValue(t, out m);
+            if (m is null)
+            {
+                m = t.GetMethod("OnGetStaticEqualityComparer",
+                    System.Reflection.BindingFlags.Instance
+                    | System.Reflection.BindingFlags.Public
+                    | System.Reflection.BindingFlags.NonPublic);
+                if (m is null)
+                    return null!;
+                lock (s_getComparerCache)
+                    s_getComparerCache[t] = m;
+            }
+            return m.Invoke(setting, new object[0])!;
+        }
+        catch
+        {
+            return null!;
+        }
+    }
+
+    // SettingConverter.OnValidateValue(Type, object) is virtual; the
+    // scalar converters inherit the SettingConverter<TValue> override.
+    // A base-typed callvirt (static token clean, so no touch can ever
+    // attribute it) that dispatches to the override on a value-type
+    // instantiation throws InvalidProgramException in the browser
+    // interpreter — the override never starts (verified: its body is
+    // now only the rev219 helper call, and no touch from inside it
+    // ever prints). Route through here and dispatch via reflection.
+    private static readonly System.Collections.Generic.Dictionary<Type, System.Reflection.MethodInfo> s_converterValidateCache
+        = new System.Collections.Generic.Dictionary<Type, System.Reflection.MethodInfo>();
+
+    // Converters whose OnValidateValue override throws InvalidProgramException
+    // in the browser interpreter (generic value-type instantiation invoke
+    // stubs, e.g. SettingConverter<TValue>.OnValidateValue): the throw is
+    // deterministic per converter type, so remember it and stop re-invoking.
+    // Behavior is unchanged (fail-open accept either way); this only kills
+    // the per-validation first-chance noise + inventory spam.
+    private static readonly System.Collections.Generic.HashSet<Type> s_converterSkipValidation
+        = new System.Collections.Generic.HashSet<Type>();
+
+    // Assembly-wide converter pre-skip (fail-open): executing a
+    // SettingConverter<TValue> override on a value-type instantiation
+    // can kill the session headless — the interpreter failure
+    // sometimes surfaces as catchable InvalidProgramException
+    // (remembered above) and sometimes as an uncatchable frameless
+    // NullReferenceException that exits the runtime with no managed
+    // frames. Validation is a bool accept/reject predicate and PDN
+    // treats accept as the normal path, so skipping it entirely is
+    // behavior-safe and removes the roulette: no converter body ever
+    // executes. Pre-skip runs per assembly at load (AssemblyLoad
+    // event, so late effect-discovery loads are covered before first
+    // validation) plus one immediate sweep of already-loaded
+    // assemblies on first validation call.
+    private static readonly System.Collections.Generic.HashSet<string> s_converterScannedAssemblies
+        = new System.Collections.Generic.HashSet<string>(System.StringComparer.Ordinal);
+    private static int s_converterPreskipHooked;
+
+    public static void PreSkipConvertersIn(System.Reflection.Assembly? asm)
+    {
+        if (asm is null) return;
+        string name;
+        try { name = asm.FullName ?? ""; } catch { return; }
+        if (name.Length == 0) return;
+        lock (s_converterValidateCache)
+        {
+            if (!s_converterScannedAssemblies.Add(name)) return;
+        }
+        System.Collections.Generic.List<Type> found;
+        try
+        {
+            System.Type[] types;
+            try { types = asm.GetTypes(); }
+            catch (System.Reflection.ReflectionTypeLoadException ex)
+            {
+                types = ex.Types.Where(tt => tt is not null).ToArray()!;
+            }
+            found = new System.Collections.Generic.List<Type>();
+            foreach (System.Type t in types)
+            {
+                if (t is null || t.IsAbstract || t.IsInterface) continue;
+                System.Type? b = null;
+                try { b = t.BaseType; } catch { continue; }
+                while (b is not null)
+                {
+                    string? bn = null;
+                    try { bn = b.FullName; } catch { break; }
+                    if (bn == "PaintDotNet.Settings.SettingConverter") break;
+                    try { b = b.BaseType; } catch { b = null; }
+                }
+                if (b is null) continue;
+                found.Add(t);
+            }
+        }
+        catch { return; }
+        if (found.Count == 0) return;
+        lock (s_converterValidateCache)
+        {
+            foreach (System.Type t in found)
+                s_converterSkipValidation.Add(t);
+        }
+        try { System.Console.WriteLine("[PRE-SKIP] converters " + found.Count + " in " + asm.GetName().Name); } catch { }
+    }
+
+    private static void EnsureConverterPreskipHook()
+    {
+        if (System.Threading.Interlocked.Exchange(ref s_converterPreskipHooked, 1) != 0) return;
+        try
+        {
+            System.AppDomain.CurrentDomain.AssemblyLoad += (s, e) =>
+            {
+                try { PreSkipConvertersIn(e.LoadedAssembly); } catch { }
+            };
+        }
+        catch { }
+        try
+        {
+            foreach (System.Reflection.Assembly a in System.AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try { PreSkipConvertersIn(a); } catch { }
+            }
+        }
+        catch { }
+    }
+
+    public static bool SettingConverterValidateValue(object converter, Type valueType, object value)
+    {
+        try { EnsureConverterPreskipHook(); } catch { }
+        try
+        {
+            if (converter is null)
+                return true;
+            Type t = converter.GetType();
+            System.Reflection.MethodInfo? m;
+            // Generic-definition normalization: the pre-skip sweep sees
+            // definitions (ParsableValueSettingConverter`1) while runtime
+            // hands us instantiations (...<BrushInfo>); match either so
+            // no instantiation ever executes headless.
+            Type skipKey = t;
+            try { if (t.IsGenericType) skipKey = t.GetGenericTypeDefinition(); } catch { }
+            lock (s_converterValidateCache)
+            {
+                if (s_converterSkipValidation.Contains(t) || s_converterSkipValidation.Contains(skipKey))
+                    return true;
+                s_converterValidateCache.TryGetValue(t, out m);
+            }
+            if (m is null)
+            {
+                m = t.GetMethod("OnValidateValue",
+                    System.Reflection.BindingFlags.Instance
+                    | System.Reflection.BindingFlags.Public
+                    | System.Reflection.BindingFlags.NonPublic,
+                    null,
+                    new Type[] { typeof(Type), typeof(object) },
+                    null);
+                if (m is null)
+                    return true;
+                lock (s_converterValidateCache)
+                    s_converterValidateCache[t] = m;
+            }
+            try
+            {
+                return (bool)m.Invoke(converter, new object?[] { valueType, value })!;
+            }
+            catch (System.Exception ex) when (IsUnrunnableValidator(ex))
+            {
+                lock (s_converterValidateCache)
+                {
+                    s_converterSkipValidation.Add(t);
+                    try { if (t.IsGenericType) s_converterSkipValidation.Add(t.GetGenericTypeDefinition()); } catch { }
+                }
+                System.Console.WriteLine("[SKIP-VALIDATE] converter " + t.FullName);
+                return true;
+            }
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
+    public static bool SettingValidateValueT(object setting, object boxedValue)
+    {
+        try
+        {
+            if (setting is null)
+                return true;
+            Type t = setting.GetType();
+            System.Reflection.MethodInfo? m;
+            lock (s_validateCache)
+            {
+                if (s_validateSkipT.Contains(t))
+                    return true;
+                s_validateCache.TryGetValue(t, out m);
+            }
+            if (m is null)
+            {
+                m = t.GetMethod("OnValidateValueT",
+                    System.Reflection.BindingFlags.Instance
+                    | System.Reflection.BindingFlags.Public
+                    | System.Reflection.BindingFlags.NonPublic);
+                if (m is null)
+                    return true;
+                lock (s_validateCache)
+                    s_validateCache[t] = m;
+            }
+            try
+            {
+                return (bool)m.Invoke(setting, new object?[] { boxedValue })!;
+            }
+            catch (System.Exception ex) when (IsUnrunnableValidator(ex))
+            {
+                lock (s_validateCache)
+                    s_validateSkipT.Add(t);
+                System.Console.WriteLine("[SKIP-VALIDATE] setting " + t.FullName);
+                return true;
+            }
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
     public static long CreateScratchTarget(int width, int height)
     {
         if (width <= 0 || height <= 0)
@@ -270,17 +1104,27 @@ public static unsafe class CpuPaint
 
     public static void FreeScratchTarget(long scratch)
     {
-        if (scratch == 0)
-            return;
-        var t = TargetOf(scratch);
-        if (t == null)
-            return;
-        if (t.IsPinned)
+        // Fail-closed (planter hunt Hole B, 2026-10-28): a stale/recycled
+        // handle must never throw on the finalizer thread (fatal exit 255).
+        // A skipped free leaks one slot; a throw kills the session.
+        try
         {
-            t.Pin.Free();
-            t.IsPinned = false;
+            if (scratch == 0)
+                return;
+            var t = TargetOf(scratch);
+            if (t == null)
+                return;
+            if (t.IsPinned)
+            {
+                try { t.Pin.Free(); } catch { }
+                t.IsPinned = false;
+            }
+            FreeHandle(scratch);
         }
-        FreeHandle(scratch);
+        catch (System.Exception fx)
+        {
+            try { System.Console.WriteLine("[SCRATCH] free-skip " + fx.GetType().Name); } catch { }
+        }
     }
 
     // Lock-serialized scratch-slot access (rev202): every take and every
@@ -321,6 +1165,41 @@ public static unsafe class CpuPaint
             long id = --s_nextScratchId;
             s_scratchMap[id] = h;
             return id;
+        }
+    }
+
+    // Fail-closed emptiness probe for finalizer-torn concurrent bags.
+    // PDN's SafeProducerConsumerCollection finalizer reads IsEmpty on a
+    // bag whose framework ThreadLocal was already disposed; that read
+    // throws ObjectDisposedException on the finalizer thread and kills
+    // the process. Answering "empty" skips item disposal while the
+    // existing finally still returns the GCHandle (no handle leak).
+    // Duck-typed object + corlib reflection only: this assembly never
+    // binds PDN types (see file header).
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<System.Type, System.Reflection.MethodInfo?> s_isEmptyProbes = new();
+    public static bool SafeBagIsEmpty(object? boxed)
+    {
+        try
+        {
+            if (boxed == null)
+                return true;
+            var probe = s_isEmptyProbes.GetOrAdd(boxed.GetType(), t =>
+            {
+                var m = t.GetMethod("get_IsEmpty",
+                    System.Reflection.BindingFlags.Public
+                    | System.Reflection.BindingFlags.NonPublic
+                    | System.Reflection.BindingFlags.Instance);
+                if (m == null || m.ReturnType != typeof(bool) || m.GetParameters().Length != 0)
+                    return null;
+                return m;
+            });
+            if (probe == null)
+                return true;
+            return (bool)probe.Invoke(boxed, null)!;
+        }
+        catch
+        {
+            return true;
         }
     }
 
@@ -482,7 +1361,12 @@ public static unsafe class CpuPaint
         var t = TargetOf(ctx);
         if (t == null)
             return;
-        var b = FromHandle<Bitmap>(bmp);
+        // Fail closed on stale/freed/torn bitmap handles (shared static
+        // upload/stash tables outlive any one test or frame): skip the blit
+        // instead of throwing out of the GCHandle deref.
+        var b = TryFromHandle<Bitmap>(bmp);
+        if (b is null)
+            return;
         if (opacity <= 0f || b.Width <= 0 || b.Height <= 0)
             return;
 
@@ -507,8 +1391,12 @@ public static unsafe class CpuPaint
         float y1 = (destX + destW) * t.M12 + (destY + destH) * t.M22 + t.M32;
         int ix0 = Math.Max(0, (int)MathF.Floor(Math.Min(x0, x1)));
         int iy0 = Math.Max(0, (int)MathF.Floor(Math.Min(y0, y1)));
-        int ix1 = Math.Min(t.Width - 1, (int)MathF.Ceiling(Math.Max(x0, x1)));
-        int iy1 = Math.Min(t.Height - 1, (int)MathF.Ceiling(Math.Max(y0, y1)));
+        // Fencepost: an integral far edge (x1 = 9.0) addresses 9 pixels
+        // 0..8, but ceil + inclusive loop painted a 10th (smear; the 9x7
+        // shadow-blit pin). ceil - 1 keeps the on-edge pixel for
+        // fractional edges and drops the past-edge one for integral.
+        int ix1 = Math.Min(t.Width - 1, (int)MathF.Ceiling(Math.Max(x0, x1)) - 1);
+        int iy1 = Math.Min(t.Height - 1, (int)MathF.Ceiling(Math.Max(y0, y1)) - 1);
 
         for (int y = iy0; y <= iy1; y++)
         {
@@ -827,8 +1715,9 @@ public static unsafe class CpuPaint
         float y1 = (x + w) * t.M12 + (y + h) * t.M22 + t.M32;
         int ix0 = Math.Max(0, (int)MathF.Floor(Math.Min(x0, x1)));
         int iy0 = Math.Max(0, (int)MathF.Floor(Math.Min(y0, y1)));
-        int ix1 = Math.Min(t.Width - 1, (int)MathF.Ceiling(Math.Max(x0, x1)));
-        int iy1 = Math.Min(t.Height - 1, (int)MathF.Ceiling(Math.Max(y0, y1)));
+        // Same integral-edge fencepost as DrawBitmap above: ceil - 1.
+        int ix1 = Math.Min(t.Width - 1, (int)MathF.Ceiling(Math.Max(x0, x1)) - 1);
+        int iy1 = Math.Min(t.Height - 1, (int)MathF.Ceiling(Math.Max(y0, y1)) - 1);
         for (int yy = iy0; yy <= iy1; yy++)
             for (int xx = ix0; xx <= ix1; xx++)
                 BlendPixel(t, xx, yy, alpha, r, g, b);
@@ -2876,7 +3765,15 @@ public static unsafe class CpuPaint
     private static int s_thumbLayerW;
     private static int s_thumbLayerH;
 
-    private static bool OverlayHasContent(long handle)
+    // Empty means no opaque pixel at all (alpha <= 128 everywhere):
+    // the provider has not produced a thumbnail for this row, so the
+    // host-fed doc composite stands in. A uniform LIGHT layer (white,
+    // light red, ...) is real per-layer content and keeps its own
+    // overlay: substituting the multi-layer composite would paint
+    // other layers' strokes into this row (bg thumb showing layer-2
+    // content). Unreadable overlays stay fail-soft (stand-in, as
+    // before) so a broken upload can never blank a live row.
+    private static bool OverlayIsEmpty(long handle)
     {
         try
         {
@@ -2884,25 +3781,123 @@ public static unsafe class CpuPaint
             uint[] px = ob.Pixels;
             int n = px.Length;
             if (n <= 0 || ob.Width <= 0 || ob.Height <= 0)
-                return false;
+                return true;
             if (n != ob.Width * ob.Height)
-                return false;
+                return true;
             for (int i = 0; i < n; i++)
             {
-                uint p = px[i];
-                uint a = p >> 24;
-                if (a <= 128)
-                    continue;
-                uint lum = (((p >> 16) & 0xFF) + ((p >> 8) & 0xFF) + (p & 0xFF)) / 3;
-                if (lum < 128)
-                    return true;
+                if ((px[i] >> 24) > 128)
+                    return false;
             }
-            return false;
+            return true;
         }
         catch
         {
-            return false;
+            return true;
         }
+    }
+
+    private static bool IsBitmapLike(object? o)
+    {
+        if (o is null)
+            return false;
+        string? fn = o.GetType().FullName;
+        if (fn is null)
+            return false;
+        return !fn.Contains("Effect") && !fn.Contains("Shader") && !fn.Contains("Proxy")
+            && !fn.Contains("ComObjectRef") && !fn.Contains("ObjectRef");
+    }
+
+    // Composite unwrapping prefers bitmap inputs. Multi-input effects
+    // resolve input 0 first, which for layer thumbnails is the
+    // procedural checkerboard: the real bitmap input is dropped and
+    // rows render a tile instead of the thumbnail (LayersStrip blank
+    // rows). Enumerate inputs and prefer the first bitmap-like
+    // candidate; anything else keeps today's input-0 behavior via the
+    // fallback. Guard-capped; effect graphs are DAGs by construction.
+    private static object? PreferBitmapInput(object? image)
+    {
+        try
+        {
+            if (image is null)
+                return null;
+            string? tn = image.GetType().FullName;
+            if (tn is null || !tn.Contains("CompositeEffect"))
+                return null;
+            var cands = new System.Collections.Generic.List<object?>();
+            var getInput = image.GetType().GetMethod("GetInput", [typeof(int)]);
+            if (getInput is not null)
+            {
+                for (int i = 0; i < 8; i++)
+                {
+                    object? cand;
+                    try { cand = getInput.Invoke(image, [i]); }
+                    catch { break; }
+                    if (cand is null || ReferenceEquals(cand, image))
+                        continue;
+                    cands.Add(cand);
+                }
+            }
+            // Multi-input effects (CompositeEffect destination/source)
+            // expose inputs through Properties.Sources instead. The
+            // accessor is duck-enumerable (custom enumerator, no
+            // IEnumerable interface), so enumerate by shape.
+            try
+            {
+                var propsGet = image.GetType().GetMethod("get_Properties", Type.EmptyTypes);
+                object? bag = propsGet?.Invoke(image, null);
+                object? sources = bag?.GetType().GetProperty("Sources")?.GetValue(bag);
+                if (sources is System.Collections.IEnumerable list)
+                {
+                    foreach (object? cand in list)
+                    {
+                        if (cand is null || ReferenceEquals(cand, image))
+                            continue;
+                        cands.Add(cand);
+                    }
+                }
+                else if (sources is not null)
+                {
+                    var gen = sources.GetType().GetMethod("GetEnumerator", Type.EmptyTypes)
+                        ?.Invoke(sources, null);
+                    var move = gen?.GetType().GetMethod("MoveNext", Type.EmptyTypes);
+                    var curProp = gen?.GetType().GetProperty("Current");
+                    var curGet = gen?.GetType().GetMethod("get_Current", Type.EmptyTypes);
+                    int steps = 0;
+                    while (steps++ < 8 && (bool)(move?.Invoke(gen, null) ?? false))
+                    {
+                        object? cand = null;
+                        try
+                        {
+                            cand = curProp is not null
+                                ? curProp.GetValue(gen)
+                                : curGet?.Invoke(gen, null);
+                        }
+                        catch { }
+                        if (cand is null || ReferenceEquals(cand, image))
+                            continue;
+                        cands.Add(cand);
+                    }
+                }
+            }
+            catch { }
+            foreach (object? cand in cands)
+            {
+                if (IsBitmapLike(cand))
+                    return cand;
+                object? resolved;
+                try { resolved = GetProxySourceImage(cand); }
+                catch { continue; }
+                if (resolved is null)
+                    continue;
+                if (IsBitmapLike(resolved) && !ReferenceEquals(resolved, image))
+                    return resolved;
+            }
+            // No bitmap-like input: null resumes today's single-input
+            // path unchanged.
+            return null;
+        }
+        catch { return null; }
     }
 
     public static object? GetProxySourceImage(object? image)
@@ -2911,6 +3906,9 @@ public static unsafe class CpuPaint
         {
             if (image is null)
                 return null;
+            object? preferred = PreferBitmapInput(image);
+            if (preferred is not null)
+                return preferred;
             Type t = image.GetType();
             if (!s_proxyShapeLogged)
             {
@@ -3248,6 +4246,99 @@ public static unsafe class CpuPaint
                 }
                 catch { }
             }
+        }
+    }
+
+
+
+    // UI.DeviceBitmap upload (layer-strip checkbox glyphs): UI-level
+    // DeviceBitmaps never pass a context upload, so the DrawBitmap
+    // contract silent-skips them (not the synthesized CpuDeviceBitmap).
+    // Upload the wrapped BitmapSource here and answer handle + dims;
+    // the contract wraps it in a cpuBmp and proceeds. 64-bit sources
+    // widen through CreateBitmapFromHalfSource; 32-bit sources copy
+    // out like it does. Anything else answers false (today's skip).
+    public static bool TryUploadUiDeviceBitmap(object? image, out long handle, out int w, out int h)
+    {
+        handle = 0; w = 0; h = 0;
+        GCHandle tempPin = default;
+        bool tempPinned = false;
+        try
+        {
+            if (image is null)
+                return false;
+            Type it = image.GetType();
+            if (it.Namespace != "PaintDotNet.UI.Media"
+                || (it.Name != "DeviceBitmap" && it.Name != "DeviceImage"))
+                return false;
+            var bsProp = image.GetType().GetProperty("BitmapSource",
+                System.Reflection.BindingFlags.Instance
+                | System.Reflection.BindingFlags.Public
+                | System.Reflection.BindingFlags.NonPublic);
+            if (bsProp is null)
+                return false;
+            object? src = InvokeGetter(bsProp, image);
+            if (src is null)
+                return false;
+            var sizeProp = src.GetType().GetProperty("Size",
+                System.Reflection.BindingFlags.Instance
+                | System.Reflection.BindingFlags.Public
+                | System.Reflection.BindingFlags.NonPublic);
+            object? size = sizeProp is null ? null : InvokeGetter(sizeProp, src);
+            w = (int)(size?.GetType().GetProperty("Width")?.GetValue(size) ?? 0);
+            h = (int)(size?.GetType().GetProperty("Height")?.GetValue(size) ?? 0);
+            if (w <= 0 || h <= 0 || (long)w * h * 4 > 64L * 1024 * 1024)
+                return false;
+            var fmtProp = src.GetType().GetProperty("PixelFormat",
+                System.Reflection.BindingFlags.Instance
+                | System.Reflection.BindingFlags.Public
+                | System.Reflection.BindingFlags.NonPublic);
+            object? fmt = fmtProp is null ? null : InvokeGetter(fmtProp, src);
+            var bppGet = fmt?.GetType().GetMethod("GetBitsPerPixel", Type.EmptyTypes);
+            int bpp = (int)(bppGet?.Invoke(fmt, null) ?? 0);
+            if (bpp == 64)
+            {
+                handle = CreateBitmapFromHalfSource(src, w, h);
+                return handle != 0;
+            }
+            if (bpp != 32)
+                return false;
+            System.Reflection.MethodInfo? cp = null;
+            foreach (var ii in src.GetType().GetInterfaces())
+            {
+                if (ii.Name != "IBitmapSource" || ii.IsGenericType)
+                    continue;
+                cp = ii.GetMethods().FirstOrDefault(m => m.Name == "CopyPixels"
+                    && m.GetParameters().Length == 4
+                    && m.GetParameters()[0].ParameterType == typeof(IntPtr));
+                if (cp is not null)
+                    break;
+            }
+            if (cp is null)
+                return false;
+            int stride = checked(w * 4);
+            byte[] temp = new byte[checked(stride * h)];
+            tempPin = GCHandle.Alloc(temp, GCHandleType.Pinned);
+            tempPinned = true;
+            try
+            {
+                cp.Invoke(src, [tempPin.AddrOfPinnedObject(), stride, stride * h, null]);
+            }
+            catch
+            {
+                return false;
+            }
+            handle = CreateBitmap(tempPin.AddrOfPinnedObject(), stride, w, h);
+            return handle != 0;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            if (tempPinned)
+                tempPin.Free();
         }
     }
 
@@ -3613,6 +4704,101 @@ public static unsafe class CpuPaint
     // RendererExtensions.AsBitmapSource + CopyPixels. This is the
     // desktop thumbnail source; layer.Surface goes stale headless.
     // Returns false (caller keeps the surface fallback) on any failure.
+    // Lock-argument builder for renderer bitmap sources (thumbnails):
+    // a full-surface rect plus a parsed lock-options enum. Reflection
+    // Invoke never converts a raw option string or a null rect, so the
+    // previous ("ReadOnly", null) shape threw on every call and silently
+    // disabled the renderer-first thumbnail path. Public for tests.
+    public static object?[] BuildRendererLockArgs(object sizeObj, System.Type rectType, System.Type optType)
+    {
+        if (sizeObj is null) throw new ArgumentNullException(nameof(sizeObj));
+        if (rectType is null) throw new ArgumentNullException(nameof(rectType));
+        if (optType is null) throw new ArgumentNullException(nameof(optType));
+        object? fullRect;
+        try { fullRect = Activator.CreateInstance(rectType, 0, 0, sizeObj); }
+        catch (System.Exception ex) { throw new InvalidOperationException("norectobj", ex); }
+        object? opt;
+        try { opt = Enum.Parse(optType, "Read"); }
+        catch { opt = null; }
+        if (opt is null)
+        {
+            try { opt = Activator.CreateInstance(optType); }
+            catch (System.Exception ex) { throw new InvalidOperationException("noopt", ex); }
+        }
+        if (opt is null)
+            throw new InvalidOperationException("noopt");
+        return new object?[] { fullRect, opt };
+    }
+
+    // Fourth-argument builder for 4-arg IntPtr CopyPixels calls
+    // (region/token): null binds only nullable/reference types; hand a
+    // default instance to non-nullable value types. Public for tests.
+    public static object? BuildCopyPixelsFourth(System.Type fourthType)
+    {
+        if (fourthType is null) throw new ArgumentNullException(nameof(fourthType));
+        if (fourthType.IsValueType && Nullable.GetUnderlyingType(fourthType) is null)
+            return Activator.CreateInstance(fourthType);
+        return null;
+    }
+
+    // CopyPixels overload picker: exact CopyPixels with a nullable
+    // region first (null region = whole surface), then any exact
+    // CopyPixels, then the first OnCopyPixels-shaped fallback.
+    public static System.Reflection.MethodInfo? SelectCopyPixels(
+        System.Collections.Generic.List<System.Reflection.MethodInfo> cands)
+    {
+        if (cands is null || cands.Count == 0) return null;
+        foreach (var m in cands)
+        {
+            if (m.Name != "CopyPixels") continue;
+            var ps = m.GetParameters();
+            if (ps.Length == 4
+                && (Nullable.GetUnderlyingType(ps[3].ParameterType) is not null
+                    || !ps[3].ParameterType.IsValueType))
+                return m;
+        }
+        foreach (var m in cands)
+            if (m.Name == "CopyPixels") return m;
+        return cands[0];
+    }
+
+    // Full argument vector for a 4-arg buffer CopyPixels: the pinned
+    // address boxed to the declared destination (IntPtr or Void*),
+    // numerics converted to the declared widths, and the region
+    // defaulted to the full surface for struct regions (a default
+    // rect is empty and would copy nothing). Unsafe for the Void*
+    // box; the project allows unsafe blocks. Public for tests.
+    public static unsafe object?[] BuildCopyPixelsArgs(
+        System.Reflection.MethodInfo cp, IntPtr addr, int stride, int len,
+        object? fourth, object? sizeObj)
+    {
+        if (cp is null) throw new ArgumentNullException(nameof(cp));
+        var ps = cp.GetParameters();
+        if (ps.Length != 4) throw new ArgumentException("cp must take 4 args", nameof(cp));
+        object? p0 = ps[0].ParameterType == typeof(IntPtr)
+            ? (object)addr
+            : System.Reflection.Pointer.Box((void*)addr, ps[0].ParameterType);
+        object p1 = System.Convert.ChangeType(stride, ps[1].ParameterType);
+        object p2 = System.Convert.ChangeType(len, ps[2].ParameterType);
+        object? p3 = fourth;
+        if (p3 is null)
+        {
+            System.Type ft = ps[3].ParameterType;
+            if (ft.IsValueType && Nullable.GetUnderlyingType(ft) is null)
+            {
+                try
+                {
+                    if (sizeObj is not null && (ft.FullName ?? "").Contains("Rect"))
+                        p3 = Activator.CreateInstance(ft, 0, 0, sizeObj);
+                    else
+                        p3 = Activator.CreateInstance(ft);
+                }
+                catch { p3 = Activator.CreateInstance(ft); }
+            }
+        }
+        return new object?[] { p0, p1, p2, p3 };
+    }
+
     private static bool TryReadLayerRendererPixels(object provider, out byte[]? bgra, out int w, out int h, out int stride)
     {
         bgra = null; w = 0; h = 0; stride = 0;
@@ -3740,7 +4926,12 @@ public static unsafe class CpuPaint
                 return false;
             // Prefer Lock (Scan0 read, same as ReadLockedBytes): the
             // adapter inherits BitmapSourceBase, whose CopyPixels
-            // overloads take typed pointers, not IntPtr.
+            // overloads take typed pointers, not IntPtr. Mirror
+            // ReadLockedBytes exactly: a full-surface rect plus a
+            // parsed lock-options enum (a raw "ReadOnly" string and a
+            // null rect never bind, which silently disabled this whole
+            // renderer-first path and left every thumb on the stale
+            // surface fallback).
             try
             {
                 object? wlk = null;
@@ -3759,7 +4950,14 @@ public static unsafe class CpuPaint
                         }
                     }
                     if (lockM is not null)
-                        wlk = lockM.Invoke(source, ["ReadOnly", null]);
+                    {
+                        var lps = lockM.GetParameters();
+                        System.Type? rectT = FindPdnType("PaintDotNet.Rendering.RectInt32");
+                        if (rectT is null || sizeObj is null)
+                            throw new InvalidOperationException("norectobj");
+                        object?[] lockArgs = BuildRendererLockArgs(sizeObj, rectT, lps[1].ParameterType);
+                        wlk = lockM.Invoke(source, lockArgs);
+                    }
                 }
                 catch { wlk = null; }
                 if (wlk is not null)
@@ -3794,28 +4992,50 @@ public static unsafe class CpuPaint
                 }
             }
             catch { }
-            // 4-arg IntPtr CopyPixels into a pinned Bgra32 buffer (same
-            // shape the Half upload path already uses).
+            // 4-arg buffer CopyPixels into a pinned Bgra32 buffer (same
+            // shape the Half upload path already uses). The adapter's
+            // overloads take a raw Void* destination, not IntPtr, so
+            // match pointer destinations too and box the pinned address
+            // accordingly; numerics convert to the declared widths.
+            // Prefer an exact CopyPixels with a nullable region (null =
+            // whole surface) over OnCopyPixels with a struct region.
             System.Reflection.MethodInfo? cp = null;
             try
             {
+                var cands = new System.Collections.Generic.List<System.Reflection.MethodInfo>();
                 foreach (var ii in source.GetType().GetInterfaces())
                 {
                     if (ii.Name != "IBitmapSource" || ii.IsGenericType)
                         continue;
-                    cp = ii.GetMethods().FirstOrDefault(m => m.Name == "CopyPixels"
-                        && m.GetParameters().Length == 4
-                        && m.GetParameters()[0].ParameterType == typeof(IntPtr));
-                    if (cp is not null)
-                        break;
+                    foreach (var m in ii.GetMethods())
+                    {
+                        if (m.Name != "CopyPixels" && !m.Name.EndsWith("CopyPixels", System.StringComparison.Ordinal))
+                            continue;
+                        var ps = m.GetParameters();
+                        if (ps.Length != 4)
+                            continue;
+                        System.Type p0 = ps[0].ParameterType;
+                        if (p0 != typeof(IntPtr) && !p0.IsPointer)
+                            continue;
+                        cands.Add(m);
+                    }
                 }
-                cp ??= source.GetType().GetMethods(
+                foreach (var m in source.GetType().GetMethods(
                         System.Reflection.BindingFlags.Instance
                         | System.Reflection.BindingFlags.Public
-                        | System.Reflection.BindingFlags.NonPublic)
-                    .FirstOrDefault(m => m.Name.EndsWith("CopyPixels", StringComparison.Ordinal)
-                        && m.GetParameters().Length == 4
-                        && m.GetParameters()[0].ParameterType == typeof(IntPtr));
+                        | System.Reflection.BindingFlags.NonPublic))
+                {
+                    if (m.Name != "CopyPixels" && !m.Name.EndsWith("CopyPixels", System.StringComparison.Ordinal))
+                        continue;
+                    var ps = m.GetParameters();
+                    if (ps.Length != 4)
+                        continue;
+                    System.Type p0 = ps[0].ParameterType;
+                    if (p0 != typeof(IntPtr) && !p0.IsPointer)
+                        continue;
+                    cands.Add(m);
+                }
+                cp = SelectCopyPixels(cands);
             }
             catch { return false; }
             if (cp is null)
@@ -3825,7 +5045,20 @@ public static unsafe class CpuPaint
             GCHandle pin = GCHandle.Alloc(buf, GCHandleType.Pinned);
             try
             {
-                try { cp.Invoke(source, [pin.AddrOfPinnedObject(), sstride, buf.Length, null]); }
+                // The 4th argument (region/token) must match its declared
+                // type: null only binds nullable/reference types, so hand
+                // a default instance to non-nullable value types instead
+                // of failing the whole renderer-first path.
+                object? fourth = null;
+                try
+                {
+                    var cps = cp.GetParameters();
+                    if (cps.Length >= 4)
+                        fourth = BuildCopyPixelsFourth(cps[3].ParameterType);
+                }
+                catch { fourth = null; }
+                object?[] cargs = BuildCopyPixelsArgs(cp, pin.AddrOfPinnedObject(), sstride, buf.Length, fourth, sizeObj);
+                try { cp.Invoke(source, cargs); }
                 catch { return false; }
             }
             finally
@@ -4056,11 +5289,13 @@ public static unsafe class CpuPaint
             catch { }
             if (bw <= 0 || bh <= 0 || handle == 0 || bw > 128 || bh > 128)
                 return false;
-            // Live-doc thumb: when the provider overlay carries no
-            // dark-opaque content, thumbnail the host-fed doc composite
-            // instead. Downscale to the overlay dims so the dest math
-            // below is unchanged; the upload is owned here and freed
-            // after the blit.
+            // Live-doc thumb: when the provider overlay is empty (no
+            // opaque pixel: no thumbnail produced for this row yet),
+            // thumbnail the host-fed doc composite instead. Downscale
+            // to the overlay dims so the dest math below is unchanged;
+            // the upload is owned here and freed after the blit. A
+            // non-empty overlay (even a uniform light layer) always
+            // paints itself: rows keep independent-layer semantics.
             long upload = 0;
             try
             {
@@ -4069,7 +5304,7 @@ public static unsafe class CpuPaint
                     && (live.Rgba.Length != live.W * live.H * 4
                         || (s_thumbLayerW > 0 && (live.W != s_thumbLayerW || live.H != s_thumbLayerH))))
                     live = null;
-                if (live is not null && !OverlayHasContent(handle))
+                if (live is not null && OverlayIsEmpty(handle))
                 {
                     // Darkest-of-footprint downscale so thin strokes
                     // survive the shrink to strip size.
@@ -4230,6 +5465,8 @@ public static unsafe class CpuPaint
         }
         catch { overlay = null; checkerBg = null; return false; }
     }
+
+
 
     // Construction-time effect inputs, noted by the rewriter's
     // EffectInputAccessor.Set hook (see NoteEffectInput): the inner
@@ -4564,3 +5801,4 @@ public static unsafe class CpuPaint
         }
     }
 }
+

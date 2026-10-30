@@ -25,7 +25,7 @@ public sealed class SynthesizedIlTests
         // (siblings are a later extension, same harness).
         string core = Path.Combine(RepoRoot(), "targets", "paint.net", "PaintDotNet.Windows.Core.dll");
         Assert.True(File.Exists(core), $"pristine PDN core missing: {core}");
-        string forms = BuiltDll("WfWasm.WinForms", "net9.0-windows", "WfWasm.WinForms");
+        string forms = BuiltDll("WfWasm.WinForms", "net9.0", "WfWasm.WinForms");
         string drawing = BuiltDll("WfWasm.Drawing", "net9.0", "WfWasm.Drawing");
         string pdncp = BuiltDll("WfWasm.PdnCpu", "net9.0", "WfWasm.PdnCpu");
         var assemblyMap = new Dictionary<string, string>(StringComparer.Ordinal)

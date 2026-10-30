@@ -212,12 +212,12 @@ public sealed class RichTextStreamRedirectTests
     [Fact]
     public void Redirect_Real_Fork_StreamMethods_Become_Trampolines()
     {
-        string src = TestPaths.Repo(@".artifacts\runtime\WfWasm.WinForms.dll");
+        string src = @"E:\tmp\rewritten-small\WfWasm.WinForms.dll";
         string tmp = Path.Combine(Path.GetTempPath(), $"RtfFork_{Guid.NewGuid()}.dll");
         try
         {
             byte[] bytes = File.ReadAllBytes(src);
-            using var resolver = new FrameworkResolver(Path.GetDirectoryName(src), [TestPaths.Repo(@".artifacts\runtime"), TestPaths.Repo(@"external-apps\paintnet-support")]);
+            using var resolver = new FrameworkResolver(Path.GetDirectoryName(src), [@"E:\tmp\rewritten-small", @"E:\tmp\rewritten-paint"]);
             var readerParams = new ReaderParameters { AssemblyResolver = resolver };
             using (var ms = new MemoryStream(bytes))
             using (var read = AssemblyDefinition.ReadAssembly(ms, readerParams))

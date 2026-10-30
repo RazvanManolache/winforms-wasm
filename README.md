@@ -1,5 +1,16 @@
 # winforms-wasm
 
+> **Final standalone snapshot — 30 October 2026.** Standalone WinForms
+> development ends at this checkpoint; the work is preserved as-is below.
+> Future development and releases move to
+> [desktop-wasm](https://github.com/RazvanManolache/desktop-wasm)
+> ([releases](https://github.com/RazvanManolache/desktop-wasm/releases)).
+> The 26 October counts (2,091 passes / 23 failures) are historical, not this
+> snapshot's result — see
+> [the final change and validation note](docs/update-2026-10-30-final.md)
+> for current verified evidence, limitations and incomplete flows.
+
+
 **Old software still has work to do.**
 
 An experiment in bringing existing Windows Forms applications to the browser with .NET and WebAssembly.

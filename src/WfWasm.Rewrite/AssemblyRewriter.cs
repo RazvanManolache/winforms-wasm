@@ -293,6 +293,16 @@ public static class AssemblyRewriter
             {
             }
         }
+        if (assembly.Name.Name == "PhotoSauce.MagicScaler")
+        {
+            // The WASM interpreter has no CPUID: MagicScaler's unguarded
+            // probe throws PNSE in the type initializer and kills every
+            // scale transform. Answer false headless (managed kernels).
+            try { EnsureMagicScalerNoSimd(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+        }
         if (assembly.Name.Name == "paintdotnet")
         {
             // Effect rendering is single-threaded headless
@@ -334,6 +344,68 @@ public static class AssemblyRewriter
             // kind-17s its whole paint): serve the trivial getters
             // through reflection helpers (see method).
             try { RetargetScaledResourceHeadless(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // rev242-244/rev246 TEMP-BISECT + erasure REVERTED rev254
+            // (kind-17 root cause was the hand-built spin painter refs,
+            // fixed at the source; these families were exonerated).
+            // Dictionary<K,V>.TryGetValue kind-17s for the
+            // Dictionary<Control,int> instantiation (see method).
+            try { RetargetDictionaryTryGet(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // LayersStrip/ImageStrip shadow-cache (rev258 REAL FIX): the
+            // interpreter not only mis-evaluates value-type-key Find, a
+            // throwing Dictionary<SizeInt32,DeviceBitmap>.Add tears the
+            // table and the next 16x16 DRAWIMG OOB-traps the session.
+            // Retarget ONLY the two shadow-cache Add sites (narrow
+            // allowlist; global Add retargeting would mask real dup bugs)
+            // to the side-table add-if-absent helper, which never mutates
+            // the PDN dict (see method).
+            try { RetargetShadowCacheTryAdd(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // Setting<TValue>.OnValidateValueT InvalidProgram on
+            // The side table must die with the PDN dict: retarget the
+            // shadow-cache Clear sites (dispose/theme/invalidate paths)
+            // to DictShadowClear (narrow allowlist, same types). Without
+            // this the strips would paint stale shadows after a theme
+            // change or leak entries past dispose.
+            try { RetargetShadowCacheClear(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // Shadow-cache TryGetValue (rev282 REAL FIX): see
+            // RetargetShadowCacheTryGet (completes the Add/Clear
+            // bypass of the interpreter-broken value-type-key Find).
+            try { RetargetShadowCacheTryGet(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // value-type instantiations (MainForm..ctor death).
+            try { RetargetSettingValidateValueT(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // EqualityComparer<TValue> get_Default/Equals/GetHashCode
+            // InvalidProgram on value-type instantiations (ScalarSetting
+            // construction death in Setting.Initialize).
+            try { RetargetSettingEqualityComparer(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // SettingConverter.OnValidateValue invisible virtual dispatch
+            // to the SettingConverter<TValue> override (Setting.Initialize
+            // death; static token is the clean base so no touch fires).
+            try { RetargetSettingConverterValidate(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // TEMP-DIAG rev216 (REVERT): touch-log generic calls.
+            try { EmitTouchLogging(module); }
             catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
             {
             }
@@ -402,6 +474,35 @@ public static class AssemblyRewriter
             catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
             {
             }
+            // Dictionary<K,V>.TryGetValue kind-17s for the
+            // Dictionary<Control,int> instantiation (see method).
+            try { RetargetDictionaryTryGet(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // LayersStrip/ImageStrip shadow-cache dup-Add (Key:50,50 on
+            // every render): the interpreter value-type-key Find
+            // mis-evaluates, so the guarded Add still throws and every
+            // strip render fails (caught -> blank Layers). Retarget ONLY
+            // the two shadow-cache Add sites (narrow allowlist; global
+            // Add retargeting would mask real dup bugs) to the
+            // scan-backed add-if-absent helper (see method).
+            try { RetargetShadowCacheTryAdd(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // TEMP-DIAG rev216 (REVERT): touch-log generic calls.
+            // Shadow-cache TryGetValue (rev282 REAL FIX): see
+            // RetargetShadowCacheTryGet (completes the Add/Clear
+            // bypass of the interpreter-broken value-type-key Find).
+            try { RetargetShadowCacheTryGet(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            try { EmitTouchLogging(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
         }
         if (assembly.Name.Name == "PaintDotNet.Windows.Framework")
         {
@@ -434,6 +535,27 @@ public static class AssemblyRewriter
             // alive; color work is identity without a device). Tiling
             // and context extensions take the CPU-backed shortcuts.
             try { EnsureCpuImagingShortcuts(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // Null WIC factory headless: WIC-mode thumbnail scalers throw
+            // (blank Layers/Document strips). Remap to managed MagicScaler
+            // modes; desktop (factory present) is untouched.
+            try { EnsureThumbnailScalerManagedFallback(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // Same null-factory wall one level deeper: the float pixel
+            // converters resolve NumericRepresentation through WIC-only
+            // PixelFormatInfo. Serve it from PDN's managed format table.
+            try { EnsureThumbnailPixelConvertManaged(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // The profile handle getter's LazyResult NREs headless; its
+            // factory is pure managed (ICC bytes -> MagicScaler handle).
+            // Compute directly so the conversion transform gets a handle.
+            try { EnsureThumbnailProfileHandleDirect(module); }
             catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
             {
             }
@@ -507,6 +629,16 @@ public static class AssemblyRewriter
             {
             }
         }
+        if (assembly.Name.Name == "Syncfusion.Telemetry")
+        {
+            // DesignMode process-name probe throws PNSE headless (caught by
+            // the vendor, telemetry inert); answer "" for the identical
+            // outcome with no first-chance in every Syncfusion app boot.
+            try { NeutralizeTelemetryDesignMode(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+        }
         if (assembly.Name.Name == "Syncfusion.Shared.Base")
         {
             // SfForm probes the Win11 build number from the registry at
@@ -559,6 +691,37 @@ public static class AssemblyRewriter
             catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
             {
             }
+            // Dictionary<K,V>.TryGetValue kind-17s for the
+            // Dictionary<Control,int> instantiation (see method).
+            try { RetargetDictionaryTryGet(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // LayersStrip/ImageStrip shadow-cache dup-Add (Key:50,50 on
+            // every render): the interpreter value-type-key Find
+            // mis-evaluates, so the guarded Add still throws and every
+            // strip render fails (caught -> blank Layers). Retarget ONLY
+            // the two shadow-cache Add sites (narrow allowlist; global
+            // Add retargeting would mask real dup bugs) to the
+            // scan-backed add-if-absent helper (see method).
+            try { RetargetShadowCacheTryAdd(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // Shadow-cache TryGetValue (rev282 REAL FIX): see
+            // RetargetShadowCacheTryGet (completes the Add/Clear
+            // bypass of the interpreter-broken value-type-key Find).
+            try { RetargetShadowCacheTryGet(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // rev240 TEMP-BISECT guard REVERTED rev254 (exonerated in vivo:
+            // oracle proved the guard loads and runs).
+            // TEMP-DIAG rev216 (REVERT): touch-log generic calls.
+            try { EmitTouchLogging(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
         }
         if (assembly.Name.Name == "PaintDotNet.Data")
         {
@@ -566,6 +729,20 @@ public static class AssemblyRewriter
             // store (BinaryFormatter), unavailable headless: answer the
             // default token so Save-As reaches its dialog (see method).
             try { RedirectLastSaveConfigToken(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+        }
+        if (assembly.Name.Name == "PaintDotNet.Collections")
+        {
+            // SafeProducerConsumerCollection's finalizer probes IsEmpty on a
+            // bag whose framework ThreadLocal is already disposed: unhandled
+            // ObjectDisposedException on the finalizer thread kills the host
+            // (testhost abort under GC pressure; browser exit at gen-2 GC).
+            // Retarget the probe to the fail-closed CpuPaint helper (see
+            // method): torn bags read empty, disposal is skipped, and the
+            // existing finally still returns the GCHandle (no handle leak).
+            try { EnsureSafeBagFinalizeTolerant(module, cpuPaintPath); }
             catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
             {
             }
@@ -609,6 +786,60 @@ public static class AssemblyRewriter
             // History rows with a non-null icon paint blank headless
             // (see method): text-only rows paint.
             try { EnsureHistoryRowTextOnly(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // rev256 TEMP-BISECT: nop the thumbnail drain FIRST (see
+            // flag): the Robust wrapper below then guards a bare ret,
+            // so delivery-robustness assertions still hold while the
+            // drain does nothing. Isolates death to dispatch vs delivery.
+            try { NeutralizeThumbnailDrainTempImpl(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // rev259 TEMP-BISECT: skip only the handler Invoke (see flag).
+            try { SkipThumbnailHandlerInvokeTempImpl(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // rev260 TEMP-BISECT: skip only the handler animation (see flag).
+            try { SkipHandlerAnimationTempImpl(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // rev261 TEMP-BISECT: skip only the handler Update (see flag).
+            try { SkipHandlerUpdateTempImpl(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // rev263 null-skip (rev274: helper-based, see method).
+            try { SkipNullBitmapDeliveryTempImpl(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // rev265 REAL FIX: strip queue sites build the ready-handler
+            // delegate via newobj in IL (kind-17 IPE when the closed
+            // instantiation is not loaded yet). Reroute through the
+            // reflection-built QueueThumbnail helper (see method).
+            try { RetargetThumbnailQueueHandler(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // The drain dispatches each ready handler through a closed
+            // ValueEventHandler<T>.Invoke the interpreter cannot JIT
+            // (kind-17 IPE: render completes, then delivery dies). Swap the
+            // call for the reflection-driven CpuPaint helper (same stack).
+            try { EnsureThumbnailDrainReflectInvoke(module, cpuPaintPath); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // rev279 TEMP-BISECT (REVERT): whole-drain nop (see flag).
+            try { NopDrainBodyTemp279Impl(module); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
+            {
+            }
+            // rev262 TEMP-BISECT: log every thumbnail enqueue (see flag).
+            try { LogThumbnailEnqueueTempImpl(module); }
             catch (Exception ex) when (ex is InvalidOperationException || ex is Mono.Cecil.ResolutionException || ex is ArgumentException)
             {
             }
@@ -658,6 +889,9 @@ public static class AssemblyRewriter
             {
             }
         }
+
+        // TEMP-DIAG rev247-249 oracle REVERTED rev254 (kind-17 root cause
+        // found + fixed: hand-built spin painter refs).
 
         // Native imports cannot bind headless: stub them with the same
         // defaults as the file pass (targeted Ensure* stubs above already
@@ -772,6 +1006,8 @@ public static class AssemblyRewriter
         MethodReference? safeGetStream1 = null;
         MethodReference? safeGetStream2 = null;
         MethodReference? safeGetResourceSet = null;
+        MethodReference? safeGetResourceSet1 = null;
+        MethodReference? safeGetResourceSet2 = null;
         MethodReference? envGetFolderPath1 = null;
         MethodReference? envGetFolderPath2 = null;
         MethodReference? safeApplyResources1 = null;
@@ -1066,6 +1302,25 @@ public static class AssemblyRewriter
                 new ParameterDefinition(module.ImportReference(typeof(System.Resources.ResourceManager))),
                 new ParameterDefinition(module.ImportReference(typeof(System.Globalization.CultureInfo))),
                 new ParameterDefinition(module.TypeSystem.Boolean),
+                new ParameterDefinition(module.TypeSystem.Boolean)
+            }
+        };
+        safeGetResourceSet1 = new MethodReference("SafeGetResourceSet", module.ImportReference(typeof(System.Resources.ResourceSet)), shimType)
+        {
+            HasThis = false,
+            Parameters =
+            {
+                new ParameterDefinition(module.ImportReference(typeof(System.Resources.ResourceManager))),
+                new ParameterDefinition(module.ImportReference(typeof(System.Globalization.CultureInfo)))
+            }
+        };
+        safeGetResourceSet2 = new MethodReference("SafeGetResourceSet", module.ImportReference(typeof(System.Resources.ResourceSet)), shimType)
+        {
+            HasThis = false,
+            Parameters =
+            {
+                new ParameterDefinition(module.ImportReference(typeof(System.Resources.ResourceManager))),
+                new ParameterDefinition(module.ImportReference(typeof(System.Globalization.CultureInfo))),
                 new ParameterDefinition(module.TypeSystem.Boolean)
             }
         };
@@ -5028,12 +5283,30 @@ public static class AssemblyRewriter
                                     instruction.Operand = safeApplyResources2;
                                 }
                             }
-                            else if (safeGetResourceSet != null && mr.Name == "GetResourceSet"
-                                && (mr.DeclaringType.FullName == "System.Resources.ResourceManager" || mr.DeclaringType.FullName == "System.ComponentModel.ComponentResourceManager")
-                                && mr.Parameters.Count == 3)
+                            else if (mr.Name == "GetResourceSet"
+                                && (mr.DeclaringType.FullName == "System.Resources.ResourceManager" || mr.DeclaringType.FullName == "System.ComponentModel.ComponentResourceManager"))
                             {
-                                instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
-                                instruction.Operand = safeGetResourceSet;
+                                // All three BCL arities funnel here (the 1/2-arg
+                                // calls previously escaped to BCL and died in
+                                // the legacy-reader NSE on v2 blobs); each
+                                // keeps its own parameter typerefs so the
+                                // static signature resolves as the caller
+                                // sees it. Shim overload defaults mirror BCL.
+                                if (mr.Parameters.Count == 1 && safeGetResourceSet1 != null)
+                                {
+                                    instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                                    instruction.Operand = safeGetResourceSet1;
+                                }
+                                else if (mr.Parameters.Count == 2 && safeGetResourceSet2 != null)
+                                {
+                                    instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                                    instruction.Operand = safeGetResourceSet2;
+                                }
+                                else if (mr.Parameters.Count == 3 && safeGetResourceSet != null)
+                                {
+                                    instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                                    instruction.Operand = safeGetResourceSet;
+                                }
                             }
                             else if (safeGetString1 != null && mr.Name == "GetString"
                                 && (mr.DeclaringType.FullName == "System.Resources.ResourceManager" || mr.DeclaringType.FullName == "System.ComponentModel.ComponentResourceManager"))
@@ -8012,6 +8285,343 @@ public static class AssemblyRewriter
                 Identity(m, 1);
         }
     }
+    // WIC imaging has no headless factory (ImagingFactory.instance stays
+    // null: the COM activation never runs in the browser), so every scaler
+    // mode that routes through the WIC transform pipeline (Mode2 1..4:
+    // Linear, Cubic, Fant, HighQualityCubic) throws Validate ANE on the
+    // null factory. That kills thumbnail rendering end to end
+    // (DocumentWorkspace.CreateThumbnailBitmap uses mode 4): the drain
+    // throws inside RenderThreadLoop, the handler never fires, and the
+    // Layers/Document strips stay blank. When the factory is null, remap
+    // those WIC-only modes to their managed MagicScaler counterparts
+    // (Linear -> HighQualityLinear, cubic family -> CubicSmooth): the
+    // scale still happens through PDN's own managed kernels, only the
+    // WIC-vs-managed selection degrades. A present factory (desktop)
+    // keeps the exact original mode. Public so the rewrite tests pin it
+    // directly, like the Redirect* rules.
+    public static void EnsureThumbnailScalerManagedFallback(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        var ife = module.GetType("PaintDotNet.Imaging.ImagingFactoryExtensions")
+            ?? throw new InvalidOperationException("CpuPaint: ImagingFactoryExtensions missing");
+        int patched = 0;
+        foreach (MethodDefinition m in ife.Methods)
+        {
+            if (m.Name != "CreateBitmapScaler" || !m.HasBody) continue;
+            if (m.Parameters.Count != 6) continue;
+            if (m.Parameters[0].ParameterType.FullName != "PaintDotNet.Imaging.IImagingFactory") continue;
+            if (m.Parameters[3].ParameterType.FullName != "PaintDotNet.Imaging.BitmapInterpolationMode2") continue;
+            bool hasSwitch = false, hasWic = false, hasManaged = false, delegates = false;
+            foreach (var ins in m.Body.Instructions)
+            {
+                if (ins.OpCode == Mono.Cecil.Cil.OpCodes.Switch) hasSwitch = true;
+                if (ins.Operand is MethodReference mr2)
+                {
+                    if (mr2.Name == "TransformBitmapSource") hasWic = true;
+                    if (mr2.Name == "CreateMagicScaler") hasManaged = true;
+                    if (mr2.Name == "CreateBitmapScaler") delegates = true;
+                }
+            }
+            if (!hasSwitch)
+            {
+                // Known wrapper: the Context overload converts to a profile
+                // and delegates to the Profile overload (patched there).
+                if (!delegates)
+                    throw new InvalidOperationException("scaler fallback shape changed");
+                continue;
+            }
+            if (m.Body.Instructions.Count == 0
+                || m.Body.Instructions[0].OpCode != Mono.Cecil.Cil.OpCodes.Newobj)
+                throw new InvalidOperationException("scaler fallback shape changed");
+            if (!hasWic || !hasManaged)
+                throw new InvalidOperationException("scaler fallback shape changed");
+            var modeParam = m.Parameters[3];
+            var il = m.Body.GetILProcessor();
+            var first = m.Body.Instructions[0];
+            var keep = il.Create(Mono.Cecil.Cil.OpCodes.Nop);
+            var notLinear = il.Create(Mono.Cecil.Cil.OpCodes.Nop);
+            var chain = new Instruction[]
+            {
+                il.Create(Mono.Cecil.Cil.OpCodes.Ldarg_0),
+                il.Create(Mono.Cecil.Cil.OpCodes.Brtrue, keep),
+                il.Create(Mono.Cecil.Cil.OpCodes.Ldarg_3),
+                il.Create(Mono.Cecil.Cil.OpCodes.Ldc_I4_1),
+                il.Create(Mono.Cecil.Cil.OpCodes.Blt, keep),
+                il.Create(Mono.Cecil.Cil.OpCodes.Ldarg_3),
+                il.Create(Mono.Cecil.Cil.OpCodes.Ldc_I4_4),
+                il.Create(Mono.Cecil.Cil.OpCodes.Bgt, keep),
+                il.Create(Mono.Cecil.Cil.OpCodes.Ldarg_3),
+                il.Create(Mono.Cecil.Cil.OpCodes.Ldc_I4_1),
+                il.Create(Mono.Cecil.Cil.OpCodes.Bne_Un, notLinear),
+                il.Create(Mono.Cecil.Cil.OpCodes.Ldc_I4_5),
+                il.Create(Mono.Cecil.Cil.OpCodes.Starg_S, modeParam),
+                il.Create(Mono.Cecil.Cil.OpCodes.Br, keep),
+                notLinear,
+                il.Create(Mono.Cecil.Cil.OpCodes.Ldc_I4_7),
+                il.Create(Mono.Cecil.Cil.OpCodes.Starg_S, modeParam),
+                keep,
+            };
+            foreach (var ins in chain) il.InsertBefore(first, ins);
+            if (m.Body.MaxStackSize < 8) m.Body.MaxStackSize = 8;
+            patched++;
+        }
+        if (patched == 0)
+            throw new InvalidOperationException("scaler fallback found no Mode2 overload");
+    }
+    // The MagicScaler thumbnail path still dies one level deeper: both
+    // pixel-format converters (to/from Pbgra128Float) resolve the source
+    // format through PixelFormatInfo.GetRef, whose value factory calls
+    // straight into the null WIC factory (NRE, treated critical, escapes).
+    // The converters only ever read NumericRepresentation off that info,
+    // and PDN ships a fully managed format table for exactly this query
+    // (PixelFormats.TryGetPixelInfo -> IPixelInfo, same representation
+    // enum). Route both converters through the managed table: the info
+    // local changes type to IPixelInfo, every NumericRepresentation call
+    // is retargeted, and an unknown format fails explicitly instead of
+    // NRE-ing inside WIC. Desktop behavior for known formats is unchanged
+    // (same enum value from the managed table). Public so the rewrite
+    // tests pin it directly, like the Redirect* rules.
+    public static void EnsureThumbnailPixelConvertManaged(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        var ife = module.GetType("PaintDotNet.Imaging.ImagingFactoryExtensions")
+            ?? throw new InvalidOperationException("CpuPaint: ImagingFactoryExtensions missing");
+        var pixelFormats = ResolveExternalDef(module, "PaintDotNet.Primitives", "PaintDotNet.Imaging.PixelFormats");
+        var tryInfo = module.ImportReference(pixelFormats.Methods.First(m => m.Name == "TryGetPixelInfo"
+            && m.Parameters.Count == 2
+            && m.Parameters[0].ParameterType.FullName == "PaintDotNet.Imaging.PixelFormat&"
+            && m.Parameters[1].ParameterType.FullName == "PaintDotNet.Imaging.IPixelInfo&"));
+        var pixelInfo = ResolveExternalDef(module, "PaintDotNet.Primitives", "PaintDotNet.Imaging.IPixelInfo");
+        var pixelInfoRef = module.ImportReference(pixelInfo);
+        var getRep = module.ImportReference(pixelInfo.Methods.First(m => m.Name == "get_NumericRepresentation" && m.Parameters.Count == 0));
+        var ioeCtor = module.ImportReference(typeof(InvalidOperationException).GetConstructor(new[] { typeof(string) })!);
+        int patched = 0;
+        foreach (MethodDefinition m in ife.Methods)
+        {
+            if ((m.Name != "ConvertBitmapToPixelSourcePbgra128Float" && m.Name != "ConvertBitmapFromPrgba128Float") || !m.HasBody) continue;
+            Instruction? infoCall = null;
+            int infoCalls = 0;
+            bool delegates = false;
+            var repSites = new System.Collections.Generic.List<Instruction>();
+            foreach (var ins in m.Body.Instructions)
+            {
+                if (ins.Operand is MethodReference mr)
+                {
+                    if (mr.Name == "GetInfoNoAddRef" && mr.DeclaringType.FullName == "PaintDotNet.Imaging.PixelFormatExtensions")
+                    { infoCall = ins; infoCalls++; }
+                    if (mr.Name == "get_NumericRepresentation" && mr.DeclaringType.FullName == "PaintDotNet.Imaging.IPixelFormatInfo")
+                        repSites.Add(ins);
+                    if ((mr.Name == "ConvertBitmapToPixelSourcePbgra128Float" || mr.Name == "ConvertBitmapFromPrgba128Float"))
+                        delegates = true;
+                }
+            }
+            if (infoCall is null)
+            {
+                // Known wrapper: the short overload converts and delegates
+                // to the full one (patched there).
+                if (!delegates || infoCalls != 0 || repSites.Count != 0)
+                    throw new InvalidOperationException("pixel convert shape changed");
+                continue;
+            }
+            if (m.Body.Variables.Count < 2
+                || m.Body.Variables[1].VariableType.FullName != "PaintDotNet.Imaging.IPixelFormatInfo")
+                throw new InvalidOperationException("pixel convert shape changed");
+            if (infoCalls != 1 || repSites.Count == 0)
+                throw new InvalidOperationException("pixel convert shape changed");
+            if (infoCall.Previous is null || infoCall.Next is null || infoCall.Next.OpCode != Mono.Cecil.Cil.OpCodes.Stloc_1)
+                throw new InvalidOperationException("pixel convert shape changed");
+            var infoLoc = new Mono.Cecil.Cil.VariableDefinition(pixelInfoRef);
+            m.Body.Variables.Add(infoLoc);
+            m.Body.InitLocals = true;
+            m.Body.Variables[1] = new Mono.Cecil.Cil.VariableDefinition(pixelInfoRef);
+            foreach (var site in repSites) site.Operand = getRep;
+            var il = m.Body.GetILProcessor();
+            var anchor = infoCall.Next;
+            var fail = il.Create(Mono.Cecil.Cil.OpCodes.Nop);
+            var seq = new Instruction[]
+            {
+                il.Create(Mono.Cecil.Cil.OpCodes.Ldloca_S, infoLoc),
+                il.Create(Mono.Cecil.Cil.OpCodes.Call, tryInfo),
+                il.Create(Mono.Cecil.Cil.OpCodes.Brfalse, fail),
+                il.Create(Mono.Cecil.Cil.OpCodes.Ldloc, infoLoc),
+                il.Create(Mono.Cecil.Cil.OpCodes.Br, anchor),
+                fail,
+                il.Create(Mono.Cecil.Cil.OpCodes.Ldstr, "pixel convert needs a known pixel format"),
+                il.Create(Mono.Cecil.Cil.OpCodes.Newobj, ioeCtor),
+                il.Create(Mono.Cecil.Cil.OpCodes.Throw),
+            };
+            il.Remove(infoCall);
+            foreach (var ins in seq) il.InsertBefore(anchor, ins);
+            if (m.Body.MaxStackSize < 8) m.Body.MaxStackSize = 8;
+            patched++;
+        }
+        if (patched == 0)
+            throw new InvalidOperationException("pixel convert found no converter");
+    }
+    // One level past the format table: the MagicScaler conversion needs a
+    // color profile handle. ColorProfile.get_MagicProfileHandle goes through
+    // a LazyResult whose interpreter-hostile machinery NREs headless, even
+    // though its factory is pure managed code (ColorProfileHandle.Create
+    // over the profile's own ICC bytes). Bypass the lazy wrapper: compute
+    // the handle directly from profileBytes every call (thumbnails are
+    // infrequent; desktop pays one lazy evaluation, the browser pays one
+    // parse per thumbnail). The proxy override delegates to this getter,
+    // so it heals too. Public so the rewrite tests pin it directly.
+    public static void EnsureThumbnailProfileHandleDirect(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        var profile = module.GetType("PaintDotNet.Imaging.ColorProfile")
+            ?? throw new InvalidOperationException("CpuPaint: ColorProfile missing");
+        var getter = profile.Methods.FirstOrDefault(m => m.Name == "get_MagicProfileHandle" && m.HasBody && m.Parameters.Count == 0)
+            ?? throw new InvalidOperationException("profile handle getter missing");
+        bool hasLazyShape = false;
+        foreach (var ins in getter.Body.Instructions)
+        {
+            if (ins.Operand is FieldReference fr && fr.Name == "magicProfileHandle") hasLazyShape = true;
+        }
+        if (!hasLazyShape)
+            throw new InvalidOperationException("profile handle shape changed");
+        var factory = profile.Methods.FirstOrDefault(m => m.Name == "<.ctor>b__30_0" && m.HasBody)
+            ?? throw new InvalidOperationException("profile handle factory missing");
+        if (factory.Body.ExceptionHandlers.Count != 0 || factory.Body.Variables.Count != 0)
+            throw new InvalidOperationException("profile handle factory shape changed");
+        bool hasCreate = false, hasSpan = false;
+        foreach (var ins in factory.Body.Instructions)
+        {
+            if (ins.OpCode.FlowControl != Mono.Cecil.Cil.FlowControl.Next
+                && ins.OpCode.FlowControl != Mono.Cecil.Cil.FlowControl.Call
+                && ins.OpCode.FlowControl != Mono.Cecil.Cil.FlowControl.Return)
+                throw new InvalidOperationException("profile handle factory shape changed");
+            if (ins.Operand is MethodReference mr)
+            {
+                if (mr.Name == "Create" && mr.DeclaringType.FullName == "PhotoSauce.MagicScaler.Experimental.ColorProfileHandle") hasCreate = true;
+                if (mr.Name == "get_Span") hasSpan = true;
+            }
+        }
+        if (!hasCreate || !hasSpan)
+            throw new InvalidOperationException("profile handle factory shape changed");
+        Instruction? addrOf = null, spanCall = null, createCall = null;
+        foreach (var ins in factory.Body.Instructions)
+        {
+            if ((ins.OpCode == Mono.Cecil.Cil.OpCodes.Ldflda || ins.OpCode == Mono.Cecil.Cil.OpCodes.Ldfld)
+                && ins.Operand is FieldReference pfr && pfr.Name == "profileBytes"
+                && pfr.DeclaringType.FullName == "PaintDotNet.Imaging.ColorProfile") addrOf = ins;
+            if ((ins.OpCode == Mono.Cecil.Cil.OpCodes.Call || ins.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt)
+                && ins.Operand is MethodReference cmr)
+            {
+                if (cmr.Name == "get_Span") spanCall = ins;
+                if (cmr.Name == "Create" && cmr.DeclaringType.FullName == "PhotoSauce.MagicScaler.Experimental.ColorProfileHandle") createCall = ins;
+            }
+        }
+        if (addrOf is null || spanCall is null || createCall is null)
+            throw new InvalidOperationException("profile handle factory shape changed");
+        int ai = factory.Body.Instructions.IndexOf(addrOf);
+        int si = factory.Body.Instructions.IndexOf(spanCall);
+        int ci = factory.Body.Instructions.IndexOf(createCall);
+        if (!(ai < si && si < ci))
+            throw new InvalidOperationException("profile handle factory shape changed");
+        var il = getter.Body.GetILProcessor();
+        getter.Body.ExceptionHandlers.Clear();
+        getter.Body.Variables.Clear();
+        getter.Body.Instructions.Clear();
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+        il.Emit(addrOf.OpCode, (FieldReference)addrOf.Operand);
+        il.Emit(spanCall.OpCode, (MethodReference)spanCall.Operand);
+        il.Emit(createCall.OpCode, (MethodReference)createCall.Operand);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+        getter.Body.InitLocals = factory.Body.InitLocals;
+        if (getter.Body.MaxStackSize < factory.Body.MaxStackSize) getter.Body.MaxStackSize = factory.Body.MaxStackSize;
+    }
+    // MagicScaler probes CPUID unconditionally in HWIntrinsics.getFastGather
+    // (called from the static ctor): the WASM interpreter has no CPUID, so
+    // the probe throws PNSE and every scale transform dies in the type
+    // initializer. The flag exists precisely to select the managed kernels,
+    // so answer false headless: all resampling runs the portable path.
+    // A present desktop keeps probing (this only ships in the rewritten
+    // browser bundle). Public so the rewrite tests pin it directly.
+    public static void EnsureMagicScalerNoSimd(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        var hw = module.GetType("PhotoSauce.MagicScaler.HWIntrinsics")
+            ?? throw new InvalidOperationException("CpuPaint: HWIntrinsics missing");
+        var probe = hw.Methods.FirstOrDefault(m => m.Name == "getFastGather" && m.IsStatic && m.HasBody && m.Parameters.Count == 0)
+            ?? throw new InvalidOperationException("HWIntrinsics probe missing");
+        bool hasCpuId = false;
+        foreach (var ins in probe.Body.Instructions)
+        {
+            if (ins.Operand is MethodReference mr && mr.Name == "CpuId"
+                && mr.DeclaringType.FullName == "System.Runtime.Intrinsics.X86.X86Base") hasCpuId = true;
+        }
+        if (!hasCpuId)
+            throw new InvalidOperationException("HWIntrinsics shape changed");
+        probe.Body.ExceptionHandlers.Clear();
+        probe.Body.Variables.Clear();
+        probe.Body.Instructions.Clear();
+        var pil = probe.Body.GetILProcessor();
+        pil.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_0);
+        pil.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+        probe.Body.InitLocals = false;
+        probe.Body.MaxStackSize = 1;
+    }
+    // DrainThumbnailReadyInvokeList dispatches each ready handler through a
+    // closed ValueEventHandler<T>.Invoke the interpreter cannot JIT
+    // (kind-17 IPE: the render completes, then delivery dies and the
+    // strips stay blank). The stack is already (handler, sender, args),
+    // so swap the callee for the reflection-driven CpuPaint helper and box
+    // the value-typed slots (struct handler/args) to its object params.
+    // Public so the rewrite tests pin it directly, like the Redirect* rules.
+    public static void EnsureThumbnailDrainReflectInvoke(Mono.Cecil.ModuleDefinition module, string? cpuPaintPath)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        var tm = module.GetType("PaintDotNet.Rendering.ThumbnailManager")
+            ?? throw new InvalidOperationException("CpuPaint: ThumbnailManager missing");
+        var drain = tm.Methods.FirstOrDefault(m => m.Name == "DrainThumbnailReadyInvokeList" && m.HasBody)
+            ?? throw new InvalidOperationException("thumbnail drain missing");
+        var helper = ImportCpuPaintMethod(module, cpuPaintPath, "InvokeReadyHandler", 3);
+        int patched = 0;
+        foreach (var ins in drain.Body.Instructions.ToArray())
+        {
+            if (!(ins.OpCode == Mono.Cecil.Cil.OpCodes.Call || ins.OpCode == Mono.Cecil.Cil.OpCodes.Callvirt)) continue;
+            if (!(ins.Operand is MethodReference mr)) continue;
+            if (mr.Name != "Invoke" || !mr.DeclaringType.Name.StartsWith("ValueEventHandler`1", StringComparison.Ordinal)) continue;
+            if (mr.Parameters.Count != 2) throw new InvalidOperationException("drain invoke shape changed");
+            // The (handler, sender, args) triple arrives as three plain
+            // locals (the null-skip rule stashes the tuple fields first, so
+            // static types no longer match the callee tokens). The call
+            // consumes exactly three slots and the three immediately
+            // preceding pushes in this straight-line region are those
+            // arguments; box whichever are value-typed for the helper's
+            // object params. The call-site count check below keeps this
+            // pinned to the single dispatch site.
+            var seq = new System.Collections.Generic.List<Instruction>();
+            var cur = ins.Previous;
+            for (int k = 0; k < 3 && cur is not null; k++) { seq.Add(cur); cur = cur.Previous; }
+            seq.Reverse();
+            if (seq.Count != 3) throw new InvalidOperationException("drain invoke shape changed");
+            var pushTypes = new Mono.Cecil.TypeReference[3];
+            for (int k = 0; k < 3; k++)
+            {
+                var opc = seq[k].OpCode;
+                if (opc != Mono.Cecil.Cil.OpCodes.Ldloc && opc != Mono.Cecil.Cil.OpCodes.Ldloc_S
+                    && opc != Mono.Cecil.Cil.OpCodes.Ldloc_0 && opc != Mono.Cecil.Cil.OpCodes.Ldloc_1
+                    && opc != Mono.Cecil.Cil.OpCodes.Ldloc_2 && opc != Mono.Cecil.Cil.OpCodes.Ldloc_3)
+                    throw new InvalidOperationException("drain invoke shape changed");
+                if (!(seq[k].Operand is Mono.Cecil.Cil.VariableDefinition vd))
+                    throw new InvalidOperationException("drain invoke shape changed");
+                pushTypes[k] = vd.VariableType;
+            }
+            var il = drain.Body.GetILProcessor();
+            if (pushTypes[0].IsValueType) il.InsertAfter(seq[0], il.Create(Mono.Cecil.Cil.OpCodes.Box, pushTypes[0]));
+            if (pushTypes[1].IsValueType) il.InsertAfter(seq[1], il.Create(Mono.Cecil.Cil.OpCodes.Box, pushTypes[1]));
+            if (pushTypes[2].IsValueType) il.InsertAfter(seq[2], il.Create(Mono.Cecil.Cil.OpCodes.Box, pushTypes[2]));
+            ins.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+            ins.Operand = helper;
+            if (drain.Body.MaxStackSize < 8) drain.Body.MaxStackSize = 8;
+            patched++;
+        }
+        if (patched != 1)
+            throw new InvalidOperationException("drain invoke site count changed");
+    }
     // PaintDotNet's environment-inventory diagnostics (DiagnosticsGenerator.
     // GetFormattedText) probes GPU/package/service state that faults headless;
     // the blocking .Result then wraps the ORIGINAL error in an
@@ -8588,7 +9198,7 @@ public static class AssemblyRewriter
         var bytes = File.ReadAllBytes(assemblyPath);
         using var stream = new MemoryStream(bytes);
         string? dir = Path.GetDirectoryName(assemblyPath);
-        using var resolver = new FrameworkResolver(dir, [AppContext.BaseDirectory]);
+        using var resolver = new FrameworkResolver(dir, [@"E:\tmp\rewritten-small", @"E:\tmp\rewritten-paint"]);
         var readerParams = new ReaderParameters { AssemblyResolver = resolver };
         using var assembly = Mono.Cecil.AssemblyDefinition.ReadAssembly(stream, readerParams);
         NeutralizeRichEditOleCallback(assembly.MainModule);
@@ -8962,7 +9572,7 @@ public static class AssemblyRewriter
         var bytes = File.ReadAllBytes(assemblyPath);
         using var stream = new MemoryStream(bytes);
         string? dir = Path.GetDirectoryName(assemblyPath);
-        using var resolver = new FrameworkResolver(dir, [AppContext.BaseDirectory]);
+        using var resolver = new FrameworkResolver(dir, [@"E:\tmp\rewritten-small", @"E:\tmp\rewritten-paint"]);
         var readerParams = new ReaderParameters { AssemblyResolver = resolver };
         using var assembly = Mono.Cecil.AssemblyDefinition.ReadAssembly(stream, readerParams);
         ReplaceRichTextStreamMethods(assembly.MainModule);
@@ -9106,6 +9716,38 @@ public static class AssemblyRewriter
         target.Body.Instructions.Clear();
         var il = target.Body.GetILProcessor();
         il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_0);
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+        if (target.Body.MaxStackSize < 8)
+            target.Body.MaxStackSize = 8;
+    }
+
+    // Syncfusion telemetry asks for the host process name to detect designer
+    // mode (Telemetry.DesignMode => Process.GetCurrentProcess().ProcessName).
+    // Headless the process query throws PNSE, caught by the vendor's own
+    // try/catch (IsDesignerMode -> false, telemetry inert) — but the
+    // first-chance fires in EVERY Syncfusion app boot and buries real triage.
+    // Answer "" instead: no designer token matches, "dotnet"-check misses,
+    // outcome is exactly today's caught path (false), with no throw.
+    // Public so the rewrite tests pin it directly, like the Redirect* rules.
+    public static void NeutralizeTelemetryDesignMode(Mono.Cecil.ModuleDefinition module)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        Mono.Cecil.TypeDefinition telemetry = module.GetType("Syncfusion.Telemetry.Telemetry")
+            ?? throw new InvalidOperationException("SFTel: Telemetry missing");
+        Mono.Cecil.MethodDefinition? target = null;
+        foreach (Mono.Cecil.MethodDefinition m in telemetry.Methods)
+        {
+            if (m.Name == "get_DesignMode" && m.HasBody && m.Parameters.Count == 0
+                && m.ReturnType.FullName == "System.String")
+                target = m;
+        }
+        if (target is null)
+            throw new InvalidOperationException("SFTel: get_DesignMode() missing");
+        target.Body.ExceptionHandlers.Clear();
+        target.Body.Variables.Clear();
+        target.Body.Instructions.Clear();
+        var il = target.Body.GetILProcessor();
+        il.Emit(Mono.Cecil.Cil.OpCodes.Ldstr, "");
         il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
         if (target.Body.MaxStackSize < 8)
             target.Body.MaxStackSize = 8;
@@ -9658,13 +10300,116 @@ public static class AssemblyRewriter
     // that carry no generic token at runtime (call + castclass/unbox
     // of the ORIGINAL return-type token: same stack shape, all tokens
     // assembly-scoped so the nested module-scope check stays green).
+    // TEMP-BISECT rev230 (REVERTED rev231): when true,
+    // RetargetScaledResourceIn leaves Nullable<T>.get_Value/get_HasValue
+    // sites untouched in paintdotnet. Bisect COMPLETE: pristine Nullable
+    // calls fail identically (rev230 kind17=23 = rev229), so the rev209
+    // reroute is EXONERATED; the poison is in original Nullable-closure IL.
+    // Flag stays false; full nullable-erasure is the queued fix.
+    private const bool BisectSkipNullableForPaintdotnet = false;
+
+    // rev245 TEMP-BISECT: when true, skip RetargetScaledResourceHeadless
+    // ENTIRELY (both the ScaledResource AND the Nullable reroutes) for the
+    // transformed module. Tests whether OUR rule emissions (ldobj/box/call-
+    // helper/unbox sequences, which desktop CLR never verifies but Mono WASM
+    // does) are the compile poison, vs original IL. Single variable against
+    // rev244 (guard + poison-call + dispatch neutralizations stay live).
+    // SET TRUE FOR THE BISECT; revert or promote by outcome.
+    private const bool BisectSkipScaledResourceHeadless = true;
+
+    // rev256 TEMP-BISECT: when true, replace the body of
+    // ThumbnailManager.DrainThumbnailReadyInvokeList with a single ret.
+    // Isolates the late-boot death to dispatch-vs-delivery: if PDN
+    // survives with the drain nop'd, the null-site is one of the ready-
+    // handlers; if it still dies, the poison is in discovery/init or the
+    // overdrawn Layers strip. Revert or promote by outcome; do NOT extend.
+    private const bool NeutralizeThumbnailDrainTemp = false; // rev257 DISC: drain LIVE for flood-vs-wedge sampling (revert or promote by outcome)
+
+    // rev259 TEMP-BISECT: when true, the thumbnail drain still snapshots,
+    // disposes bitmaps and returns pooled args, but the ready-handler
+    // Invoke call itself is replaced with pops (handler never runs).
+    // Survival here implicates handler downstream (strip paint on
+    // delivered bitmaps, re-queue); death implicates Dispose / pooled
+    // return / snapshot / lock machinery. Revert or promote by outcome.
+    private const bool SkipThumbnailHandlerInvokeTemp = false; // rev259 PROVEN (Invoke-downstream); Invoke runs again for the animation split
+
+    // rev260 TEMP-BISECT: when true, the two thumbnail ready-handlers
+    // (LayersStrip/DocumentStrip.OnThumbnailUpdated) run normally EXCEPT
+    // the opacity AnimateValueTo call is replaced with pops (animation
+    // never starts). Survival here implicates the animation churn loop;
+    // death implicates invalidate/repaint or SetImage/teardown. Split
+    // with the Update-skipping half next if this dies. Revert or promote.
+    private const bool SkipHandlerAnimationTemp = false; // rev260 EXONERATED (animation skip still died); animation runs again for the Update split
+
+    // rev261 TEMP-BISECT: when true, the two thumbnail ready-handlers
+    // (LayersStrip/DocumentStrip.OnThumbnailUpdated) run normally EXCEPT
+    // the terminal ImageItem.Update call is replaced with a pop (no
+    // invalidate/repaint is requested by delivery). Animation runs (rev260
+    // cleared it). Survival here implicates the repaint/re-queue feedback
+    // loop; death implicates SetImage/teardown. Revert or promote.
+    private const bool SkipHandlerUpdateTemp = false; // rev261 EXONERATED (Update skip still died); full handlers for the delivery proof
+
+    // rev263 TEMP-BISECT (promote if it saves): the drain delivers a NULL
+    // bitmap when the headless render failed (proven: WIC factory null ->
+    // DocumentWorkspace.CreateThumbnailBitmap throws -> null queued ->
+    // handler CreateRefT(null) throws). Desktop never produces null here,
+    // so skipping null-bitmap items at dispatch is principled: per-item
+    // guard before Invoke (log + jump to MoveNext, bypassing Invoke AND
+    // the null-unsafe Dispose/return). If survival follows, the NRE death
+    // was the torn null delivery; if death persists, the LayersStrip item
+    // (non-null bitmap) kills independently. Revert or promote by outcome.
+    private const bool SkipNullBitmapDeliveryTemp = true;
+    // rev279 TEMP-BISECT (REVERT): whole-drain nop re-added to split
+    // render-vs-delivery for the post-delivery sgen assertion. If the
+    // boot-idle probe still crashes with no delivery at all, the render
+    // (rev266 managed scaler) corrupts the heap; if clean, delivery
+    // (helpers or strip paint with real bitmaps) is implicated.
+    private const bool NopDrainBodyTemp279 = false;
+    // rev279b TEMP-BISECT (REVERTED 280d): dispose helper re-enabled
+    // (control B crashed without it, so it is not the sgen trigger;
+    // skipping it leaks pooled args + bitmaps every delivery).
+    private const bool SkipDisposeHelper279b = false;
+    private static void NopDrainBodyTemp279Impl(ModuleDefinition module)
+    {
+        if (!NopDrainBodyTemp279)
+        {
+            return;
+        }
+        var manager = module.GetType("PaintDotNet.Rendering.ThumbnailManager")
+            ?? throw new InvalidOperationException("nopdrain needs ThumbnailManager");
+        var drain = manager.Methods.FirstOrDefault(m => m.Name == "DrainThumbnailReadyInvokeList" && m.HasBody)
+            ?? throw new InvalidOperationException("nopdrain drain missing");
+        drain.Body.ExceptionHandlers.Clear();
+        drain.Body.Variables.Clear();
+        drain.Body.Instructions.Clear();
+        var il = drain.Body.GetILProcessor();
+        il.Emit(OpCodes.Ldstr, "[DRAIN] nop-drain hit");
+        il.Emit(OpCodes.Call, module.ImportReference(typeof(Console).GetMethod("WriteLine", new[] { typeof(string) })!));
+        il.Emit(OpCodes.Ret);
+    }
+
+    // rev262 TEMP-BISECT: when true, log every thumbnail enqueue at the
+    // 3-arg QueueThumbnailUpdate entry (provider type + handler method +
+    // size). Death-time logs then show WHAT was queued in delivery order
+    // (first-delivery-to-X vs re-delivery vs storm) for the ~9 draws that
+    // precede the trap. Null provider/handler would NRE one instruction
+    // earlier than the original code (same fail class, TEMP-documented).
+    // Revert or promote by outcome.
+    private const bool LogThumbnailEnqueueTemp = true;
+
     private static void RetargetScaledResourceHeadless(ModuleDefinition module, string? cpuPaintPath)
     {
+        if (BisectSkipScaledResourceHeadless)
+            return;
         MethodReference getRes = ImportCpuPaintMethod(module, cpuPaintPath, "ScaledResourceGet", 1);
         MethodReference getFac = ImportCpuPaintMethod(module, cpuPaintPath, "ScaledResourceFactor", 1);
+        MethodReference getVal = ImportCpuPaintMethod(module, cpuPaintPath, "NullableValue", 1);
+        MethodReference getHas = ImportCpuPaintMethod(module, cpuPaintPath, "NullableHasValue", 1);
+        MethodReference getGvd = ImportCpuPaintMethod(module, cpuPaintPath, "NullableValueOrDefault", 2);
+        MethodReference typeFromHandle = module.ImportReference(typeof(Type).GetMethod("GetTypeFromHandle", new[] { typeof(RuntimeTypeHandle) })!);
         int count = 0;
         foreach (TypeDefinition type in module.Types)
-            count += RetargetScaledResourceIn(type, getRes, getFac);
+            count += RetargetScaledResourceIn(type, getRes, getFac, getVal, getHas, getGvd, typeFromHandle);
         if (count == 0)
             throw new InvalidOperationException("CpuPaint: no ScaledResource call sites found");
     }
@@ -9684,7 +10429,9 @@ public static class AssemblyRewriter
     }
 
     private static int RetargetScaledResourceIn(
-        TypeDefinition type, MethodReference getRes, MethodReference getFac)
+        TypeDefinition type, MethodReference getRes, MethodReference getFac,
+        MethodReference getVal, MethodReference getHas, MethodReference getGvd,
+        MethodReference typeFromHandle)
     {
         int count = 0;
         foreach (MethodDefinition method in type.Methods)
@@ -9693,21 +10440,77 @@ public static class AssemblyRewriter
             List<Instruction> hits = new List<Instruction>();
             foreach (Instruction ins in method.Body.Instructions)
             {
-                if (ins.OpCode == OpCodes.Callvirt
-                    && ins.Operand is MethodReference mr
+                if (ins.Operand is not MethodReference mr
+                    || mr.DeclaringType is not GenericInstanceType gi
+                    || gi.GenericArguments.Count != 1
+                    || ContainsGenericParameter(gi.GenericArguments[0]))
+                    continue;
+                bool scaledHit = (ins.OpCode == OpCodes.Callvirt
                     && (mr.Name == "get_Resource" || mr.Name == "get_ScaleFactor")
-                    && mr.DeclaringType is GenericInstanceType gi
-                    && gi.ElementType.FullName == "PaintDotNet.Resources.ScaledResource`1"
-                    && gi.GenericArguments.Count == 1
-                    && !ContainsGenericParameter(gi.GenericArguments[0]))
+                    && gi.ElementType.FullName == "PaintDotNet.Resources.ScaledResource`1");
+                bool nullHit = (ins.OpCode == OpCodes.Call || ins.OpCode == OpCodes.Callvirt)
+                    && (mr.Name == "get_Value" || mr.Name == "get_HasValue")
+                    && gi.ElementType.FullName == "System.Nullable`1";
+                // rev239: parameterless GetValueOrDefault is the remaining
+                // direct Nullable-token call on paint paths (PdnToolBar
+                // get_GlassInset; the Framework GPU survivor feeds one
+                // too). The one-arg overload is left alone.
+                bool nullGvdHit = (ins.OpCode == OpCodes.Call || ins.OpCode == OpCodes.Callvirt)
+                    && mr.Name == "GetValueOrDefault" && mr.Parameters.Count == 0
+                    && gi.ElementType.FullName == "System.Nullable`1";
+                // TEMP-BISECT rev230 (REVERT): skip the Nullable reroute for
+                // paintdotnet to test whether the rule broke PaintBackground
+                // invoke (keeps the ScaledResource reroute). Single variable:
+                // PB returns to pristine bytes; everything else unchanged.
+                if (nullHit && BisectSkipNullableForPaintdotnet
+                    && type.Module.Assembly.Name.Name == "paintdotnet")
+                    continue;
+                if (scaledHit || nullHit || nullGvdHit)
                     hits.Add(ins);
             }
             if (hits.Count == 0) continue;
             var il = method.Body.GetILProcessor();
+            bool touched = false;
             foreach (Instruction ins in hits)
             {
                 var mr = (MethodReference)ins.Operand;
                 bool isRes = mr.Name == "get_Resource";
+                bool isVal = mr.Name == "get_Value";
+                bool isHas = mr.Name == "get_HasValue";
+                bool isGvd = mr.Name == "GetValueOrDefault";
+                var giHit = (GenericInstanceType)mr.DeclaringType;
+                // The helper takes object but the stack may hold an
+                // address (ldflda/ldloca for the struct call this): the
+                // missing value-to-object coercion is itself a kind-17
+                // source (reference expected, generic-instance value
+                // found). Dereference in place with ldobj, then box.
+                Instruction? prev = ins.Previous;
+                // NOTE: Cecil keeps short forms as distinct opcodes
+                // (Ldloca_S etc.); matching only the long form silently
+                // skipped every address load and boxed a managed pointer
+                // (rev209 blank chrome: stack addresses reinterpreted as
+                // doubles/scales). Match both forms. The address load
+                // stays untouched (it may be a branch/handler target):
+                // dereference with ldobj, then box. Replacing the load
+                // in place orphans handler/branch references to the old
+                // instruction object (NRE in CodeReader on reload).
+                bool isAddrLoad = prev is not null && (
+                    prev.OpCode == OpCodes.Ldflda
+                    || prev.OpCode == OpCodes.Ldloca || prev.OpCode == OpCodes.Ldloca_S
+                    || prev.OpCode == OpCodes.Ldarga || prev.OpCode == OpCodes.Ldarga_S
+                    || prev.OpCode == OpCodes.Ldsflda);
+                if (prev is not null && prev.OpCode == OpCodes.Dup)
+                    continue;
+                if (isAddrLoad)
+                    il.InsertAfter(prev, il.Create(OpCodes.Ldobj, giHit));
+                il.InsertBefore(ins, il.Create(OpCodes.Box, giHit));
+                if (isGvd)
+                {
+                    // Helper takes (boxed, Type): ldtoken carries the
+                    // concrete instantiation argument, no Nullable token.
+                    il.InsertBefore(ins, il.Create(OpCodes.Ldtoken, giHit.GenericArguments[0]));
+                    il.InsertBefore(ins, il.Create(OpCodes.Call, typeFromHandle));
+                }
                 // The getter's declared return is the open generic
                 // parameter T (Cecil does not inflate through the
                 // instantiation): emitting it as a castclass/unbox
@@ -9717,18 +10520,832 @@ public static class AssemblyRewriter
                 // the factor getter already returns concrete
                 // UIScaleFactor.
                 TypeReference retTok = mr.ReturnType;
-                if (isRes && mr.DeclaringType is GenericInstanceType giRes
-                    && giRes.GenericArguments.Count == 1)
-                    retTok = giRes.GenericArguments[0];
+                if ((isRes || isVal || isGvd) && giHit.GenericArguments.Count == 1)
+                    retTok = giHit.GenericArguments[0];
                 ins.OpCode = OpCodes.Call;
-                ins.Operand = isRes ? getRes : getFac;
-                il.InsertAfter(ins, il.Create(
-                    isRes ? OpCodes.Castclass : OpCodes.Unbox_Any, retTok));
+                ins.Operand = isRes ? getRes : isVal ? getVal : isHas ? getHas : isGvd ? getGvd : getFac;
+                touched = true;
+                if (!isHas)
+                {
+                    // Nullable<T>.Value / GetValueOrDefault need unbox for
+                    // struct T (WindowColorizationInfo), castclass for
+                    // reference T.
+                    bool valueType = false;
+                    if (isVal || isGvd)
+                    {
+                        try
+                        {
+                            var resolved = retTok.Resolve();
+                            valueType = resolved is not null && resolved.IsValueType;
+                        }
+                        catch { valueType = false; }
+                    }
+                    il.InsertAfter(ins, il.Create(
+                        (isRes || ((isVal || isGvd) && !valueType)) ? OpCodes.Castclass : OpCodes.Unbox_Any, retTok));
+                }
                 count++;
+            }
+            // Inserted ldobj/box/follow-up bytes can push a short
+            // branch (br.s ±127) out of range; the operand wraps and
+            // the verifier reports an invalid target. Expand short
+            // branches to long form in place (opcode swap only: no
+            // list surgery, all references stay valid). Fixpoint: one
+            // expansion can push a neighbor out of range.
+            if (touched)
+                ExpandShortBranches(method);
+            // Nullable<T> helpers box the value first, so the follow-up
+            // token rules match the ScaledResource ones (inflated T).
+        }
+        foreach (TypeDefinition nested in type.NestedTypes)
+            count += RetargetScaledResourceIn(nested, getRes, getFac, getVal, getHas, getGvd, typeFromHandle);
+        return count;
+    }
+
+    private static readonly System.Collections.Generic.Dictionary<OpCode, OpCode> s_shortToLongBranch =
+        new System.Collections.Generic.Dictionary<OpCode, OpCode>
+        {
+            { OpCodes.Br_S, OpCodes.Br },
+            { OpCodes.Brfalse_S, OpCodes.Brfalse },
+            { OpCodes.Brtrue_S, OpCodes.Brtrue },
+            { OpCodes.Beq_S, OpCodes.Beq },
+            { OpCodes.Bge_S, OpCodes.Bge },
+            { OpCodes.Bgt_S, OpCodes.Bgt },
+            { OpCodes.Ble_S, OpCodes.Ble },
+            { OpCodes.Blt_S, OpCodes.Blt },
+            { OpCodes.Bne_Un_S, OpCodes.Bne_Un },
+            { OpCodes.Bge_Un_S, OpCodes.Bge_Un },
+            { OpCodes.Bgt_Un_S, OpCodes.Bgt_Un },
+            { OpCodes.Ble_Un_S, OpCodes.Ble_Un },
+            { OpCodes.Blt_Un_S, OpCodes.Blt_Un },
+            { OpCodes.Leave_S, OpCodes.Leave },
+        };
+
+    // Resolve a plain ldarg[.s|_N] of a byref parameter (Cecil leaves
+    // Operand empty on the ldarg.0-3 macros): returns the parameter when
+    // its type is a managed pointer, else null.
+    private static ParameterDefinition? OutByRefArg(MethodDefinition method, Instruction? prev)
+    {
+        if (prev is null)
+            return null;
+        if (prev.OpCode == OpCodes.Ldarg || prev.OpCode == OpCodes.Ldarg_S)
+        {
+            if (prev.Operand is ParameterDefinition pd
+                && pd.ParameterType is ByReferenceType)
+                return pd;
+            return null;
+        }
+        int idx = prev.OpCode == OpCodes.Ldarg_0 ? 0
+            : prev.OpCode == OpCodes.Ldarg_1 ? 1
+            : prev.OpCode == OpCodes.Ldarg_2 ? 2
+            : prev.OpCode == OpCodes.Ldarg_3 ? 3 : -1;
+        if (idx < 0)
+            return null;
+        int pidx = method.HasThis ? idx - 1 : idx;
+        if (pidx < 0 || pidx >= method.Parameters.Count)
+            return null;
+        var p = method.Parameters[pidx];
+        return p.ParameterType is ByReferenceType ? p : null;
+    }
+
+    private static void ExpandShortBranches(MethodDefinition method)
+    {
+        for (int pass = 0; pass < 10; pass++)
+        {
+            var offsets = new System.Collections.Generic.Dictionary<Instruction, int>();
+            int pos = 0;
+            foreach (Instruction ins in method.Body.Instructions)
+            {
+                offsets[ins] = pos;
+                pos += ins.GetSize();
+            }
+            bool changed = false;
+            foreach (Instruction ins in method.Body.Instructions)
+            {
+                if (!s_shortToLongBranch.TryGetValue(ins.OpCode, out OpCode big))
+                    continue;
+                if (ins.Operand is not Instruction target)
+                    continue;
+                int dist = offsets[target] - (offsets[ins] + ins.GetSize());
+                if (dist < sbyte.MinValue || dist > sbyte.MaxValue)
+                {
+                    ins.OpCode = big;
+                    changed = true;
+                }
+            }
+            if (!changed)
+                break;
+        }
+    }
+
+    // Dictionary<K,V>.TryGetValue kind-17s headless for at least the
+    // Dictionary<Control,int> instantiation (UIHelpers reentrancy guard,
+    // touch-logged live: the touch prints, the call throws). Reroute
+    // closed instantiations through the IDictionary helper above. Shape:
+    // dict, key, addr -> pop addr, push temp-object addr, call helper,
+    // then unbox/cast the temp past the original true-branch. The temp
+    // slot is one object local per method; prev is never modified (it
+    // may be a branch/handler target).
+    private const bool BisectSkipDictReroute = false;
+
+    private static int RetargetDictionaryTryGet(ModuleDefinition module, string? cpuPaintPath)
+    {
+        if (BisectSkipDictReroute)
+            return 0;
+        MethodReference helper = ImportCpuPaintMethod(module, cpuPaintPath, "DictTryGetValue", 3);
+        int count = 0;
+        foreach (TypeDefinition type in module.Types)
+            count += RetargetDictionaryTryGetIn(module, type, helper);
+        return count;
+    }
+
+    private static int RetargetDictionaryTryGetIn(ModuleDefinition module, TypeDefinition type, MethodReference helper)
+    {
+        int count = 0;
+        foreach (MethodDefinition method in type.Methods)
+        {
+            if (!method.HasBody) continue;
+            var hits = new System.Collections.Generic.List<Instruction>();
+            foreach (Instruction ins in method.Body.Instructions)
+            {
+                if ((ins.OpCode != OpCodes.Call && ins.OpCode != OpCodes.Callvirt)
+                    || ins.Operand is not MethodReference mr
+                    || mr.Name != "TryGetValue"
+                    || mr.DeclaringType is not GenericInstanceType gi
+                    || gi.ElementType.FullName != "System.Collections.Generic.Dictionary`2"
+                    || gi.GenericArguments.Count != 2
+                    || ContainsGenericParameter(gi.GenericArguments[0])
+                    || ContainsGenericParameter(gi.GenericArguments[1]))
+                    continue;
+                hits.Add(ins);
+            }
+            if (hits.Count == 0) continue;
+            var il = method.Body.GetILProcessor();
+            var tmp = new VariableDefinition(module.TypeSystem.Object);
+            var flag = new VariableDefinition(module.TypeSystem.Boolean);
+            var owner = new VariableDefinition(module.TypeSystem.Object);
+            method.Body.Variables.Add(tmp);
+            method.Body.Variables.Add(flag);
+            method.Body.Variables.Add(owner);
+            method.Body.InitLocals = true;
+            bool touched = false;
+            foreach (Instruction ins in hits)
+            {
+                Instruction? prev = ins.Previous;
+                // The out-address arrives as an address load (ldloca /
+                // ldflda / ldarga / ldsflda, short forms included) or as
+                // a plain ldarg of a byref parameter (Cecil leaves
+                // Operand empty on ldarg.0-3, so resolve by index).
+                ParameterDefinition? outArg = OutByRefArg(method, prev);
+                bool outIsArgPtr = outArg is not null;
+                bool outOk = outIsArgPtr || (prev is not null && (prev.OpCode == OpCodes.Ldloca
+                    || prev.OpCode == OpCodes.Ldloca_S || prev.OpCode == OpCodes.Ldflda
+                    || prev.OpCode == OpCodes.Ldarga || prev.OpCode == OpCodes.Ldarga_S
+                    || prev.OpCode == OpCodes.Ldsflda));
+                if (!outOk)
+                    continue;
+                // Guards BEFORE any insert. Instance-field addresses need
+                // their object to recompute: spill a reference-type owner
+                // (dup + stloc before the load); value-type owners and
+                // anything else unrecognized stay pristine (the pin test
+                // lists survivors).
+                bool ownerSpilled = false;
+                FieldReference? spillField = null;
+                if (prev.OpCode == OpCodes.Ldflda)
+                {
+                    spillField = (Mono.Cecil.FieldReference)prev.Operand;
+                    bool ownerRef = false;
+                    try
+                    {
+                        var dt = spillField.DeclaringType.Resolve();
+                        ownerRef = dt is not null && !dt.IsValueType;
+                    }
+                    catch { ownerRef = false; }
+                    if (!ownerRef)
+                        continue;
+                    il.InsertBefore(prev, il.Create(OpCodes.Dup));
+                    il.InsertBefore(prev, il.Create(OpCodes.Stloc, owner));
+                    ownerSpilled = true;
+                }
+                var giHit = (GenericInstanceType)((MethodReference)ins.Operand).DeclaringType;
+                // Neutralize the original out-address load: it is
+                // redundant (the address is re-emitted fresh for the
+                // store). Nop it instead of loading + popping: popping
+                // a managed pointer is unverifiable under Mono
+                // (invoke-time kind-17 in IsControlPaintingEnabled) while
+                // nop preserves all branch/handler references. The
+                // ldflda path still needs its pop (that load consumes
+                // the spilled owner object; nop-ing it would strand the
+                // object on the stack).
+                bool prevConsumes = prev.OpCode == OpCodes.Ldflda;
+                // Snapshot prev's shape BEFORE neutralizing it below
+                // (emitAddr re-reads it for both the hit and miss paths
+                // and needs fresh Instruction objects each time).
+                OpCode prevAddrOp = prev.OpCode;
+                object? prevAddrOperand = prev.Operand;
+                if (!prevConsumes)
+                {
+                    prev.OpCode = OpCodes.Nop;
+                    prev.Operand = null;
+                }
+                else
+                {
+                    il.InsertBefore(ins, il.Create(OpCodes.Pop));
+                }
+                il.InsertBefore(ins, il.Create(OpCodes.Ldloca, tmp));
+                ins.OpCode = OpCodes.Call;
+                ins.Operand = helper;
+                // BCL-exact: the out slot must read default(V) on miss and
+                // the original branch must keep its labels. Duplicate the
+                // helper bool; hit path stores the value, miss path stores
+                // the default, both push the bool the original branch
+                // consumes. Stores go THROUGH the re-emitted address
+                // (stind/stobj: starg would replace the pointer itself,
+                // which is unverifiable and killed MainForm..ctor on
+                // rev214).
+                TypeReference vTok = giHit.GenericArguments[1];
+                bool valueType = false;
+                try
+                {
+                    var resolved = vTok.Resolve();
+                    valueType = resolved is not null && resolved.IsValueType;
+                }
+                catch { valueType = false; }
+                System.Collections.Generic.List<Instruction> emitAddr()
+                {
+                    var list = new System.Collections.Generic.List<Instruction>();
+                    if (ownerSpilled && spillField is not null)
+                    {
+                        list.Add(il.Create(OpCodes.Ldloc, owner));
+                        list.Add(il.Create(OpCodes.Ldflda, spillField));
+                        return list;
+                    }
+                    if (prevAddrOp == OpCodes.Ldloca || prevAddrOp == OpCodes.Ldloca_S)
+                        list.Add(il.Create(OpCodes.Ldloca, (Mono.Cecil.Cil.VariableDefinition)prevAddrOperand!));
+                    else if (prevAddrOp == OpCodes.Ldarga || prevAddrOp == OpCodes.Ldarga_S)
+                        list.Add(il.Create(OpCodes.Ldarga, (Mono.Cecil.ParameterDefinition)prevAddrOperand!));
+                    else if (prevAddrOp == OpCodes.Ldsflda)
+                        list.Add(il.Create(OpCodes.Ldsflda, (Mono.Cecil.FieldReference)prevAddrOperand!));
+                    else if (outArg is not null && (prevAddrOp == OpCodes.Ldarg || prevAddrOp == OpCodes.Ldarg_S))
+                        list.Add(il.Create(prevAddrOp, outArg));
+                    else
+                        list.Add(il.Create(prevAddrOp));
+                    return list;
+                }
+                // General shape (works whether or not a branch follows):
+                // stash the bool, store value-or-default through the
+                // re-emitted address, then push the bool back for the
+                // original consumer.
+                Instruction joinBr = ins.Next;
+                var missLbl = il.Create(OpCodes.Nop);
+                var doneLbl = il.Create(OpCodes.Nop);
+                il.InsertBefore(joinBr, il.Create(OpCodes.Stloc, flag));
+                il.InsertBefore(joinBr, il.Create(OpCodes.Ldloc, flag));
+                il.InsertBefore(joinBr, il.Create(OpCodes.Brfalse, missLbl));
+                foreach (var a in emitAddr())
+                    il.InsertBefore(joinBr, a);
+                il.InsertBefore(joinBr, il.Create(OpCodes.Ldloc, tmp));
+                il.InsertBefore(joinBr, il.Create(
+                    valueType ? OpCodes.Unbox_Any : OpCodes.Castclass, vTok));
+                if (valueType)
+                    il.InsertBefore(joinBr, il.Create(OpCodes.Stobj, vTok));
+                else
+                    il.InsertBefore(joinBr, il.Create(OpCodes.Stind_Ref));
+                il.InsertBefore(joinBr, il.Create(OpCodes.Br, doneLbl));
+                il.InsertBefore(joinBr, missLbl);
+                foreach (var a in emitAddr())
+                    il.InsertBefore(joinBr, a);
+                if (valueType)
+                    il.InsertBefore(joinBr, il.Create(OpCodes.Initobj, vTok));
+                else
+                {
+                    il.InsertBefore(joinBr, il.Create(OpCodes.Ldnull));
+                    il.InsertBefore(joinBr, il.Create(OpCodes.Stind_Ref));
+                }
+                il.InsertBefore(joinBr, doneLbl);
+                il.InsertBefore(joinBr, il.Create(OpCodes.Ldloc, flag));
+                touched = true;
+                count++;
+            }
+            if (touched)
+                ExpandShortBranches(method);
+        }
+        foreach (TypeDefinition nested in type.NestedTypes)
+            count += RetargetDictionaryTryGetIn(module, nested, helper);
+        return count;
+    }
+
+    // LayersStrip/ImageStrip shadow bitmap caches: guarded Add still
+    // throws (Key:50,50) because the interpreter mis-evaluates
+    // value-type-key Find while Insert detects the duplicate. Route the
+    // two shadow-cache Add sites (and only those) through
+    // CpuPaint.DictTryAddValue(object, object, object): same stack
+    // order as the instance Add, bool result popped.
+    // Single-value loader check for the TryGetValue key slot (ldloc /
+    // ldarg only; anything fancier stays pristine).
+    private static bool IsSinglePushLoader(Instruction ins)
+    {
+        var c = ins.OpCode.Code;
+        return c == Mono.Cecil.Cil.Code.Ldloc_0 || c == Mono.Cecil.Cil.Code.Ldloc_1
+            || c == Mono.Cecil.Cil.Code.Ldloc_2 || c == Mono.Cecil.Cil.Code.Ldloc_3
+            || c == Mono.Cecil.Cil.Code.Ldloc || c == Mono.Cecil.Cil.Code.Ldloc_S
+            || c == Mono.Cecil.Cil.Code.Ldarg_0 || c == Mono.Cecil.Cil.Code.Ldarg_1
+            || c == Mono.Cecil.Cil.Code.Ldarg_2 || c == Mono.Cecil.Cil.Code.Ldarg_3
+            || c == Mono.Cecil.Cil.Code.Ldarg || c == Mono.Cecil.Cil.Code.Ldarg_S;
+    }
+
+    private static TypeReference LoaderPushedType(Instruction ins)
+    {
+        if (ins.Operand is VariableDefinition vd) return vd.VariableType;
+        if (ins.Operand is ParameterDefinition pd) return pd.ParameterType;
+        return null;
+    }
+
+    // Shadow-cache TryGetValue (rev282 REAL FIX): the same interpreter
+    // value-type-key Find mis-evaluation that tore Add (tearing the table
+    // so the next draw OOB-traps) also poisons TryGetValue on
+    // Dictionary<SizeInt32,DeviceBitmap>. The crash render dies after the
+    // shadow resource upload with no composite ever reached; shadows-off
+    // lives and RenderInside no-op does not save it, so the remaining
+    // pristine dict op in the window (this TryGetValue) is the planter.
+    // Retarget ONLY the two shadow-cache Get sites (same narrow allowlist
+    // as Add/Clear) to the scan-backed DictTryGetValue helper, which
+    // consults the side table first and never touches the hash Find.
+    private static int RetargetShadowCacheTryGet(ModuleDefinition module, string? cpuPaintPath)
+    {
+        var helper = ImportCpuPaintMethod(module, cpuPaintPath, "DictTryGetValue", 3);
+        int count = 0;
+        foreach (TypeDefinition type in module.Types)
+            count += RetargetShadowCacheTryGetIn(module, type, helper);
+        return count;
+    }
+
+    private static int RetargetShadowCacheTryGetIn(ModuleDefinition module, TypeDefinition type, MethodReference helper)
+    {
+        int count = 0;
+        bool inScope = type.Name == "VerticalImageStrip" || type.Name == "ImageStrip";
+        if (inScope)
+        {
+            foreach (MethodDefinition method in type.Methods)
+            {
+                if ((method.Name != "DrawItemImageShadow" && method.Name != "DrawImageItemImageShadow") || !method.HasBody)
+                    continue;
+                var il = method.Body.GetILProcessor();
+                var insns = method.Body.Instructions;
+                for (int i = 3; i < insns.Count; i++)
+                {
+                    Instruction call = insns[i];
+                    if ((call.OpCode != OpCodes.Call && call.OpCode != OpCodes.Callvirt)
+                        || call.Operand is not MethodReference mr
+                        || mr.Name != "TryGetValue"
+                        || mr.ReturnType.FullName != "System.Boolean"
+                        || mr.Parameters.Count != 2
+                        || mr.DeclaringType is not GenericInstanceType gi
+                        || gi.ElementType.FullName != "System.Collections.Generic.Dictionary`2"
+                        || gi.GenericArguments.Count != 2
+                        || ContainsGenericParameter(gi.GenericArguments[0])
+                        || ContainsGenericParameter(gi.GenericArguments[1]))
+                        continue;
+                    Instruction ldOut = insns[i - 1];
+                    Instruction ldKey = insns[i - 2];
+                    Instruction ldDict = insns[i - 3];
+                    if (ldOut.OpCode != OpCodes.Ldloca && ldOut.OpCode != OpCodes.Ldloca_S)
+                        continue;
+                    if (!IsSinglePushLoader(ldKey))
+                        continue;
+                    if (ldDict.OpCode != OpCodes.Ldfld)
+                        continue;
+                    VariableDefinition outVar = (VariableDefinition)ldOut.Operand;
+                    TypeReference keyType = LoaderPushedType(ldKey);
+                    if (keyType == null)
+                        continue;
+                    TypeReference valType = gi.GenericArguments[1];
+                    var objTmp = new VariableDefinition(module.TypeSystem.Object);
+                    var boolTmp = new VariableDefinition(module.TypeSystem.Boolean);
+                    method.Body.Variables.Add(objTmp);
+                    method.Body.Variables.Add(boolTmp);
+                    method.Body.InitLocals = true;
+                    if (keyType.IsValueType)
+                        il.InsertAfter(ldKey, il.Create(OpCodes.Box, keyType));
+                    ldOut.Operand = objTmp;
+                    call.OpCode = OpCodes.Call;
+                    call.Operand = helper;
+                    var storeBool = il.Create(OpCodes.Stloc, boolTmp);
+                    var loadObj = il.Create(OpCodes.Ldloc, objTmp);
+                    var castVal = il.Create(OpCodes.Castclass, valType);
+                    var storeOut = il.Create(OpCodes.Stloc, outVar);
+                    var loadBool = il.Create(OpCodes.Ldloc, boolTmp);
+                    il.InsertAfter(call, storeBool);
+                    il.InsertAfter(storeBool, loadObj);
+                    il.InsertAfter(loadObj, castVal);
+                    il.InsertAfter(castVal, storeOut);
+                    il.InsertAfter(storeOut, loadBool);
+                    count++;
+                    i += 5;
+                }
+                if (count > 0)
+                    ExpandShortBranches(method);
             }
         }
         foreach (TypeDefinition nested in type.NestedTypes)
-            count += RetargetScaledResourceIn(nested, getRes, getFac);
+            count += RetargetShadowCacheTryGetIn(module, nested, helper);
+        return count;
+    }
+
+private static int RetargetShadowCacheTryAdd(ModuleDefinition module, string? cpuPaintPath)
+    {
+        if (BisectSkipDictReroute)
+            return 0;
+        var helper = ImportCpuPaintMethod(module, cpuPaintPath, "DictTryAddValue", 3);
+        int count = 0;
+        foreach (TypeDefinition type in module.Types)
+            count += RetargetShadowCacheTryAddIn(module, type, helper);
+        return count;
+    }
+
+    private static int RetargetShadowCacheTryAddIn(ModuleDefinition module, TypeDefinition type, MethodReference helper)
+    {
+        int count = 0;
+        bool inScope = type.Name == "VerticalImageStrip" || type.Name == "ImageStrip";
+        if (inScope)
+        {
+            foreach (MethodDefinition method in type.Methods)
+            {
+                if ((method.Name != "DrawItemImageShadow" && method.Name != "DrawImageItemImageShadow") || !method.HasBody)
+                    continue;
+                var il = method.Body.GetILProcessor();
+                var hits = new System.Collections.Generic.List<Instruction>();
+                foreach (Instruction ins in method.Body.Instructions)
+                {
+                    if ((ins.OpCode != OpCodes.Call && ins.OpCode != OpCodes.Callvirt)
+                        || ins.Operand is not MethodReference mr
+                        || mr.Name != "Add"
+                        || mr.DeclaringType is not GenericInstanceType gi
+                        || gi.ElementType.FullName != "System.Collections.Generic.Dictionary`2"
+                        || gi.GenericArguments.Count != 2
+                        || ContainsGenericParameter(gi.GenericArguments[0])
+                        || ContainsGenericParameter(gi.GenericArguments[1]))
+                        continue;
+                    hits.Add(ins);
+                }
+                foreach (Instruction ins in hits)
+                {
+                    ins.OpCode = OpCodes.Call;
+                    ins.Operand = helper;
+                    il.InsertAfter(ins, il.Create(OpCodes.Pop));
+                    count++;
+                }
+                if (count > 0)
+                    ExpandShortBranches(method);
+            }
+        }
+        foreach (TypeDefinition nested in type.NestedTypes)
+            count += RetargetShadowCacheTryAddIn(module, nested, helper);
+        return count;
+    }
+
+    private static int RetargetShadowCacheClear(ModuleDefinition module, string? cpuPaintPath)
+    {
+        if (BisectSkipDictReroute)
+            return 0;
+        var helper = ImportCpuPaintMethod(module, cpuPaintPath, "DictShadowClear", 1);
+        int count = 0;
+        foreach (TypeDefinition type in module.Types)
+            count += RetargetShadowCacheClearIn(module, type, helper);
+        return count;
+    }
+
+    private static int RetargetShadowCacheClearIn(ModuleDefinition module, TypeDefinition type, MethodReference helper)
+    {
+        int count = 0;
+        bool inScope = type.Name == "VerticalImageStrip" || type.Name == "ImageStrip";
+        if (inScope)
+        {
+            foreach (MethodDefinition method in type.Methods)
+            {
+                if ((method.Name != "ClearDropShadowDeviceBitmapCache" && method.Name != "OnDispose"
+                    && method.Name != "OnThemeConfigChanged") || !method.HasBody)
+                    continue;
+                var il = method.Body.GetILProcessor();
+                var hits = new System.Collections.Generic.List<Instruction>();
+                foreach (Instruction ins in method.Body.Instructions)
+                {
+                    if ((ins.OpCode != OpCodes.Call && ins.OpCode != OpCodes.Callvirt)
+                        || ins.Operand is not MethodReference mr
+                        || mr.Name != "Clear"
+                        || mr.DeclaringType is not GenericInstanceType gi
+                        || gi.ElementType.FullName != "System.Collections.Generic.Dictionary`2"
+                        || gi.GenericArguments.Count != 2
+                        || ContainsGenericParameter(gi.GenericArguments[0])
+                        || ContainsGenericParameter(gi.GenericArguments[1]))
+                        continue;
+                    hits.Add(ins);
+                }
+                foreach (Instruction ins in hits)
+                {
+                    // Void static helper consumes the same dict ref; no
+                    // stack residue, so no Pop is emitted.
+                    ins.OpCode = OpCodes.Call;
+                    ins.Operand = helper;
+                    count++;
+                }
+                if (count > 0)
+                    ExpandShortBranches(method);
+            }
+        }
+        foreach (TypeDefinition nested in type.NestedTypes)
+            count += RetargetShadowCacheClearIn(module, nested, helper);
+        return count;
+    }
+
+    // Setting<TValue>.OnValidateValueT headless: virtual dispatch on a
+    // value-type generic instantiation (Setting<FormWindowState>,
+    // ScalarSetting<double>, ...) throws InvalidProgramException in the
+    // browser interpreter — the callee body is trivial (ldc.i4.1, ret)
+    // and never starts, the type instantiates and unbox.any TValue
+    // executes fine, so only the callvirt itself is broken
+    // (touch-attributed: Setting`1::OnValidateValue@0007 is the last
+    // print before MainForm..ctor dies in AppSettings validation).
+    // Reroute every call/callvirt through
+    // CpuPaint.SettingValidateValueT(object, object), which dispatches
+    // via reflection. The value on the stack is the raw TValue, so a
+    // box of the instantiation argument is inserted first (box of a
+    // generic parameter is interpreter-safe per the Nullable reroute).
+    private const bool BisectSkipSettingsReroutes = false;
+
+    private static int RetargetSettingValidateValueT(ModuleDefinition module, string? cpuPaintPath)
+    {
+        if (BisectSkipSettingsReroutes)
+            return 0;
+        MethodReference helper = ImportCpuPaintMethod(module, cpuPaintPath, "SettingValidateValueT", 2);
+        int count = 0;
+        foreach (TypeDefinition type in module.Types)
+            count += RetargetSettingValidateValueTIn(module, type, helper);
+        return count;
+    }
+
+    private static int RetargetSettingValidateValueTIn(ModuleDefinition module, TypeDefinition type, MethodReference helper)
+    {
+        int count = 0;
+        foreach (MethodDefinition method in type.Methods)
+        {
+            if (!method.HasBody) continue;
+            var hits = new System.Collections.Generic.List<Instruction>();
+            foreach (Instruction ins in method.Body.Instructions)
+            {
+                // Callvirt ONLY: a non-virtual `call` is a base-call with
+                // exact-implementation semantics (e.g. StringSetting calls
+                // base Setting<string>.OnValidateValueT). Rerouting it
+                // through the virtual-dispatching helper recurses
+                // infinitely (override -> helper -> override: tab death by
+                // stack overflow). Pristine base-calls on reference-type
+                // instantiations execute natively; value-type base-calls
+                // are unreachable (every virtual entry is rerouted and
+                // reflection cannot invoke value-type overrides, so the
+                // override bodies never execute headless).
+                if (ins.OpCode != OpCodes.Callvirt
+                    || ins.Operand is not MethodReference mr
+                    || mr.Name != "OnValidateValueT"
+                    || mr.DeclaringType is not GenericInstanceType gi
+                    || !gi.ElementType.FullName.StartsWith("PaintDotNet.Settings.Setting", StringComparison.Ordinal)
+                    || gi.GenericArguments.Count != 1)
+                    continue;
+                hits.Add(ins);
+            }
+            if (hits.Count == 0) continue;
+            var il = method.Body.GetILProcessor();
+            bool touched = false;
+            foreach (Instruction ins in hits)
+            {
+                var gi = (GenericInstanceType)((MethodReference)ins.Operand).DeclaringType;
+                il.InsertBefore(ins, il.Create(OpCodes.Box, gi.GenericArguments[0]));
+                ins.OpCode = OpCodes.Call;
+                ins.Operand = helper;
+                touched = true;
+                count++;
+            }
+            if (touched)
+                ExpandShortBranches(method);
+        }
+        foreach (TypeDefinition nested in type.NestedTypes)
+            count += RetargetSettingValidateValueTIn(module, nested, helper);
+        return count;
+    }
+
+    // EqualityComparer<TValue> headless: the static get_Default() on a
+    // value-type instantiation throws InvalidProgramException in the
+    // browser interpreter (touch-attributed: OnGetStaticEqualityComparer
+    // dies inside Setting.Initialize during ScalarSetting/DoubleSetting
+    // construction), and the Equals/GetHashCode virtuals on the
+    // resulting comparer would throw the same way. Reroute all three
+    // through CpuPaint helpers carrying only objects (plus a
+    // System.Type for the static factory, via ldtoken which is
+    // interpreter-safe). Reference-type instantiations reroute
+    // uniformly (same comparer, same answers; mirrors the Dictionary
+    // rule's uniform scope). Sites that are branch or handler targets
+    // stay pristine (inserting stack surgery ahead of them would be
+    // skipped by the incoming edge) and are reported; the pin test
+    // requires zero survivors in the shipped inputs.
+    private static int RetargetSettingEqualityComparer(ModuleDefinition module, string? cpuPaintPath)
+    {
+        if (BisectSkipSettingsReroutes)
+            return 0;
+        MethodReference getDefault = ImportCpuPaintMethod(module, cpuPaintPath, "SettingEqualityComparer", 1);
+        MethodReference equals = ImportCpuPaintMethod(module, cpuPaintPath, "SettingComparerEquals", 3);
+        MethodReference getHash = ImportCpuPaintMethod(module, cpuPaintPath, "SettingComparerHash", 2);
+        MethodReference getComparer = ImportCpuPaintMethod(module, cpuPaintPath, "SettingGetComparer", 1);
+        MethodReference typeFromHandle = module.ImportReference(
+            typeof(Type).GetMethod("GetTypeFromHandle", new[] { typeof(RuntimeTypeHandle) })!);
+        int count = 0;
+        foreach (TypeDefinition type in module.Types)
+            count += RetargetSettingEqualityComparerIn(module, type, getDefault, equals, getHash, getComparer, typeFromHandle);
+        return count;
+    }
+
+    // SettingConverter.OnValidateValue(Type, object) invisible dispatch:
+    // the static token at the call site is the non-generic base, so no
+    // touch can attribute it, but at runtime it dispatches to the
+    // SettingConverter<TValue> override, which throws InvalidProgram on
+    // value-type instantiations (attributed by elimination: the override
+    // body is now only the rev219 helper call, Setting.Initialize is on
+    // the [1ST] stack, and no touch from inside the override prints).
+    // Reroute every call/callvirt (base-typed or generic-typed) through
+    // CpuPaint.SettingConverterValidateValue. Stack shape is already
+    // (converter, Type, object): no surgery, just a token swap.
+    private static int RetargetSettingConverterValidate(ModuleDefinition module, string? cpuPaintPath)
+    {
+        if (BisectSkipSettingsReroutes)
+            return 0;
+        MethodReference helper = ImportCpuPaintMethod(module, cpuPaintPath, "SettingConverterValidateValue", 3);
+        int count = 0;
+        foreach (TypeDefinition type in module.Types)
+            count += RetargetSettingConverterValidateIn(module, type, helper);
+        return count;
+    }
+
+    private static int RetargetSettingConverterValidateIn(ModuleDefinition module, TypeDefinition type, MethodReference helper)
+    {
+        int count = 0;
+        foreach (MethodDefinition method in type.Methods)
+        {
+            if (!method.HasBody) continue;
+            var hits = new System.Collections.Generic.List<Instruction>();
+            foreach (Instruction ins in method.Body.Instructions)
+            {
+                // Callvirt only: same base-call recursion hazard as
+                // OnValidateValueT (a `call` is exact-implementation).
+                if (ins.OpCode != OpCodes.Callvirt
+                    || ins.Operand is not MethodReference mr
+                    || mr.Name != "OnValidateValue"
+                    || mr.Parameters.Count != 2
+                    || mr.Parameters[0].ParameterType.FullName != "System.Type"
+                    || mr.Parameters[1].ParameterType.FullName != "System.Object")
+                    continue;
+                string? decl = mr.DeclaringType?.FullName;
+                bool isBase = decl == "PaintDotNet.Settings.SettingConverter";
+                bool isGeneric = mr.DeclaringType is GenericInstanceType gi
+                    && gi.ElementType.FullName == "PaintDotNet.Settings.SettingConverter`1"
+                    && gi.GenericArguments.Count == 1;
+                if (!isBase && !isGeneric)
+                    continue;
+                hits.Add(ins);
+            }
+            if (hits.Count == 0) continue;
+            bool touched = false;
+            foreach (Instruction ins in hits)
+            {
+                if (IsControlTarget(method, ins))
+                {
+                    Console.WriteLine(
+                        $"CpuFx: converter-validate reroute skipped control-target {type.FullName}::{method.Name}");
+                    continue;
+                }
+                ins.OpCode = OpCodes.Call;
+                ins.Operand = helper;
+                touched = true;
+                count++;
+            }
+            if (touched)
+                ExpandShortBranches(method);
+        }
+        foreach (TypeDefinition nested in type.NestedTypes)
+            count += RetargetSettingConverterValidateIn(module, nested, helper);
+        return count;
+    }
+
+    private static bool IsControlTarget(MethodDefinition method, Instruction ins)
+    {
+        foreach (Instruction other in method.Body.Instructions)
+        {
+            if (other.Operand is Instruction target && target == ins)
+                return true;
+        }
+        if (method.Body.HasExceptionHandlers)
+        {
+            foreach (ExceptionHandler h in method.Body.ExceptionHandlers)
+            {
+                if (h.TryStart == ins || h.TryEnd == ins || h.HandlerStart == ins
+                    || h.HandlerEnd == ins || h.FilterStart == ins)
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    private static int RetargetSettingEqualityComparerIn(
+        ModuleDefinition module, TypeDefinition type,
+        MethodReference getDefault, MethodReference equals, MethodReference getHash,
+        MethodReference getComparer, MethodReference typeFromHandle)
+    {
+        int count = 0;
+        foreach (MethodDefinition method in type.Methods)
+        {
+            if (!method.HasBody) continue;
+            var hits = new System.Collections.Generic.List<Instruction>();
+            foreach (Instruction ins in method.Body.Instructions)
+            {
+                if (ins.Operand is not MethodReference mr
+                    || mr.DeclaringType is not GenericInstanceType gi
+                    || gi.GenericArguments.Count != 1)
+                    continue;
+                string decl = gi.ElementType.FullName;
+                // Virtual dispatch only (callvirt): a non-virtual `call`
+                // is a base-call with exact-implementation semantics;
+                // rerouting it through the virtual-dispatching helpers
+                // recurses infinitely (see OnValidateValueT rule).
+                // get_Default is static (call-only) and has no such hazard.
+                bool ok = (mr.Name == "get_Default" && ins.OpCode == OpCodes.Call
+                        && decl == "System.Collections.Generic.EqualityComparer`1")
+                    || (mr.Name == "Equals" && ins.OpCode == OpCodes.Callvirt
+                        && mr.Parameters.Count == 2
+                        && decl == "System.Collections.Generic.EqualityComparer`1")
+                    || (mr.Name == "GetHashCode" && ins.OpCode == OpCodes.Callvirt
+                        && mr.Parameters.Count == 1
+                        && decl == "System.Collections.Generic.EqualityComparer`1")
+                    || (mr.Name == "OnGetStaticEqualityComparer"
+                        && ins.OpCode == OpCodes.Callvirt
+                        && mr.Parameters.Count == 0
+                        && decl.StartsWith("PaintDotNet.Settings.Setting", StringComparison.Ordinal));
+                if (!ok)
+                    continue;
+                hits.Add(ins);
+            }
+            if (hits.Count == 0) continue;
+            var il = method.Body.GetILProcessor();
+            VariableDefinition? tmp = null;
+            bool touched = false;
+            foreach (Instruction ins in hits)
+            {
+                var mr = (MethodReference)ins.Operand;
+                var gi = (GenericInstanceType)mr.DeclaringType;
+                if (IsControlTarget(method, ins))
+                {
+                    Console.WriteLine(
+                        $"CpuFx: EqualityComparer reroute skipped control-target {type.FullName}::{method.Name} {mr.Name}");
+                    continue;
+                }
+                if (mr.Name == "get_Default")
+                {
+                    il.InsertBefore(ins, il.Create(OpCodes.Ldtoken, gi.GenericArguments[0]));
+                    il.InsertBefore(ins, il.Create(OpCodes.Call, typeFromHandle));
+                    ins.OpCode = OpCodes.Call;
+                    ins.Operand = getDefault;
+                    il.InsertAfter(ins, il.Create(OpCodes.Castclass, gi));
+                }
+                else if (mr.Name == "Equals")
+                {
+                    tmp ??= new VariableDefinition(module.TypeSystem.Object);
+                    if (!method.Body.Variables.Contains(tmp))
+                    {
+                        method.Body.Variables.Add(tmp);
+                        method.Body.InitLocals = true;
+                    }
+                    il.InsertBefore(ins, il.Create(OpCodes.Box, gi.GenericArguments[0]));
+                    il.InsertBefore(ins, il.Create(OpCodes.Stloc, tmp));
+                    il.InsertBefore(ins, il.Create(OpCodes.Box, gi.GenericArguments[0]));
+                    il.InsertBefore(ins, il.Create(OpCodes.Ldloc, tmp));
+                    ins.OpCode = OpCodes.Call;
+                    ins.Operand = equals;
+                }
+                else if (mr.Name == "GetHashCode")
+                {
+                    il.InsertBefore(ins, il.Create(OpCodes.Box, gi.GenericArguments[0]));
+                    ins.OpCode = OpCodes.Call;
+                    ins.Operand = getHash;
+                }
+                else
+                {
+                    ins.OpCode = OpCodes.Call;
+                    ins.Operand = getComparer;
+                    il.InsertAfter(ins, il.Create(OpCodes.Castclass, mr.ReturnType));
+                }
+                touched = true;
+                count++;
+            }
+            if (touched)
+                ExpandShortBranches(method);
+        }
+        foreach (TypeDefinition nested in type.NestedTypes)
+            count += RetargetSettingEqualityComparerIn(module, nested, getDefault, equals, getHash, getComparer, typeFromHandle);
         return count;
     }
 
@@ -10308,14 +11925,172 @@ public static class AssemblyRewriter
         il.InsertBefore(tail, il.Create(OpCodes.Callvirt, countGetter));
         il.InsertBefore(tail, il.Create(OpCodes.Brfalse_S, tail));
         il.InsertBefore(tail, il.Create(OpCodes.Ldarg_0));
-        il.InsertBefore(tail, il.Create(OpCodes.Call, loop));
+        var renderDrain = ImportCpuPaintMethod(module, cpuPaintPath, "RenderAndDrainInline", 1);
+        il.InsertBefore(tail, il.Create(OpCodes.Call, renderDrain));
         il.InsertBefore(tail, il.Create(OpCodes.Brfalse_S, tail));
         il.InsertBefore(tail, il.Create(OpCodes.Br_S, top));
+        // Handler-range repair: InsertBefore anchors on the tail `ret`, so
+        // any handler ending there (here: the updateLock finally) grows over
+        // the appended drain. A handler covering the drain — with the
+        // retargeted `leave` landing inside its own handler — is invalid IL;
+        // the interpreter dies unwinding through it (observed live: boot
+        // FailFast at interp.c:3998 after a first-chance ANE under the
+        // drain). Pin such ends back to the first appended instruction; the
+        // drain runs unlocked (the leave already ran the finally), so
+        // excluding it changes no lock semantics.
+        foreach (var h in queue.Body.ExceptionHandlers)
+        {
+            if (h.HandlerEnd == tail)
+                h.HandlerEnd = top;
+            if (h.TryEnd == tail)
+                h.TryEnd = top;
+        }
         queue.Body.MaxStackSize = System.Math.Max(queue.Body.MaxStackSize, 2);
-        Console.WriteLine("CpuFx: ThumbnailManager drains inline headless (layer previews)");
+        Console.WriteLine("CpuFx: ThumbnailManager renders+drains inline headless (layer previews)");
         // (Opacity init + render swap run first, above; the drain they
         // feed lands here, last.)
     }
+
+    // TEMP-DIAG rev216 (REVERT AFTER USE): log every generic call site
+    // before it executes. Covers generic-instance TYPES and generic
+    // METHOD instantiations (the latter is a whole unexamined family:
+    // first-call-only kind-17s that vanish after the host falls back
+    // to a different paint path). The last TOUCH before a kind-17 names
+    // the exact token (caller frames cannot: the callee never starts).
+    // TEMP rev223 (REVERT): master kill-switch for the touch logger
+    // (MainForm/AppWorkspace .ctors fail invoke-time verification and
+    // the only delta from pristine is touches+one pop; bisecting).
+    // Stripped rev238: touch logger master-disabled (all TEMP-DIAG/REVERT
+    // instrumentation off; served PDN returns to rule-only bytes so the
+    // kind-17 probe attributes original-IL/Mono shape, not probe artifacts).
+    private const bool EnableTouchLogging = false;
+
+    private static void EmitTouchLogging(ModuleDefinition module)
+    {
+        if (!EnableTouchLogging)
+            return;
+        var writeLine = module.ImportReference(
+            typeof(System.Console).GetMethod("WriteLine", new[] { typeof(string) })!);
+        int sites = 0;
+        foreach (TypeDefinition type in module.Types)
+        {
+            string n = type.FullName;
+            if (!(n.Contains("PdnToolBar") || n.Contains("ArrowButton")
+                || n.Contains("CaptionControl") || n.Contains("PdnPushButton")
+                || n.Contains("PdnButtonBase") || n.Contains("GdiControl")
+                || n.Contains("UIHelpers") || n.Contains("ThemeConfig")
+                || n.Contains("SystemMetrics") || n.Contains("UIImageResource")
+                || n.Contains("ImageResource") || n.Contains("ScaledResource")
+                || n.Contains("PdnToolStripRenderer") || n.Contains("ToolsControl")
+                || n.Contains("LayersForm") || n.Contains("DocumentStrip")
+                || n.Contains("PdnMainMenu") || n.Contains("PdnAuxMenu")
+                || n.Contains("PenBrushCache") || n.Contains("PdnRegion")
+                || n.Contains("SafeGraphicsExtensions") || n.Contains("DwmManager")
+                || n.Contains("UxTheme") || n.Contains("GlassInset")
+                || n.Contains("VisualStyling") || n.Contains("SysTray")
+                || n.Contains("PdnBaseForm") || n.Contains("AppWorkspace")
+                || n.Contains("MainForm") || n.Contains("Setting")))
+                continue;
+            sites += EmitTouchLoggingIn(type, writeLine);
+        }
+        Console.WriteLine($"CpuFx TEMP-DIAG: touch-logged {sites} generic call sites");
+    }
+
+    // TEMP-DIAG rev218 (REVERT): a constrained./volatile./unaligned./
+    // readonly./tail. prefix must stay glued to its call. Inserting
+    // ldstr+call between the prefix and the call re-pairs the prefix
+    // with our Console call (InvalidOperationException "constrained
+    // call: System.Console is not assignable from ..." — a pure probe
+    // artifact that killed AppSettings..ctor in rev217).
+    private static bool IsPrefix(Instruction? prev)
+    {
+        return prev is not null
+            && (prev.OpCode == OpCodes.Constrained
+                || prev.OpCode == OpCodes.Volatile
+                || prev.OpCode == OpCodes.Unaligned
+                || prev.OpCode == OpCodes.Readonly
+                || prev.OpCode == OpCodes.Tail);
+    }
+
+    private static int EmitTouchLoggingIn(TypeDefinition type, MethodReference writeLine)
+    {
+        int count = 0;
+        foreach (MethodDefinition method in type.Methods)
+        {
+            if (!method.HasBody) continue;
+            // TEMP rev225 (REVERT): skip constructors. Touch inserts
+            // break invoke-time verification of MainForm/AppWorkspace
+            // .ctors (mechanism open: bodies are pristine+touches+pop
+            // with identical branch targets; touch-off unblocks them).
+            // Paint attribution (OnPaint etc.) is unaffected.
+            if (method.IsConstructor || method.Name == ".cctor")
+                continue;
+            // TEMP-DIAG rev229 (REVERT): skip PaintBackground too.
+            // It never starts (no ENTER print) while its caller
+            // OnPaint does: same invoke-time shape as the .ctors.
+            // Bisecting whether touches break it.
+            if (method.Name == "PaintBackground")
+                continue;
+            // TEMP-DIAG rev228 (REVERT): entry touch to distinguish
+            // invoke-time failure of the rerouted dict shape (no print:
+            // unverifiable, e.g. the ldloca+pop pair) from a throw in
+            // the helper or later (prints, then kind-17).
+            bool wantEntry = method.Name == "IsControlPaintingEnabled";
+            var hits = new System.Collections.Generic.List<Instruction>();
+            foreach (Instruction ins in method.Body.Instructions)
+            {
+                if ((ins.OpCode == OpCodes.Call || ins.OpCode == OpCodes.Callvirt
+                        || ins.OpCode == OpCodes.Newobj)
+                    && ins.Operand is MethodReference mr
+                    && (mr.DeclaringType is Mono.Cecil.GenericInstanceType
+                        || mr.IsGenericInstance)
+                    && !IsPrefix(ins.Previous))
+                    hits.Add(ins);
+            }
+            if (hits.Count == 0 && !wantEntry) continue;
+            var il = method.Body.GetILProcessor();
+            if (wantEntry)
+            {
+                il.InsertBefore(method.Body.Instructions[0],
+                    il.Create(OpCodes.Ldstr, "ENTER " + type.FullName + "::" + method.Name));
+                il.InsertBefore(method.Body.Instructions[1],
+                    il.Create(OpCodes.Call, writeLine));
+                count++;
+            }
+            // TEMP-DIAG rev226 (REVERT): method-entry touch for paint
+            // methods. kind-17 stacks are skip-2-truncated and paint
+            // touches interleave across controls, so the exact poison
+            // call is ambiguous. An entry print distinguishes
+            // never-started (invoke-time verification failure, no entry
+            // print) from started-but-died-on-touch-invisible-op
+            // (newobj/box/ldfld on valuetype instantiations, constrained
+            // calls, base-dispatched virtuals: none of these print).
+            if (!wantEntry && method.Name.Contains("Paint"))
+            {
+                il.InsertBefore(method.Body.Instructions[0],
+                    il.Create(OpCodes.Ldstr, "ENTER " + type.FullName + "::" + method.Name));
+                il.InsertBefore(method.Body.Instructions[1],
+                    il.Create(OpCodes.Call, writeLine));
+                count++;
+            }
+            foreach (Instruction ins in hits)
+            {
+                var mr = (MethodReference)ins.Operand;
+                string tag = "TOUCH " + type.FullName + "::" + method.Name
+                    + "@" + ins.Offset.ToString("X4") + " " + mr.DeclaringType.FullName
+                    + "::" + mr.Name;
+                il.InsertBefore(ins, il.Create(OpCodes.Ldstr, tag));
+                il.InsertBefore(ins, il.Create(OpCodes.Call, writeLine));
+                count++;
+            }
+            method.Body.MaxStackSize++;
+            ExpandShortBranches(method);
+        }
+        foreach (TypeDefinition nested in type.NestedTypes)
+            count += EmitTouchLoggingIn(nested, writeLine);
+        return count;
+    }
+
 
     // One poisoned thumbnail batch must not kill document setup:
     // DrainThumbnailReadyInvokeList invokes every ready handler
@@ -10329,6 +12104,367 @@ public static class AssemblyRewriter
     // survives, and the next invalidation re-queues. This wraps the
     // whole body (narrow handler guards cannot cover snapshot-phase
     // faults); the existing enumerator finally still runs on unwind.
+    private static void LogThumbnailEnqueueTempImpl(ModuleDefinition module)
+    {
+        if (!LogThumbnailEnqueueTemp)
+        {
+            return;
+        }
+        var manager = module.GetType("PaintDotNet.Rendering.ThumbnailManager");
+        if (manager == null)
+        {
+            return;
+        }
+        var queue = manager.Methods.FirstOrDefault(m => m.Name == "QueueThumbnailUpdate"
+            && m.Parameters.Count == 3 && m.HasBody);
+        if (queue == null)
+            throw new InvalidOperationException("enqueue log needs 3-arg QueueThumbnailUpdate");
+        var il = queue.Body.GetILProcessor();
+        var getType = module.ImportReference(typeof(object).GetMethod("GetType")!);
+        var getFullName = module.ImportReference(typeof(Type).GetProperty("FullName")!.GetMethod!);
+        var getMethod = module.ImportReference(typeof(Delegate).GetProperty("Method")!.GetMethod!);
+        var getName = module.ImportReference(typeof(System.Reflection.MethodBase).GetProperty("Name")!.GetMethod!);
+        var toString = module.ImportReference(typeof(object).GetMethod("ToString")!);
+        var concat = module.ImportReference(typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(string) })!);
+        var writeLine = module.ImportReference(typeof(Console).GetMethod("WriteLine", new[] { typeof(string) })!);
+        Instruction first = queue.Body.Instructions[0];
+        var seq = new System.Collections.Generic.List<Instruction>
+        {
+            il.Create(OpCodes.Ldstr, "[ENQ] provider="),
+            il.Create(OpCodes.Ldarg_1),
+            il.Create(OpCodes.Callvirt, getType),
+            il.Create(OpCodes.Callvirt, getFullName),
+            il.Create(OpCodes.Call, concat),
+            il.Create(OpCodes.Call, writeLine),
+            il.Create(OpCodes.Ldstr, "[ENQ] handler="),
+            il.Create(OpCodes.Ldarg_3),
+            il.Create(OpCodes.Callvirt, getMethod),
+            il.Create(OpCodes.Callvirt, getName),
+            il.Create(OpCodes.Call, concat),
+            il.Create(OpCodes.Call, writeLine),
+            il.Create(OpCodes.Ldstr, "[ENQ] size="),
+            il.Create(OpCodes.Ldarg_2),
+            il.Create(OpCodes.Box, module.TypeSystem.Int32),
+            il.Create(OpCodes.Callvirt, toString),
+            il.Create(OpCodes.Call, concat),
+            il.Create(OpCodes.Call, writeLine),
+        };
+        foreach (Instruction ins in seq)
+            il.InsertBefore(first, ins);
+        ExpandShortBranches(queue);
+    }
+
+    private static int RetargetThumbnailQueueHandler(ModuleDefinition module, string? cpuPaintPath)
+    {
+        var helper = ImportCpuPaintMethod(module, cpuPaintPath, "QueueThumbnail", 5);
+        int count = 0;
+        foreach (TypeDefinition type in module.Types)
+            count += RetargetThumbnailQueueHandlerIn(module, type, helper);
+        return count;
+    }
+
+    private static int RetargetThumbnailQueueHandlerIn(ModuleDefinition module, TypeDefinition type, MethodReference helper)
+    {
+        int count = 0;
+        bool inScope = (type.Name == "DocumentStrip" || type.Name == "LayersStrip");
+        if (inScope)
+        {
+            foreach (MethodDefinition method in type.Methods)
+            {
+                bool isSite = (type.Name == "DocumentStrip" && method.Name == "QueueThumbnailUpdate" && method.Parameters.Count == 1)
+                    || (type.Name == "LayersStrip" && method.Name == "RefreshLayerThumbnail" && method.Parameters.Count == 1);
+                if (!isSite || !method.HasBody) continue;
+                var il = method.Body.GetILProcessor();
+                var ins = method.Body.Instructions;
+                Instruction ctorCall = null;
+                Instruction queueCall = null;
+                int ctorCount = 0;
+                int queueCount = 0;
+                for (int k = 0; k < ins.Count; k++)
+                {
+                    if ((ins[k].OpCode != OpCodes.Call && ins[k].OpCode != OpCodes.Callvirt && ins[k].OpCode != OpCodes.Newobj)
+                        || !(ins[k].Operand is MethodReference mr))
+                        continue;
+                    if (ins[k].OpCode == OpCodes.Newobj && mr.Name == ".ctor" && mr.DeclaringType.FullName.Contains("ValueEventHandler"))
+                    {
+                        ctorCall = ins[k];
+                        ctorCount++;
+                    }
+                    else if (mr.Name == "QueueThumbnailUpdate" && mr.DeclaringType.FullName.Contains("ThumbnailManager"))
+                    {
+                        queueCall = ins[k];
+                        queueCount++;
+                    }
+                }
+                if (ctorCall == null || queueCall == null || ctorCount != 1 || queueCount != 1)
+                    throw new InvalidOperationException("queue handler site shape changed in " + type.Name + "::" + method.Name);
+                Instruction ldftn = null;
+                string handlerName = null;
+                for (int k = ins.IndexOf(ctorCall) - 1; k >= 0; k--)
+                {
+                    if (ins[k].OpCode == OpCodes.Ldftn && ins[k].Operand is MethodReference lmr)
+                    {
+                        ldftn = ins[k];
+                        handlerName = lmr.Name;
+                        break;
+                    }
+                }
+                if (ldftn == null || handlerName == null)
+                    throw new InvalidOperationException("queue handler ldftn missing in " + type.Name + "::" + method.Name);
+                ctorCall.OpCode = OpCodes.Pop;
+                ctorCall.Operand = null;
+                il.InsertAfter(ctorCall, il.Create(OpCodes.Ldstr, handlerName));
+                queueCall.OpCode = OpCodes.Call;
+                queueCall.Operand = helper;
+                count++;
+                ExpandShortBranches(method);
+            }
+        }
+        foreach (TypeDefinition nested in type.NestedTypes)
+            count += RetargetThumbnailQueueHandlerIn(module, nested, helper);
+        return count;
+    }
+
+    private static void SkipNullBitmapDeliveryTempImpl(ModuleDefinition module, string? cpuPaintPath)
+    {
+        if (!SkipNullBitmapDeliveryTemp)
+        {
+            return;
+        }
+        var manager = module.GetType("PaintDotNet.Rendering.ThumbnailManager")
+            ?? throw new InvalidOperationException("null-skip needs ThumbnailManager");
+        var drain = manager.Methods.FirstOrDefault(m => m.Name == "DrainThumbnailReadyInvokeList" && m.HasBody)
+            ?? throw new InvalidOperationException("null-skip drain missing");
+        Instruction invokeCall = null;
+        foreach (Instruction ins in drain.Body.Instructions)
+        {
+            if ((ins.OpCode == OpCodes.Call || ins.OpCode == OpCodes.Callvirt)
+                && ins.Operand is MethodReference mr)
+            {
+                if (mr.Name == "Invoke" && mr.DeclaringType.FullName.Contains("ValueEventHandler"))
+                {
+                    if (invokeCall != null)
+                        throw new InvalidOperationException("null-skip expected 1 Invoke");
+                    invokeCall = ins;
+                }
+            }
+        }
+        if (invokeCall == null)
+            throw new InvalidOperationException("null-skip missing drain landmarks");
+        // rev278 REAL FIX (branch-free): the null check and both disposals
+        // must not touch closed generic instantiations in PDN IL, and the
+        // loop admits no forward skip-branch (Mono-WASM IPE at drain entry:
+        // rev268 bisects c-g). The stash keeps fields in locals (popped in
+        // push order: Item3->veVar, Item2->vsVar, Item1->vhVar); the ready
+        // dispatch (swapped to CpuPaint.InvokeReadyHandler by the drain
+        // rule) skips null bitmaps internally; the pristine dispose region
+        // below is replaced with CpuPaint.DisposeThumbnailItem (object in,
+        // void out). No branches, no generic tokens, straight fall-through.
+        var tuple3 = (GenericInstanceType)drain.Body.Variables[4].VariableType;
+        var eventArgsType = tuple3.GenericArguments[2];
+        var veVar = new VariableDefinition(eventArgsType);
+        var vsVar = new VariableDefinition(module.TypeSystem.Object);
+        var vhVar = new VariableDefinition(module.TypeSystem.Object);
+        drain.Body.Variables.Add(veVar);
+        drain.Body.Variables.Add(vsVar);
+        drain.Body.Variables.Add(vhVar);
+        var disposeHelper = ImportCpuPaintMethod(module, cpuPaintPath, "DisposeThumbnailItem", 1);
+        var il = drain.Body.GetILProcessor();
+        var prologue = new System.Collections.Generic.List<Instruction>
+        {
+            il.Create(OpCodes.Stloc, veVar),
+            il.Create(OpCodes.Stloc, vsVar),
+            il.Create(OpCodes.Stloc, vhVar),
+            il.Create(OpCodes.Ldloc, vhVar),
+            il.Create(OpCodes.Ldloc, vsVar),
+            il.Create(OpCodes.Ldloc, veVar),
+        };
+        foreach (Instruction ins in prologue)
+            il.InsertBefore(invokeCall, ins);
+        Instruction regionEnd = null;
+        for (Instruction cur = invokeCall.Next; cur != null; cur = cur.Next)
+        {
+            if ((cur.OpCode == OpCodes.Call || cur.OpCode == OpCodes.Callvirt)
+                && cur.Operand is MethodReference dmr && dmr.Name == "Dispose"
+                && dmr.DeclaringType.FullName.Contains("PooledEventArgs"))
+            {
+                regionEnd = cur;
+                break;
+            }
+        }
+        if (regionEnd == null)
+            throw new InvalidOperationException("null-skip missing dispose tail");
+        var tail = new System.Collections.Generic.List<Instruction>();
+        if (!SkipDisposeHelper279b)
+        {
+            tail.Add(il.Create(OpCodes.Ldloc, veVar));
+            tail.Add(il.Create(OpCodes.Call, disposeHelper));
+        }
+        // rev279b TEMP-BISECT (REVERT): with the flag set, the dispose
+        // region is nopped with no helper call (args/bitmap leak): if the
+        // sgen assertion persists, strip paint with real bitmaps is
+        // implicated; if clean, the dispose helper (or its timing) is.
+        Instruction tailAnchor = invokeCall.Next;
+        foreach (Instruction ins in tail)
+            il.InsertBefore(tailAnchor, ins);
+        for (Instruction cur = tailAnchor; cur != null;)
+        {
+            Instruction next = cur.Next;
+            bool last = cur == regionEnd;
+            cur.OpCode = OpCodes.Nop;
+            cur.Operand = null;
+            if (last) break;
+            cur = next;
+        }
+        ExpandShortBranches(drain);
+    }
+
+    private static void SkipHandlerUpdateTempImpl(ModuleDefinition module)
+    {
+        if (!SkipHandlerUpdateTemp)
+        {
+            return;
+        }
+        int count = 0;
+        foreach (TypeDefinition type in module.Types)
+        {
+            bool inScope = type.Name == "LayersStrip" || type.Name == "DocumentStrip";
+            if (!inScope) continue;
+            foreach (MethodDefinition method in type.Methods)
+            {
+                if (method.Name != "OnThumbnailUpdated" || !method.HasBody) continue;
+                var il = method.Body.GetILProcessor();
+                System.Collections.Generic.List<Instruction> hits =
+                    new System.Collections.Generic.List<Instruction>();
+                foreach (Instruction ins in method.Body.Instructions)
+                {
+                    if ((ins.OpCode != OpCodes.Call && ins.OpCode != OpCodes.Callvirt)
+                        || ins.Operand is not MethodReference mr
+                        || mr.Name != "Update"
+                        || !mr.DeclaringType.FullName.Contains("ImageItem")
+                        || mr.ReturnType.FullName != "System.Void"
+                        || mr.Parameters.Count != 0)
+                        continue;
+                    hits.Add(ins);
+                }
+                foreach (Instruction call in hits)
+                {
+                    // Argumentless void instance call: the instance ref is
+                    // the only stack slot, so one Pop suffices.
+                    call.OpCode = OpCodes.Pop;
+                    call.Operand = null;
+                    count++;
+                }
+                if (count > 0)
+                    ExpandShortBranches(method);
+            }
+        }
+        if (count < 2)
+            throw new InvalidOperationException("update bisect expected >= 2 Update, found " + count);
+    }
+
+    private static void SkipHandlerAnimationTempImpl(ModuleDefinition module)
+    {
+        if (!SkipHandlerAnimationTemp)
+        {
+            return;
+        }
+        var il = (ILProcessor)null;
+        int count = 0;
+        foreach (TypeDefinition type in module.Types)
+        {
+            bool inScope = type.Name == "LayersStrip" || type.Name == "DocumentStrip";
+            if (!inScope) continue;
+            foreach (MethodDefinition method in type.Methods)
+            {
+                if (method.Name != "OnThumbnailUpdated" || !method.HasBody) continue;
+                il = method.Body.GetILProcessor();
+                System.Collections.Generic.List<Instruction> hits =
+                    new System.Collections.Generic.List<Instruction>();
+                foreach (Instruction ins in method.Body.Instructions)
+                {
+                    if ((ins.OpCode != OpCodes.Call && ins.OpCode != OpCodes.Callvirt)
+                        || ins.Operand is not MethodReference mr
+                        || mr.Name != "AnimateValueTo"
+                        || !mr.DeclaringType.FullName.Contains("AnimatedValue")
+                        || mr.ReturnType.FullName != "System.Void")
+                        continue;
+                    hits.Add(ins);
+                }
+                foreach (Instruction call in hits)
+                {
+                    var callRef = (MethodReference)call.Operand;
+                    int pops = 1 + callRef.Parameters.Count;
+                    call.OpCode = OpCodes.Pop;
+                    call.Operand = null;
+                    Instruction cursor = call;
+                    for (int k = 1; k < pops; k++)
+                    {
+                        Instruction extra = il.Create(OpCodes.Pop);
+                        il.InsertAfter(cursor, extra);
+                        cursor = extra;
+                    }
+                    count++;
+                }
+                if (count > 0)
+                    ExpandShortBranches(method);
+            }
+        }
+        if (count < 2)
+            throw new InvalidOperationException("animation bisect expected >= 2 AnimateValueTo, found " + count);
+    }
+
+    private static void SkipThumbnailHandlerInvokeTempImpl(ModuleDefinition module)
+    {
+        if (!SkipThumbnailHandlerInvokeTemp)
+        {
+            return;
+        }
+        var manager = module.GetType("PaintDotNet.Rendering.ThumbnailManager")
+            ?? throw new InvalidOperationException("invoke bisect needs ThumbnailManager");
+        var drain = manager.Methods.FirstOrDefault(m => m.Name == "DrainThumbnailReadyInvokeList" && m.HasBody)
+            ?? throw new InvalidOperationException("invoke bisect drain missing");
+        var il = drain.Body.GetILProcessor();
+        System.Collections.Generic.List<Instruction> hits =
+            new System.Collections.Generic.List<Instruction>();
+        foreach (Instruction ins in drain.Body.Instructions)
+        {
+            if ((ins.OpCode != OpCodes.Call && ins.OpCode != OpCodes.Callvirt)
+                || ins.Operand is not MethodReference mr
+                || mr.Name != "Invoke"
+                || !mr.DeclaringType.FullName.Contains("ValueEventHandler"))
+                continue;
+            hits.Add(ins);
+        }
+        if (hits.Count != 1)
+            throw new InvalidOperationException("invoke bisect expected 1 Invoke, found " + hits.Count);
+        // Stack at the Invoke: handler instance, sender, event args
+        // (void return). Reuse the call slot for the first Pop so
+        // existing branch targets stay valid; the appended Pops shift
+        // only later offsets, which Cecil recomputes on write.
+        Instruction call = hits[0];
+        call.OpCode = OpCodes.Pop;
+        call.Operand = null;
+        il.InsertAfter(call, il.Create(OpCodes.Pop));
+        il.InsertAfter(call.Next, il.Create(OpCodes.Pop));
+    }
+
+    private static void NeutralizeThumbnailDrainTempImpl(ModuleDefinition module)
+    {
+        if (!NeutralizeThumbnailDrainTemp)
+        {
+            return;
+        }
+        var manager = module.GetType("PaintDotNet.Rendering.ThumbnailManager")
+            ?? throw new InvalidOperationException("drain bisect needs ThumbnailManager");
+        var drain = manager.Methods.FirstOrDefault(m => m.Name == "DrainThumbnailReadyInvokeList" && m.HasBody)
+            ?? throw new InvalidOperationException("drain bisect drain missing");
+        drain.Body.Instructions.Clear();
+        drain.Body.ExceptionHandlers.Clear();
+        var dil = drain.Body.GetILProcessor();
+        dil.Append(dil.Create(OpCodes.Ret));
+    }
+
     private static void EnsureThumbnailDeliveryRobust(ModuleDefinition module)
     {
         var manager = module.GetType("PaintDotNet.Rendering.ThumbnailManager")
@@ -10339,7 +12475,9 @@ public static class AssemblyRewriter
         var first = drain.Body.Instructions[0];
         var pop = dil.Create(OpCodes.Pop);
         var done = dil.Create(OpCodes.Ret);
+        var leave = dil.Create(OpCodes.Leave, done);
         dil.Append(pop);
+        dil.Append(leave);
         dil.Append(done);
         drain.Body.ExceptionHandlers.Add(new Mono.Cecil.Cil.ExceptionHandler(Mono.Cecil.Cil.ExceptionHandlerType.Catch)
         {
@@ -10449,6 +12587,45 @@ public static class AssemblyRewriter
         }
         if (neutered != 2)
             throw new InvalidOperationException($"CpuFx: update roots changed ({neutered})");
+    }
+
+    // Public for hermetic unit coverage (same precedent as the public
+    // Redirect*/Ensure* rules): the driver gates this to the
+    // PaintDotNet.Collections assembly by name (see driver).
+    public static void EnsureSafeBagFinalizeTolerant(ModuleDefinition module, string cpuPaintPath)
+    {
+        TypeDefinition bag = module.GetType("PaintDotNet.Collections.SafeProducerConsumerCollection`2")
+            ?? throw new InvalidOperationException("Pdn: SafeProducerConsumerCollection`2 missing");
+        MethodDefinition? fin = bag.Methods.FirstOrDefault(m => m.Name == "Finalize" && !m.IsStatic && m.Parameters.Count == 0 && m.HasBody)
+            ?? throw new InvalidOperationException("Pdn: SafeProducerConsumerCollection.Finalize missing");
+        AssemblyDefinition cpuAsm;
+        try
+        {
+            cpuAsm = AssemblyDefinition.ReadAssembly(cpuPaintPath);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"CpuPaint: cannot read {cpuPaintPath}", ex);
+        }
+        TypeDefinition? cpuPaint = cpuAsm.MainModule.GetType("WfWasm.PdnCpu.CpuPaint")
+            ?? throw new InvalidOperationException($"CpuPaint: WfWasm.PdnCpu.CpuPaint missing in {cpuPaintPath}");
+        MethodDefinition? probe = cpuPaint.Methods.FirstOrDefault(m => m.Name == "SafeBagIsEmpty" && m.Parameters.Count == 1)
+            ?? throw new InvalidOperationException("CpuPaint: SafeBagIsEmpty/1 missing");
+        MethodReference probeRef = module.ImportReference(probe);
+        int swapped = 0;
+        foreach (Instruction ins in fin.Body.Instructions)
+        {
+            if ((ins.OpCode == OpCodes.Callvirt || ins.OpCode == OpCodes.Call) && ins.Operand is MethodReference mr
+                && mr.Name == "get_IsEmpty" && mr.ReturnType.FullName == "System.Boolean"
+                && mr.DeclaringType.FullName.StartsWith("PaintDotNet.Collections.IProducerConsumerCollection2", StringComparison.Ordinal))
+            {
+                ins.OpCode = OpCodes.Call;
+                ins.Operand = probeRef;
+                swapped++;
+            }
+        }
+        if (swapped != 1)
+            throw new InvalidOperationException($"Pdn: expected 1 IsEmpty probe in SafeProducerConsumerCollection.Finalize, swapped {swapped}");
     }
 
     private static void EnsureCpuPostProcessIdentity(ModuleDefinition module)
@@ -13351,7 +15528,32 @@ public static class AssemblyRewriter
             il.Emit(OpCodes.Stloc, bmpLoc);
             il.Emit(OpCodes.Ldloc, bmpLoc);
             var doneLabel = il.Create(OpCodes.Nop);
+            var uiUploaded = il.Create(OpCodes.Nop);
+            // UI.DeviceBitmap upload (layer-strip checkbox glyphs):
+            il.Emit(OpCodes.Brtrue, uiUploaded);
+            // UI-level DeviceBitmaps never pass a context upload, so
+            // the checks above miss them. Upload the wrapped source
+            // here and wrap the handle in a cpuBmp, then proceed.
+            // Anything else keeps today's silent skip (doneLabel).
+            var uiHandleLoc = new Mono.Cecil.Cil.VariableDefinition(module.TypeSystem.Int64);
+            var uiWLoc = new Mono.Cecil.Cil.VariableDefinition(module.TypeSystem.Int32);
+            var uiHLoc = new Mono.Cecil.Cil.VariableDefinition(module.TypeSystem.Int32);
+            foreach (var v in new Mono.Cecil.Cil.VariableDefinition[] { uiHandleLoc, uiWLoc, uiHLoc })
+                drawBitmap.Body.Variables.Add(v);
+            drawBitmap.Body.InitLocals = true;
+            MethodReference tryUploadUi = Cpu("TryUploadUiDeviceBitmap", 4);
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Ldloca_S, uiHandleLoc);
+            il.Emit(OpCodes.Ldloca_S, uiWLoc);
+            il.Emit(OpCodes.Ldloca_S, uiHLoc);
+            il.Emit(OpCodes.Call, tryUploadUi);
             il.Emit(OpCodes.Brfalse, doneLabel);
+            il.Emit(OpCodes.Ldloc, uiHandleLoc);
+            il.Emit(OpCodes.Ldloc, uiWLoc);
+            il.Emit(OpCodes.Ldloc, uiHLoc);
+            il.Emit(OpCodes.Newobj, bmpCtor);
+            il.Emit(OpCodes.Stloc, bmpLoc);
+            il.Append(uiUploaded);
             il.Append(isBmp);
             // Perspective: anything set is beyond stamp scope.
             il.Emit(OpCodes.Ldarg, drawBitmap.Parameters[5]);
@@ -16149,27 +18351,27 @@ public static class AssemblyRewriter
             .FirstOrDefault(r => r.Name == "WfWasm.WinForms" || r.Name == "System.Windows.Forms");
         if (formsScope is null)
             return;
-        Mono.Cecil.AssemblyNameReference? drawingScope = module.AssemblyReferences
-            .FirstOrDefault(r => r.Name == "WfWasm.Drawing" || r.Name == "System.Drawing" || r.Name == "System.Drawing.Common");
-        if (drawingScope is null)
-            return;
         var painterType = new Mono.Cecil.TypeReference("System.Windows.Forms.VisualStyles", "VisualStyleSpinPainter", module, formsScope);
-        var rectType = new Mono.Cecil.TypeReference("System.Drawing", "Rectangle", module, drawingScope);
-        Mono.Cecil.MethodReference spin2 = new Mono.Cecil.MethodReference("DrawSpinBackground", module.TypeSystem.Void, painterType)
+        // NOTE: the Rectangle slots MUST reuse the caller-resolved Rectangle
+        // identity (IsValueType=true). A hand-built TypeReference defaults
+        // IsValueType=false, so the emitted ref declares the slots as classes
+        // while the fork def takes valuetypes: Mono rejects the load with
+        // "Expected reference type but got type kind 17" (rev182 shipped the
+        // hand-built form; PB/UpDown/Spin chrome paints never loaded since).
+        // The object slots stay System.Object: the original instance (a
+        // VisualStyleRenderer class) converts implicitly.
+        Mono.Cecil.MethodReference MakeSpin(Mono.Cecil.MethodReference original, int rectCount)
         {
-            HasThis = false,
-        };
-        spin2.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Object));
-        spin2.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Object));
-        spin2.Parameters.Add(new Mono.Cecil.ParameterDefinition(rectType));
-        Mono.Cecil.MethodReference spin3 = new Mono.Cecil.MethodReference("DrawSpinBackground", module.TypeSystem.Void, painterType)
-        {
-            HasThis = false,
-        };
-        spin3.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Object));
-        spin3.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Object));
-        spin3.Parameters.Add(new Mono.Cecil.ParameterDefinition(rectType));
-        spin3.Parameters.Add(new Mono.Cecil.ParameterDefinition(rectType));
+            var spin = new Mono.Cecil.MethodReference("DrawSpinBackground", module.TypeSystem.Void, painterType)
+            {
+                HasThis = false,
+            };
+            spin.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Object));
+            spin.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Object));
+            for (int i = 0; i < rectCount; i++)
+                spin.Parameters.Add(new Mono.Cecil.ParameterDefinition(original.Parameters[1 + i].ParameterType));
+            return spin;
+        }
         foreach (Mono.Cecil.TypeDefinition type in module.GetTypes())
         {
             if (type.FullName == "System.Windows.Forms.VisualStyles.VisualStyleSpinPainter")
@@ -16192,12 +18394,29 @@ public static class AssemblyRewriter
                     if (mr.Parameters.Count == 2)
                     {
                         instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
-                        instruction.Operand = spin2;
+                        instruction.Operand = MakeSpin(mr, 1);
                     }
                     else if (mr.Parameters.Count == 3)
                     {
-                        instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
-                        instruction.Operand = spin3;
+                        // Only the (IDeviceContext, Rectangle, Rectangle) tail
+                        // is retargeted: all slots are reference types, so the
+                        // (object, object, Rectangle, Rectangle) helper binds.
+                        // HWND-tailed overloads (HDC, Rectangle, HWND) stay on
+                        // the original stubbed P/Invoke (safe headless no-op):
+                        // HDC carries no pixels without a Graphics, and any
+                        // valuetype-exact helper reference fails to bind
+                        // headless (interpreter kind-17, DockSample DummyDoc /
+                        // DummySolutionExplorer + PDN numerics precedent).
+                        Mono.Cecil.TypeReference p0 = mr.Parameters[0].ParameterType;
+                        Mono.Cecil.TypeReference p2 = mr.Parameters[2].ParameterType;
+                        bool p2IsRect = p2.FullName == "System.Drawing.Rectangle";
+                        bool p0IsValue = false;
+                        try { p0IsValue = p0.IsValueType; } catch { p0IsValue = true; }
+                        if (p2IsRect && !p0IsValue && !p0.IsByReference)
+                        {
+                            instruction.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                            instruction.Operand = MakeSpin(mr, 2);
+                        }
                     }
                 }
             }
@@ -16952,6 +19171,155 @@ public static class AssemblyRewriter
                         il.Emit(Mono.Cecil.Cil.OpCodes.Conv_U);
                         il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
                     }
+                    else if (method.Name == "CreateBitmap" && method.Parameters.Count == 5
+                        && (method.ReturnType.FullName == "System.IntPtr" || method.ReturnType.FullName == "System.UIntPtr"))
+                    {
+                        // Headless GDI bitmap realization (grid dashed-border
+                        // milestone): decode the spec bits into a managed
+                        // Bitmap and mint a trackable fake the fork
+                        // Image.FromHbitmap resolves (Syncfusion
+                        // GridBorderPaint dash/dot tiles). The generic
+                        // sentinel below would trip the honest NSE instead.
+                        // Unknown bit-buffer shapes fail closed with Zero
+                        // (the documented GDI failure shape callers check).
+                        Mono.Cecil.AssemblyNameReference? gdiBmpScope = module.AssemblyReferences.FirstOrDefault(r => r.Name == "WfWasm.Drawing");
+                        if (gdiBmpScope is null)
+                        {
+                            gdiBmpScope = new Mono.Cecil.AssemblyNameReference("WfWasm.Drawing", new Version(1, 0, 0, 0));
+                            module.AssemblyReferences.Add(gdiBmpScope);
+                        }
+                        var gdiBmpType = new Mono.Cecil.TypeReference("System.Drawing", "WasmGdiBitmap", module, gdiBmpScope);
+                        var gdiBitsParam = method.Parameters[4].ParameterType;
+                        bool gdiIsShortArray = gdiBitsParam is Mono.Cecil.ArrayType gdiArr && gdiArr.ElementType.FullName == "System.Int16" && gdiArr.Rank == 1;
+                        bool gdiIsPtr = gdiBitsParam.FullName == "System.IntPtr" || gdiBitsParam.FullName == "System.UIntPtr" || gdiBitsParam.IsPointer;
+                        Mono.Cecil.MethodReference? gdiCreate = null;
+                        if (gdiIsShortArray || gdiIsPtr)
+                        {
+                            gdiCreate = new Mono.Cecil.MethodReference(gdiIsShortArray ? "CreateTracked" : "CreateTrackedPtr", module.TypeSystem.IntPtr, gdiBmpType)
+                            {
+                                HasThis = false,
+                                Parameters =
+                                {
+                                    new Mono.Cecil.ParameterDefinition(module.TypeSystem.Int32),
+                                    new Mono.Cecil.ParameterDefinition(module.TypeSystem.Int32),
+                                    new Mono.Cecil.ParameterDefinition(module.TypeSystem.Int32),
+                                    new Mono.Cecil.ParameterDefinition(module.TypeSystem.Int32),
+                                    new Mono.Cecil.ParameterDefinition(gdiBitsParam),
+                                }
+                            };
+                        }
+                        if (gdiCreate is null)
+                        {
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_0);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Conv_I);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                        }
+                        else
+                        {
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_1);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_2);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_3);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg, method.Parameters[4]);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Call, module.ImportReference(gdiCreate));
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                        }
+                    }
+                    else if (method.Name == "ScrollWindowEx"
+                        && method.Parameters.Count == 8
+                        && method.Parameters[0].ParameterType.FullName == "System.IntPtr"
+                        && method.Parameters[1].ParameterType.FullName == "System.Int32"
+                        && method.Parameters[2].ParameterType.FullName == "System.Int32"
+                        && method.Parameters[3].ParameterType is Mono.Cecil.ByReferenceType
+                        && method.Parameters[4].ParameterType is Mono.Cecil.ByReferenceType
+                        && method.Parameters[5].ParameterType.FullName == "System.IntPtr"
+                        && method.Parameters[6].ParameterType is Mono.Cecil.ByReferenceType
+                        && method.Parameters[7].ParameterType.FullName == "System.Int32"
+                        && method.ReturnType.FullName == "System.Boolean")
+                    {
+                        // Headless ScrollWindowEx (grid scroll milestone):
+                        // native ScrollWindowEx blits moved pixels and
+                        // reports the exposed strip through the update
+                        // region; headless windows have no surface, so the
+                        // generic stub answered success with no side effects
+                        // and the cracked (empty) update region invalidated
+                        // nothing while vendor scroll state still advanced,
+                        // freezing scrolled content on stale pixels.
+                        // Retarget to WasmScrollWindow.Scroll: the scroll and
+                        // clip RECT& decompose through the signature's own
+                        // struct (first four Int32 fields in declaration
+                        // order, DrawText shape). The out update rect is
+                        // never read back by the caller (it cracks
+                        // hrgnUpdate instead), so only scroll and clip rects
+                        // cross the bridge. Unresolvable shapes keep the
+                        // quiet-success stub (no worse than today).
+                        // Regression: wheel no-op with advancing scrollbar
+                        // value <- SfDataGrid TableControl scroll.
+                        Mono.Cecil.AssemblyNameReference? swScope = module.AssemblyReferences.FirstOrDefault(r => r.Name == "WfWasm.WinForms");
+                        if (swScope is null)
+                        {
+                            swScope = new Mono.Cecil.AssemblyNameReference("WfWasm.WinForms", new Version(1, 0, 0, 0));
+                            module.AssemblyReferences.Add(swScope);
+                        }
+                        var swType = new Mono.Cecil.TypeReference("System.Windows.Forms", "WasmScrollWindow", module, swScope);
+                        var swRef = new Mono.Cecil.MethodReference("Scroll", module.TypeSystem.Boolean, swType) { HasThis = false };
+                        swRef.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.IntPtr));
+                        for (int swi = 0; swi < 10; swi++)
+                            swRef.Parameters.Add(new Mono.Cecil.ParameterDefinition(module.TypeSystem.Int32));
+                        int[] swRectParams = { 3, 4 };
+                        var swElems = new Mono.Cecil.TypeReference[2];
+                        System.Collections.Generic.List<Mono.Cecil.FieldDefinition>?[] swFieldSets =
+                            new System.Collections.Generic.List<Mono.Cecil.FieldDefinition>?[2];
+                        bool swOk = true;
+                        for (int swi = 0; swi < 2 && swOk; swi++)
+                        {
+                            var swElem = ((Mono.Cecil.ByReferenceType)method.Parameters[swRectParams[swi]].ParameterType).ElementType;
+                            Mono.Cecil.TypeDefinition? swDef = null;
+                            try { swDef = swElem.Resolve(); } catch { swOk = false; }
+                            var swFields = swDef?.Fields
+                                .Where(f => !f.IsStatic && f.FieldType.FullName == "System.Int32")
+                                .Take(4).ToList();
+                            if (swFields is null || swFields.Count != 4)
+                                swOk = false;
+                            else
+                            {
+                                swElems[swi] = swElem;
+                                swFieldSets[swi] = swFields;
+                            }
+                        }
+                        if (!swOk)
+                        {
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                        }
+                        else
+                        {
+                            var swVars = new Mono.Cecil.Cil.VariableDefinition[2];
+                            for (int swi = 0; swi < 2; swi++)
+                            {
+                                swVars[swi] = new Mono.Cecil.Cil.VariableDefinition(module.ImportReference(swElems[swi]));
+                                method.Body.Variables.Add(swVars[swi]);
+                            }
+                            method.Body.InitLocals = true;
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_1);
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_2);
+                            for (int swi = 0; swi < 2; swi++)
+                            {
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg, method.Parameters[swRectParams[swi]]);
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Ldobj, module.ImportReference(swElems[swi]));
+                                il.Emit(Mono.Cecil.Cil.OpCodes.Stloc, swVars[swi]);
+                                foreach (var swField in swFieldSets[swi]!)
+                                {
+                                    il.Emit(Mono.Cecil.Cil.OpCodes.Ldloc, swVars[swi]);
+                                    il.Emit(Mono.Cecil.Cil.OpCodes.Ldfld, module.ImportReference(swField));
+                                }
+                            }
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Call, module.ImportReference(swRef));
+                            il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                            method.Body.MaxStackSize = System.Math.Max(method.Body.MaxStackSize, 14);
+                        }
+                    }
                     else if (method.ReturnType.IsPointer || method.ReturnType.IsByReference)
                     {
                         il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4, 0x1000);
@@ -17345,7 +19713,7 @@ public static class AssemblyRewriter
     {
         var keys = new HashSet<string>(methodKeys, StringComparer.Ordinal);
         string? dir = Path.GetDirectoryName(assemblyPath);
-        using var resolver = new FrameworkResolver(dir, [AppContext.BaseDirectory]);
+        using var resolver = new FrameworkResolver(dir, [@"E:\tmp\rewritten-small", @"E:\tmp\rewritten-paint"]);
         var bytes = File.ReadAllBytes(assemblyPath);
         var readerParams = new ReaderParameters { AssemblyResolver = resolver };
         using var stream = new MemoryStream(bytes);
@@ -17392,7 +19760,7 @@ public static class AssemblyRewriter
     {
         var keys = new HashSet<string>(methodKeys, StringComparer.Ordinal);
         string? dir = Path.GetDirectoryName(assemblyPath);
-        using var resolver = new FrameworkResolver(dir, [AppContext.BaseDirectory]);
+        using var resolver = new FrameworkResolver(dir, [@"E:\tmp\rewritten-small", @"E:\tmp\rewritten-paint"]);
         var bytes = File.ReadAllBytes(assemblyPath);
         var readerParams = new ReaderParameters { AssemblyResolver = resolver };
         using var stream = new MemoryStream(bytes);
@@ -17439,7 +19807,7 @@ public static class AssemblyRewriter
         // lives in the scratch staging dirs (see rewrite-*.ps1), not next
         // to the app DLLs: metadata resolution needs them on the path.
         string? probeDir = Path.GetDirectoryName(assemblyPath);
-        using var resolver = new FrameworkResolver(probeDir, [AppContext.BaseDirectory]);
+        using var resolver = new FrameworkResolver(probeDir, [@"E:\tmp\rewritten-small", @"E:\tmp\rewritten-paint"]);
         var bytes = File.ReadAllBytes(assemblyPath);
         var readerParams = new ReaderParameters { AssemblyResolver = resolver };
         using var stream = new MemoryStream(bytes);

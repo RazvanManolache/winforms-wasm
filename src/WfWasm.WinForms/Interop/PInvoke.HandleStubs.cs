@@ -40,7 +40,30 @@ internal static partial class PInvoke
     public static HIMC ImmGetContext(HWND hWnd) => default;
     public static BOOL ImmReleaseContext(HWND hWnd, HIMC hIMC) => (BOOL)true;
     public static BOOL InvalidateRgn(HWND hWnd, HRGN hrgn, BOOL erase) => (BOOL)true;
-    public static BOOL IsChild(HWND hWndParent, HWND hWnd) => (BOOL)false;
+    public static BOOL IsChild(HWND hWndParent, HWND hWnd)
+    {
+        // Desktop walks the parent chain (NULL or foreign handles
+        // are not children). ContainsFocus depends on this for
+        // child-hosting controls such as combo editors.
+        // A query must never throw: parallel test sessions (and real apps)
+        // can leave a destroyed handle focused, so a disposed control in
+        // the chain means "not a child", not ObjectDisposedException.
+        try
+        {
+            global::System.Windows.Forms.Control? c =
+                global::System.Windows.Forms.Control.FromHandle((IntPtr)hWnd.Value);
+            while (c is not null && !c.IsDisposed)
+            {
+                if (c.IsHandleCreated && c.Handle == (IntPtr)hWndParent.Value)
+                    return (BOOL)true;
+                c = c.Parent;
+            }
+        }
+        catch
+        {
+        }
+        return (BOOL)false;
+    }
     public static BOOL IsWindow(HWND hWnd) => (BOOL)(!hWnd.IsNull);
     public static BOOL IsWindowEnabled(HWND hWnd) => (BOOL)true;
     public static BOOL IsWindowVisible(HWND hWnd) => (BOOL)true;
@@ -61,6 +84,8 @@ internal static partial class PInvoke
     public static int SetScrollPos(HWND hWnd, SCROLLBAR_CONSTANTS nBar, int nPos, BOOL bRedraw) => nPos;
     [ThreadStatic]
     private static bool s_inSetWindowPos;
+    [ThreadStatic]
+    private static global::System.Collections.Generic.HashSet<HWND>? s_pendingBounds;
     private static readonly global::System.Reflection.MethodInfo? s_updateBoundsMethod =
         typeof(global::System.Windows.Forms.Control).GetMethod("UpdateBounds",
             global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic,
@@ -69,25 +94,55 @@ internal static partial class PInvoke
     public static BOOL SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int Y, int cx, int cy, SET_WINDOW_POS_FLAGS uFlags)
     {
         WindowBoundsStorage.Update(hWnd, X, Y, cx, cy, uFlags);
-        if (!s_inSetWindowPos)
+        if (s_inSetWindowPos)
         {
-            s_inSetWindowPos = true;
-            try
+            // Nested request: a container's layout repositions children while the
+            // container's own SetWindowPos is still in flight (e.g. DockWindow layout
+            // assigning pane bounds during the window's UpdateBounds). Desktop
+            // processes these reentrantly until sizes converge; dropping the nested
+            // UpdateBounds (previous behavior) froze control fields at stale values
+            // and skipped child layout. Record it for the outermost call to drain.
+            (s_pendingBounds ??= new global::System.Collections.Generic.HashSet<HWND>()).Add(hWnd);
+            return (BOOL)true;
+        }
+        s_inSetWindowPos = true;
+        try
+        {
+            ApplyStoredBounds(hWnd);
+            // Drain nested requests iteratively (bounded: matches desktop
+            // convergence via the SetBoundsCore no-change early-out; the cap
+            // guards against ping-pong layouts).
+            int passes = 0;
+            while (s_pendingBounds is { Count: > 0 } && passes++ < 32)
             {
-                var c = global::System.Windows.Forms.Control.FromHandle((IntPtr)hWnd.Value);
-                if (c != null)
+                global::System.Collections.Generic.HashSet<HWND> pending = s_pendingBounds;
+                s_pendingBounds = new global::System.Collections.Generic.HashSet<HWND>();
+                foreach (HWND queued in pending)
                 {
-                    var r = WindowBoundsStorage.Get(hWnd);
-                    s_updateBoundsMethod?.Invoke(c, [r.X, r.Y, r.Width, r.Height]);
+                    ApplyStoredBounds(queued);
                 }
             }
-            catch { }
-            finally
-            {
-                s_inSetWindowPos = false;
-            }
+        }
+        finally
+        {
+            s_inSetWindowPos = false;
+            s_pendingBounds = null;
         }
         return (BOOL)true;
+    }
+
+    private static void ApplyStoredBounds(HWND hWnd)
+    {
+        try
+        {
+            var c = global::System.Windows.Forms.Control.FromHandle((IntPtr)hWnd.Value);
+            if (c != null)
+            {
+                var r = WindowBoundsStorage.Get(hWnd);
+                s_updateBoundsMethod?.Invoke(c, [r.X, r.Y, r.Width, r.Height]);
+            }
+        }
+        catch { }
     }
     public static int SetWindowRgn(HWND hwnd, HRGN hrgn, BOOL fRedraw) => 1;
     public static BOOL SetWindowText(HWND hWnd, string? text)

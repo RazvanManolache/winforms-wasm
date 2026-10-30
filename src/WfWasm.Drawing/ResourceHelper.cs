@@ -129,9 +129,29 @@ public static class ResourceHelper
                     catch { readerName = ""; }
                     return true;
                 }
+                // The reader name lives at offset 12 (after the skip
+                // Int32), not 8: reading a string AT the skip field
+                // 7-bit-misdecodes the skip bytes and only accidentally
+                // lands on the name (skip 256 decodes to length 0 ->
+                // empty candidate -> legacy ctor -> NSE). Minimal
+                // synthetic headers omit the skip field (reader name at
+                // 8); retry there when offset 12 yields no token.
+                try { br.ReadInt32(); }
+                catch { return false; }
                 string candidate = "";
                 try { candidate = br.ReadString(); }
-                catch { return false; }
+                catch { candidate = ""; }
+                if (!candidate.Contains("ResourceReader", System.StringComparison.Ordinal))
+                {
+                    try
+                    {
+                        s.Position = 8;
+                        using var br2 = new System.IO.BinaryReader(
+                            s, System.Text.Encoding.UTF8, leaveOpen: true);
+                        candidate = br2.ReadString();
+                    }
+                    catch { return false; }
+                }
                 // Containment (not equality): stray table bytes never
                 // spell the 14-char token at a valid 7-bit boundary,
                 // and a miss degrades to a lookup miss, never a throw.
@@ -157,6 +177,37 @@ public static class ResourceHelper
     private static bool IsLegacyReaderName(string readerName) =>
         readerName.StartsWith("System.Resources.ResourceReader,",
             System.StringComparison.Ordinal);
+
+    // Throw-free header gate for the legacy ctor above: only streams
+    // carrying the .resources magic ever reach ResourceReader's name
+    // validation (which throws NSE first-chance on DRR stamps). Never
+    // throws; restores position; inspection failure answers true to
+    // preserve today's attempt for forward-only streams.
+    private static bool HasResourcesMagic(System.IO.Stream s)
+    {
+        try
+        {
+            if (!s.CanSeek)
+                return true;
+            long pos = s.Position;
+            try
+            {
+                s.Position = 0;
+                using var br = new System.IO.BinaryReader(
+                    s, System.Text.Encoding.UTF8, leaveOpen: true);
+                return br.ReadInt32() == unchecked((int)0xBEEFCACE);
+            }
+            finally
+            {
+                try { s.Position = pos; }
+                catch { }
+            }
+        }
+        catch
+        {
+            return true;
+        }
+    }
 
     // Version-tolerant reader resolution: vendor streams stamp the
     // reference-assembly version (4.0.0.0) while the runtime ships
@@ -228,6 +279,17 @@ public static class ResourceHelper
             // enumerate through the BCL-GetResourceSet fallback in
             // EnumeratePrefixedKeys instead, which is proven on the
             // vendor calendar blob (134 keys).
+            // Never instantiate DeserializingResourceReader for values:
+            // it enumerates names but cannot MATERIALIZE user-type values
+            // (Bitmap/Icon/ImageStream) without BinaryFormatter, removed
+            // in net9, so any touch throws. The format-aware raw walk
+            // below recovers those values; enumeration goes raw too.
+            // Custom and legacy readers still instantiate here.
+            if (namedReader.Contains("DeserializingResourceReader",
+                System.StringComparison.Ordinal))
+            {
+                return null;
+            }
             Type? t = ResolveReaderType(namedReader);
             if (t is not null
                 && typeof(System.Resources.IResourceReader).IsAssignableFrom(t))
@@ -254,6 +316,13 @@ public static class ResourceHelper
         }
         try
         {
+            // Magic-gate: probing manifest names yields real-but-wrong
+            // streams (no BEEFCACE header) whose legacy construction
+            // throws a first-chance NSE every time; skip the doomed ctor
+            // and let the raw walk answer. Inspection failure preserves
+            // today's attempt (forward-only streams still construct).
+            if (!HasResourcesMagic(s))
+                return null;
             return new System.Resources.ResourceReader(s);
         }
         catch
@@ -383,17 +452,12 @@ public static class ResourceHelper
             // image entries go straight to the NRBF decoder and never pay
             // for the doomed GetObject below. Each caught throw there is
             // still a first-chance report (the per-boot PNSE noise across
-            // all Telerik demos), so avoiding the throw IS the fix.
-            if (TryResourceCandidates(rm, out System.Collections.Generic.List<string>? namedCandidates)
-                && namedCandidates is not null
-                && TryResolveResourceAssembly(rm, namedCandidates, name, out System.Reflection.Assembly? namedAsm)
-                && namedAsm is not null
-                && TryGetNamedEntry(namedAsm, namedCandidates, name, out object? namedValue)
-                && namedValue is not null)
-            {
-                Trace("TEMP named-hit key=" + name);
-                return namedValue;
-            }
+            // all Telerik demos), so avoiding the throw IS the fix. The
+            // named-enumerator path stays second: materializing en.Value
+            // through a DeserializingResourceReader throws PNSE for
+            // BinaryFormatter entries (first-chance noise even when caught),
+            // while the raw walk above resolves the same image entries
+            // throw-free.
             if (TryResolveImageEntry(rm, name, out string? typeName, out byte[]? payload)
                 && typeName is not null && payload is not null)
             {
@@ -410,10 +474,23 @@ public static class ResourceHelper
                 }
                 else if (IsInlineEntryType(typeName))
                 {
-                    CacheImage(rm, name, new KnownDirect());
-                    object? inline = DirectGetObject(rm, name);
-                    if (inline != null)
+                    // Materialize straight from the raw payload: the BCL
+                    // GetObject below opens the legacy reader on v2
+                    // blobs (NSE first-chance every time, then null),
+                    // so every v2 string/primitive currently misses AND
+                    // pays a first-chance report. Identical values to
+                    // BCL successes on v1 (same bytes, same decodes).
+                    if (TryMaterializeInline(typeName, payload, out object? inline)
+                        && inline is not null)
+                    {
+                        CacheImage(rm, name, inline);
+                        NoteResMark($"[RESIMG] inline base={SafeBaseName(rm)} key={name} type={typeName}");
                         return inline;
+                    }
+                    CacheImage(rm, name, new KnownDirect());
+                    object? direct = DirectGetObject(rm, name);
+                    if (direct != null)
+                        return direct;
                     CacheImage(rm, name, null);
                 }
                 else
@@ -429,12 +506,38 @@ public static class ResourceHelper
                         CacheImage(rm, name, decoded);
                         return decoded;
                     }
+                    // Syncfusion ImageStreamer components serialize a
+                    // List<System.Drawing.Image> (NOT WinForms MSFt):
+                    // 15 identical 367-byte entries in TileLayoutDemo
+                    // prove the placeholder shape (no real bitmap fits).
+                    // The fork cannot BinaryFormatter-deserialize the
+                    // list; returning the healthy empty list fixes the
+                    // Form1 ctor NRE while staying pixel-honest (tiles
+                    // that need real pixels stay visibly absent, never
+                    // crashed). Exact root-class match only.
+                    if (TryDecodeImageListBlob(typeName, payload, out object? imageList)
+                        && imageList is not null)
+                    {
+                        CacheImage(rm, name, imageList);
+                        NoteResMark($"[RESIMG] empty-imagelist base={SafeBaseName(rm)} key={name}");
+                        return imageList;
+                    }
                     // Resolved non-image user type (ImageListStreamer
                     // blobs, cursors, ...): GetObject could only throw
                     // PNSE for these, so record the miss directly.
                     CacheImage(rm, name, null);
                     NoteResMark($"[RESMISS] base={SafeBaseName(rm)} key={name} type={typeName} non-image");
                 }
+            if (TryResourceCandidates(rm, out System.Collections.Generic.List<string>? namedCandidates)
+                && namedCandidates is not null
+                && TryResolveResourceAssembly(rm, namedCandidates, name, out System.Reflection.Assembly? namedAsm)
+                && namedAsm is not null
+                && TryGetNamedEntry(namedAsm, namedCandidates, name, out object? namedValue)
+                && namedValue is not null)
+            {
+                Trace("TEMP named-hit key=" + name);
+                return namedValue;
+            }
             }
             else
             {
@@ -511,8 +614,26 @@ public static class ResourceHelper
             if (!TryResolveImageEntry(rm, name, out string? typeName, out byte[]? payload)
                 || payload is null)
                 return false;
-            if (typeName is null || !typeName.Contains("ImageListStreamer", StringComparison.Ordinal))
+            bool isStreamer = typeName is not null
+                && typeName.Contains("ImageListStreamer", StringComparison.Ordinal);
+            // Modern SDK output (DeserializingResourceReader-stamped blobs)
+            // stores ImageListStreamer entries under the UnknownType table
+            // slot (the streamer type itself never appears in the type
+            // table) wrapped in one SerializationFormat envelope (fmt,
+            // 7-bit length, bytes). Verified byte-for-byte on real vendor
+            // blobs: code 65 (UnknownType), fmt 1, len, NRBF-with-MS-Im...
+            // Legacy blobs carry the streamer type name with bare NRBF.
+            bool isUnknown = typeName is not null
+                && typeName.Contains("UnknownType", StringComparison.Ordinal);
+            if (!isStreamer && !isUnknown)
                 return false;
+            if (isUnknown)
+            {
+                if (TryStripSerializationEnvelope(payload, out byte[]? inner) && inner is not null)
+                    payload = inner;
+                else if (payload.Length == 0 || payload[0] != 0x00)
+                    return false;
+            }
             if (!NrbfImage.TryExtractImageListBytes(payload, out byte[] found))
                 return false;
             msft = found;
@@ -521,6 +642,63 @@ public static class ResourceHelper
         catch
         {
             msft = null;
+            return false;
+        }
+    }
+
+    // Strips one SerializationFormat envelope (7-bit format code, 7-bit
+    // byte length, bytes) for byte-array-carrying formats:
+    // BinaryFormatter (0), TypeConverterByteArray (1), ActivatorStream
+    // (3). Answers false for TypeConverterString (2), empty input, and
+    // malformed prefixes. Never throws. Public so the Drawing suite can
+    // pin the exact wire shape (verified against real SDK output).
+    public static bool TryStripSerializationEnvelope(byte[]? payload, out byte[]? inner)
+    {
+        inner = null;
+        try
+        {
+            if (payload is null || payload.Length < 2)
+                return false;
+            int pos = 0;
+            int fmt = 0;
+            int shift = 0;
+            for (int i = 0; i < 5; i++)
+            {
+                if (pos >= payload.Length)
+                    return false;
+                byte c = payload[pos++];
+                fmt |= (c & 0x7F) << shift;
+                if ((c & 0x80) == 0)
+                    break;
+                shift += 7;
+                if (i == 4)
+                    return false;
+            }
+            if (fmt != 0 && fmt != 1 && fmt != 3)
+                return false;
+            int length = 0;
+            shift = 0;
+            for (int i = 0; i < 5; i++)
+            {
+                if (pos >= payload.Length)
+                    return false;
+                byte c = payload[pos++];
+                length |= (c & 0x7F) << shift;
+                if ((c & 0x80) == 0)
+                    break;
+                shift += 7;
+                if (i == 4)
+                    return false;
+            }
+            if (length < 0 || pos + length > payload.Length)
+                return false;
+            inner = new byte[length];
+            System.Buffer.BlockCopy(payload, pos, inner, 0, length);
+            return true;
+        }
+        catch
+        {
+            inner = null;
             return false;
         }
     }
@@ -569,6 +747,198 @@ public static class ResourceHelper
             || typeName is null || payload is null)
             return false;
         return TryDecodePayload(typeName, payload, out image);
+    }
+
+    // Syncfusion ".Images" entries: BinaryFormatter-serialized
+    // List<System.Drawing.Image> under an UnknownType table slot
+    // (fmt 1 envelope, NRBF root class List`1[[System.Drawing.Image).
+    // Real bitmaps cannot fit the observed ~367-byte placeholder
+    // shape, so the healthy empty list is the exact recovery; any
+    // other shape keeps today\u0027s miss. Never throws.
+    private static bool TryDecodeImageListBlob(string typeName, byte[] payload, out object? value)
+    {
+        value = null;
+        try
+        {
+            if (!typeName.Contains("UnknownType", System.StringComparison.Ordinal))
+                return false;
+            if (payload is null || payload.Length == 0 || payload.Length > 4096)
+                return false;
+            string ascii = System.Text.Encoding.ASCII.GetString(payload);
+            if (!ascii.Contains("List`1[[System.Drawing.Image", System.StringComparison.Ordinal))
+                return false;
+            value = new System.Collections.Generic.List<System.Drawing.Image>();
+            return true;
+        }
+        catch { value = null; return false; }
+    }
+
+    // Materializes ResourceTypeCode wire entries (Null, String,
+    // primitives, ByteArray, Stream) from the raw-walk payload,
+    // no deserializer and no BCL reader involved. Payload shapes match
+    // RawReadValue exactly (fixed sizes, UTF-8 string, raw bytes).
+    // Null answers false (caller keeps today\u0027s miss); anything
+    // malformed answers false and the legacy BCL path below is
+    // preserved. Public so the Drawing suite pins every wire code.
+    // Never throws.
+    public static bool TryMaterializeInline(string? typeName, byte[]? payload, out object? value)
+    {
+        value = null;
+        try
+        {
+            if (string.IsNullOrEmpty(typeName) || payload is null)
+                return false;
+            const string pfx = "ResourceTypeCode.";
+            if (!typeName.StartsWith(pfx, System.StringComparison.Ordinal))
+                return false;
+            string code = typeName.Substring(pfx.Length);
+            switch (code)
+            {
+                case "Null":
+                    return false;
+                case "String":
+                    value = System.Text.Encoding.UTF8.GetString(StripSevenBitPrefix(payload));
+                    return true;
+                case "Boolean":
+                    if (payload.Length != 1) return false;
+                    value = payload[0] != 0;
+                    return true;
+                case "Char":
+                    if (payload.Length != 2) return false;
+                    value = System.BitConverter.ToChar(payload, 0);
+                    return true;
+                case "Byte":
+                    if (payload.Length != 1) return false;
+                    value = payload[0];
+                    return true;
+                case "SByte":
+                    if (payload.Length != 1) return false;
+                    value = unchecked((sbyte)payload[0]);
+                    return true;
+                case "Int16":
+                    if (payload.Length != 2) return false;
+                    value = System.BitConverter.ToInt16(payload, 0);
+                    return true;
+                case "UInt16":
+                    if (payload.Length != 2) return false;
+                    value = System.BitConverter.ToUInt16(payload, 0);
+                    return true;
+                case "Int32":
+                    if (payload.Length != 4) return false;
+                    value = System.BitConverter.ToInt32(payload, 0);
+                    return true;
+                case "UInt32":
+                    if (payload.Length != 4) return false;
+                    value = System.BitConverter.ToUInt32(payload, 0);
+                    return true;
+                case "Int64":
+                    if (payload.Length != 8) return false;
+                    value = System.BitConverter.ToInt64(payload, 0);
+                    return true;
+                case "UInt64":
+                    if (payload.Length != 8) return false;
+                    value = System.BitConverter.ToUInt64(payload, 0);
+                    return true;
+                case "Single":
+                    if (payload.Length != 4) return false;
+                    value = System.BitConverter.ToSingle(payload, 0);
+                    return true;
+                case "Double":
+                    if (payload.Length != 8) return false;
+                    value = System.BitConverter.ToDouble(payload, 0);
+                    return true;
+                case "Decimal":
+                {
+                    if (payload.Length != 16) return false;
+                    int[] bits = new int[4];
+                    for (int i = 0; i < 4; i++)
+                        bits[i] = System.BitConverter.ToInt32(payload, i * 4);
+                    value = new decimal(bits);
+                    return true;
+                }
+                case "DateTime":
+                    if (payload.Length != 8) return false;
+                    value = new System.DateTime(System.BitConverter.ToInt64(payload, 0));
+                    return true;
+                case "TimeSpan":
+                    if (payload.Length != 8) return false;
+                    value = new System.TimeSpan(System.BitConverter.ToInt64(payload, 0));
+                    return true;
+                case "ByteArray":
+                {
+                    // Legacy GetResourceData framing is Int32 LE length
+                    // + bytes (raw-walk payloads arrive stripped, but
+                    // DRR blobs never emit code 32, so a bare payload
+                    // here is not expected). No exact fit -> false so
+                    // the legacy BCL path below keeps today\u0027s behavior.
+                    if (!TryStripInt32Prefix(payload, out byte[]? body) || body is null)
+                        return false;
+                    value = body;
+                    return true;
+                }
+                case "Stream":
+                {
+                    if (!TryStripInt32Prefix(payload, out byte[]? body) || body is null)
+                        return false;
+                    value = new System.IO.MemoryStream(body, writable: false);
+                    return true;
+                }
+                default:
+                    return false;
+            }
+        }
+        catch { value = null; return false; }
+    }
+
+    // Strips one 7-bit length prefix when it EXACTLY accounts for the
+    // payload (legacy GetResourceData string framing). Pure raw-walk
+    // payloads pass through untouched: their first byte would have to
+    // coincidentally decode to exactly the remaining length, which no
+    // real string does except the framing itself. Never throws.
+    private static byte[] StripSevenBitPrefix(byte[] payload)
+    {
+        try
+        {
+            int length = 0;
+            int shift = 0;
+            int pos = 0;
+            for (int i = 0; i < 5 && pos < payload.Length; i++)
+            {
+                byte c = payload[pos++];
+                length |= (c & 0x7F) << shift;
+                if ((c & 0x80) == 0)
+                    break;
+                shift += 7;
+            }
+            if (pos + length == payload.Length && length >= 0)
+            {
+                byte[] body = new byte[length];
+                System.Buffer.BlockCopy(payload, pos, body, 0, length);
+                return body;
+            }
+            return payload;
+        }
+        catch { return payload; }
+    }
+
+    // Strips one Int32 LE length prefix when it EXACTLY accounts for
+    // the payload (legacy GetResourceData ByteArray/Stream framing).
+    // Never throws.
+    private static bool TryStripInt32Prefix(byte[] payload, out byte[]? body)
+    {
+        body = null;
+        try
+        {
+            if (payload is null || payload.Length < 4)
+                return false;
+            int length = System.BitConverter.ToInt32(payload, 0);
+            if (length < 0 || 4 + length != payload.Length)
+                return false;
+            body = new byte[length];
+            System.Buffer.BlockCopy(payload, 4, body, 0, length);
+            return true;
+        }
+        catch { body = null; return false; }
     }
 
     private static bool TryDecodePayload(string typeName, byte[] payload, out object? image)
@@ -781,6 +1151,84 @@ public static class ResourceHelper
     // bounds for unprefixed user-type blobs come from the next entry's
     // data offset (or the stream end), matching what the BCL reader hands
     // the NRBF decoder.
+    // Enumerates every entry name in a v1/v2 .resources stream by
+    // walking the name table (same container parse as TryReadRawEntry),
+    // with no reader construction and no value materialization.
+    // Lets SafeApplyResources enumerate modern blobs without the BCL
+    // GetResourceSet fallback (which throws one first-chance NSE per
+    // enumeration on v2 stamps). True = stream parsed (names may be
+    // empty); false = not a resources stream, caller keeps its fallback.
+    // Never throws.
+    private static bool TryEnumerateRawNames(System.IO.Stream s, out System.Collections.Generic.List<string>? names)
+    {
+        names = null;
+        try
+        {
+            if (s is null || !s.CanSeek)
+                return false;
+            long len = s.Length;
+            if (len < 16 || len > int.MaxValue)
+                return false;
+            s.Position = 0;
+            using var br = new System.IO.BinaryReader(s, System.Text.Encoding.UTF8, leaveOpen: true);
+            if (!RawReadInt(br, len, out int magic) || magic != unchecked((int)0xBEEFCACE))
+                return false;
+            if (!RawReadInt(br, len, out _))
+                return false;
+            if (!RawReadInt(br, len, out int skip) || skip < 0)
+                return false;
+            long cursor = 12L + skip;
+            if (cursor < 0 || cursor + 12 > len)
+                return false;
+            s.Position = cursor;
+            if (!RawReadInt(br, len, out _))
+                return false;
+            if (!RawReadInt(br, len, out int numResources) || numResources < 0 || numResources > 100000)
+                return false;
+            if (!RawReadInt(br, len, out int numTypes) || numTypes < 0 || numTypes > 10000)
+                return false;
+            for (int i = 0; i < numTypes; i++)
+            {
+                if (!RawReadString(br, len, out string? tn) || tn is null)
+                    return false;
+            }
+            long aligned = s.Position + ((8 - (s.Position % 8)) % 8);
+            if (aligned > len)
+                return false;
+            s.Position = aligned;
+            long hashes = (long)numResources * 4;
+            if (s.Position + hashes > len)
+                return false;
+            s.Position += hashes;
+            int[] positions = new int[numResources];
+            for (int i = 0; i < numResources; i++)
+                if (!RawReadInt(br, len, out positions[i]))
+                    return false;
+            if (!RawReadInt(br, len, out int dataStart) || dataStart < 0 || dataStart > len)
+                return false;
+            long namesStart = s.Position;
+            var result = new System.Collections.Generic.List<string>(numResources);
+            var visited = new System.Collections.Generic.HashSet<long>();
+            for (int i = 0; i < numResources; i++)
+            {
+                if (positions[i] < 0)
+                    continue;
+                long np = namesStart + positions[i];
+                if (np < 0 || np >= len || !visited.Add(np))
+                    continue;
+                s.Position = np;
+                if (!RawReadUtf16Name(br, len, out string? entry) || entry is null)
+                    continue;
+                if (!RawReadInt(br, len, out int dataRel) || dataRel < 0 || (long)dataStart + dataRel > len)
+                    continue;
+                result.Add(entry);
+            }
+            names = result;
+            return true;
+        }
+        catch { names = null; return false; }
+    }
+
     private static bool TryReadRawEntry(System.IO.Stream s, string name, out string? typeName, out byte[]? payload)
     {
         typeName = null;
@@ -1116,7 +1564,25 @@ public static class ResourceHelper
                     using (var reader = OpenResourceReader(s))
                     {
                         if (reader is null)
+                        {
+                            // No constructible reader (v2 stamp): walk
+                            // the name table directly. Without this every
+                            // SafeApplyResources falls into the BCL
+                            // GetResourceSet fallback below, which news up
+                            // the legacy reader on the v2 stream (one
+                            // first-chance NSE per enumeration).
+                            if (TryEnumerateRawNames(s, out var rawNames) && rawNames is not null)
+                            {
+                                foreach (string name in rawNames)
+                                {
+                                    if (string.IsNullOrEmpty(name) || !name.StartsWith(prefix, System.StringComparison.OrdinalIgnoreCase))
+                                        continue;
+                                    if (seen.Add(name))
+                                        keys.Add(name);
+                                }
+                            }
                             continue;
+                        }
                         var en = reader.GetEnumerator();
                         while (en.MoveNext())
                         {

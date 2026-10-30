@@ -13,35 +13,35 @@ public sealed class SceneState
         AppScene Scene, string Label, string? SourceLabel, string? SourceUrl,
         string? DesktopReferenceFile, string? AppFolder);
 
-    public IReadOnlyList<SceneEntry> Entries { get; private set; } = new[]
+    public IReadOnlyList<SceneEntry> Entries { get; } = new[]
     {
         new SceneEntry(AppScene.Smoke, "Smoke form",
             "dotnet/samples · windowsforms/helloworld-sharedsource", "https://github.com/dotnet/samples",
-            null, null),
+            "desktop-Smoke.png", null),
         new SceneEntry(AppScene.Calendar, "Calendar",
             "justwesi/functional-calendar", "https://github.com/justwesi/functional-calendar",
-            null, "calendar"),
+            "desktop-Calendar.png", "calendar"),
         new SceneEntry(AppScene.Paint, "Paint",
             "Paint.NET v5.1.12 (Retargeted to WebAssembly)", "https://www.getpaint.net",
-            null, "paintnet"),
+            "desktop-PaintNet.png", "paintnet"),
         new SceneEntry(AppScene.Calculator, "Calculator",
             "albisnesstz/csharp-win-calculator", "https://github.com/albisnesstz/csharp-win-calculator",
-            null, "calculator"),
+            "desktop-Calculator.png", "calculator"),
         new SceneEntry(AppScene.Todo, "Todo list",
             "kasra10/simple-csharp-todolist", "https://github.com/kasra10/simple-csharp-todolist",
-            null, "todo"),
+            "desktop-Todo.png", "todo"),
         new SceneEntry(AppScene.TicTacToe, "Tic-tac-toe",
             "zakaria-sahki/tic-tac-toe-game", "https://github.com/zakaria-sahki/tic-tac-toe-game",
-            null, "tictactoe"),
+            "desktop-TicTacToe.png", "tictactoe"),
         new SceneEntry(AppScene.TelerikPhoto, "Telerik: Photo Album",
             "Telerik UI for WinForms demos", null,
             null, "telerik-photo"),
         new SceneEntry(AppScene.TelerikBookshelf, "Telerik: BookShelf",
             "Telerik UI for WinForms demos", null,
-            null, "telerik-bookshelf"),
+            "desktop-BookShelf.png", "telerik-bookshelf"),
         new SceneEntry(AppScene.TelerikBugtracker, "Telerik: BugTracker",
             "Telerik UI for WinForms demos", null,
-            null, "telerik-bugtracker"),
+            "desktop-BugTracker.png", "telerik-bugtracker"),
         new SceneEntry(AppScene.TelerikDemoAppsHub, "Telerik: DemoAppsHub",
             "Telerik UI for WinForms demos", null,
             null, "telerik-demoappshub"),
@@ -81,14 +81,6 @@ public sealed class SceneState
         demo.Family + " benchmark · experimental", demo.SourceUrl, null, demo.Slug))).ToArray();
 
     public AppScene Current { get; private set; } = AppScene.Smoke;
-
-    public void LimitToAvailableApps(IEnumerable<string> appIds)
-    {
-        var available = new HashSet<string>(appIds, StringComparer.OrdinalIgnoreCase);
-        Entries = Entries.Where(e => e.AppFolder is null || available.Contains(e.AppFolder)).ToArray();
-        if (!Entries.Any(e => e.Scene == Current)) Current = AppScene.Smoke;
-        Changed?.Invoke();
-    }
 
     public SceneEntry CurrentEntry => Entries.First(e => e.Scene == Current);
 

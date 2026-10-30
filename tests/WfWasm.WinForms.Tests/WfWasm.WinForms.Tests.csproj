@@ -29,7 +29,7 @@
     <!-- Compile against the MIGRATED fork (rewritten-small), not the src
          build: the rewritten test apps bind WfWasm.Drawing-scoped signatures
          that only the migrated copy has. Regenerate it any time with
-         E:\tmp\rewrite-small.ps1 (same coupling as WfWasm.CanvasHost). -->
+         scripts/build.ps1 rewriter step (same coupling as WfWasm.CanvasHost). -->
     <Reference Include="$(WfWasmMigratedForms)">
       <!-- global keeps the existing unqualified fork refs; Fork reaches the
            CAS stubs, which the framework ref packs forward to the

@@ -34,7 +34,7 @@ public sealed class RepaintGateRewriteTests
         // host subscribes for coalesced repaints. Telerik's own
         // RadElement.Invalidate must NOT match (different declarer).
         // Regression: photo-album animations frozen at start positions.
-        string input = TestPaths.Repo(@"telerik\Telerik UI for WinForms demos\Bin\Release\Telerik.WinControls.dll");
+        string input = @"E:\AI\Code\WindowsForms\telerik\Telerik UI for WinForms demos\Bin\Release\Telerik.WinControls.dll";
         if (!File.Exists(input)) return;
         string tempOut = Path.Combine(Path.GetTempPath(), $"TelerikWinControls_Invalidate_{Guid.NewGuid()}.dll");
         try

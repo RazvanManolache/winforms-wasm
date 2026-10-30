@@ -15,7 +15,7 @@ public sealed class EndpointTests : IAsyncLifetime
 {
     private WebApplication _app = null!;
     private string _origin = "";
-    private readonly string _root = Path.Combine(Path.Combine(Path.GetTempPath(), "wf-platform-http-tests"), Guid.NewGuid().ToString("N"));
+    private readonly string _root = Path.Combine("E:/tmp/wf-platform-http-tests", Guid.NewGuid().ToString("N"));
     public async Task InitializeAsync()
     {
         var builder = WebApplication.CreateBuilder(); builder.WebHost.UseUrls("http://127.0.0.1:0"); builder.Logging.ClearProviders();

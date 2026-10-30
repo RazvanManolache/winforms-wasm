@@ -25,9 +25,7 @@ app.MapGet("/api/preview-config", (HttpContext context) =>
     context.Response.Headers.CacheControl = "no-cache";
     return Results.Ok(new {
         runtimeOrigin = app.Configuration["Preview:RuntimeOrigin"],
-        apps = new SceneState().Entries.Where(entry => DesktopBenchmarks.Find(entry.Scene) is not null || entry.AppFolder is null ||
-            (AppTransform.TryGetSpec(entry.AppFolder, out var spec) && spec is not null &&
-             AppTransform.TryResolveAssembly(entry.AppFolder, spec.Entry, out _))).Select(entry => new {
+        apps = new SceneState().Entries.Select(entry => new {
             slug = SceneState.ToSlug(entry.Scene), entry.Label, entry.SourceLabel,
             entry.SourceUrl, entry.AppFolder,
             category = DesktopBenchmarks.Find(entry.Scene) is null ? null : "benchmarks",

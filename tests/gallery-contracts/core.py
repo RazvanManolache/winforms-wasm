@@ -4,13 +4,12 @@ import hashlib
 import json
 import re
 import uuid
-from pathlib import Path
 from datetime import datetime, timezone
 
 CANVAS_OFFSET = (301, 53)  # canvas top-left in a 1500x950 viewport; verified by click logs
 VIEWPORT = (1500, 950)
 
-SRC = str(Path(__file__).resolve().parents[2] / 'src')
+SRC = 'E:/AI/Code/WindowsForms/src'
 BIN = SRC + '/WfWasm.Host.Server/bin/Debug/net9.0'
 
 
@@ -58,6 +57,9 @@ def parse_scene(consoles):
     toolbar and menu targets are clickable."""
     controls = {}
     form = None
+    tops = []  # every indent-0 window; multi-window apps (PDN tool
+    # windows) dump several, so the main window is picked by area
+    # below instead of taking the last one (which was ColorsForm).
     stack = []  # (indent, absx, absy)
     for line in consoles:
         m = CTRL_RE.search(line) or ITEM_RE.search(line)
@@ -75,7 +77,7 @@ def parse_scene(consoles):
             ox, oy = (0, 0)
         ax, ay = ox + x, oy + y
         if indent == 0:
-            form = (ax, ay, w, h)
+            tops.append((ax, ay, w, h))
             stack.append((indent, ax, ay))
         else:
             key = name or f'{typ}@{ax},{ay}'
@@ -85,6 +87,11 @@ def parse_scene(consoles):
                     key = f'{typ}:{tm.group(1)[:40]}@{ax},{ay}'
             controls[key] = (typ, ax, ay, w, h, vis)
             stack.append((indent, ax, ay))
+    if tops:
+        # Main window = largest top-level area. Single-window apps have
+        # exactly one candidate (behavior unchanged); PDN's MainForm
+        # (1096x814) dwarfs its tool windows (ColorsForm was last).
+        form = max(tops, key=lambda b: b[2] * b[3])
     return form, controls
 
 

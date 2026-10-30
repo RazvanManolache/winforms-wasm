@@ -46,6 +46,8 @@ foreach ($wb in Get-ChildItem (Join-Path $Root 'WindowsBase.*.wasm') -ErrorActio
     $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($wb.FullName))
     if ($text -like '*DependencyObject*') { Write-Host '  DependencyObject present' }
     else { Write-Host '  FAIL: System.Windows.DependencyObject absent (TypeLoadException token 01000023)'; $failed = $true }
+    if ($text -like '*get_ReflectionOnly*') { Write-Host '  FAIL: live Assembly.ReflectionOnly guard (Mono-WASM NIE, paint MONO cascade) — --refonly stage missing/stale'; $failed = $true }
+    else { Write-Host '  ReflectionOnly neutralized' }
 }
 
 # System.Configuration.ConfigurationManager must be the FULL implementation
@@ -59,6 +61,14 @@ foreach ($c in $cfg) {
     Write-Host "ConfigManager: $($c.Name) $($c.Length) bytes"
     if ($c.Length -lt 100KB) { Write-Host '  FAIL: facade-sized (<100KB) — full implementation missing'; $failed = $true }
 }
+
+# System.Data.OleDb must ship (headless stub, rev41): without it in
+# _framework, rewritten typed-DataSet apps (medical, hub, export) TypeLoad
+# on their OleDbDataAdapter fields even though the rewriter retargeted them.
+$ole = @(Get-ChildItem (Join-Path $Root 'System.Data.OleDb.*.wasm') -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -notlike '*.gz' })
+if ($ole.Count -eq 0) { Write-Host '  FAIL: System.Data.OleDb missing from bundle'; $failed = $true }
+foreach ($o in $ole) { Write-Host "OleDb: $($o.Name) $($o.Length) bytes" }
 
 if ($failed) { exit 1 }
 Write-Host 'bundle gate PASS'

@@ -15,7 +15,7 @@ using FormsForm = System.Windows.Forms.Form;
 /// </summary>
 public sealed class EvalScaleTests
 {
-    private static readonly string SmallDir = TestPaths.Repo(@".artifacts\runtime");
+    private const string SmallDir = @"E:\tmp\rewritten-small";
 
     private static Assembly LoadSmallApp(string file, string expectName)
     {
